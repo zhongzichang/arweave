@@ -845,7 +845,7 @@ remove_peer(RemovedPeer) ->
 			set_total_rating(current, TotalCurrentRating - get_peer_rating(current, Performance)),
 			ets:delete(?MODULE, {peer, RemovedPeer}),
 			remove_peer_port(RemovedPeer),
-			ar_events:send(peer, {removed, RemovedPeer}).
+			ar_events:send(peer, {removed, RemovedPeer})
 	end.
 	
 
