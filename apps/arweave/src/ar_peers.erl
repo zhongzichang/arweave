@@ -390,6 +390,7 @@ handle_cast({warning, Peer}, State) ->
 	%	false ->
 	%		ok
 	%end,
+
 	{noreply, State};
 
 handle_cast(Cast, State) ->
@@ -829,18 +830,24 @@ maybe_add_peer(Peer, Release) ->
 	end.
 
 remove_peer(RemovedPeer) ->
-	?LOG_DEBUG([
-		{event, remove_peer},
-		{peer, ar_util:format_peer(RemovedPeer)}
-	]),
-	Performance = get_or_init_performance(RemovedPeer),
-	TotalLifetimeRating = get_total_rating(lifetime),
-	TotalCurrentRating = get_total_rating(current),
-	set_total_rating(lifetime, TotalLifetimeRating - get_peer_rating(lifetime, Performance)),
-	set_total_rating(current, TotalCurrentRating - get_peer_rating(current, Performance)),
-	ets:delete(?MODULE, {peer, RemovedPeer}),
-	remove_peer_port(RemovedPeer),
-	ar_events:send(peer, {removed, RemovedPeer}).
+	IPAddr = peer_to_ip_addr(RemovedPeer)
+	LocalIPs = [peer_to_ip_addr(Peer) || Peer <- Config#config.local_peers],
+	case lists:member(IPAddr, LocalIPs) of
+		false ->
+			?LOG_DEBUG([
+				{event, remove_peer},
+				{peer, ar_util:format_peer(RemovedPeer)}
+			]),
+			Performance = get_or_init_performance(RemovedPeer),
+			TotalLifetimeRating = get_total_rating(lifetime),
+			TotalCurrentRating = get_total_rating(current),
+			set_total_rating(lifetime, TotalLifetimeRating - get_peer_rating(lifetime, Performance)),
+			set_total_rating(current, TotalCurrentRating - get_peer_rating(current, Performance)),
+			ets:delete(?MODULE, {peer, RemovedPeer}),
+			remove_peer_port(RemovedPeer),
+			ar_events:send(peer, {removed, RemovedPeer}).
+	end
+	
 
 remove_peer_port(Peer) ->
 	{IP, Port} = get_ip_port(Peer),
@@ -1165,3 +1172,5 @@ assert_performance(Expected, Actual) ->
 round(Float, N) ->
     Multiplier = math:pow(10, N),
     round(Float * Multiplier) / Multiplier.
+
+peer_to_ip_addr({A, B, C, D, _}) -> {A, B, C, D}.
