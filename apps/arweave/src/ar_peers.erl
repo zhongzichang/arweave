@@ -846,7 +846,7 @@ remove_peer(RemovedPeer) ->
 			ets:delete(?MODULE, {peer, RemovedPeer}),
 			remove_peer_port(RemovedPeer),
 			ar_events:send(peer, {removed, RemovedPeer}).
-	end
+	end.
 	
 
 remove_peer_port(Peer) ->
