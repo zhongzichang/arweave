@@ -830,6 +830,7 @@ maybe_add_peer(Peer, Release) ->
 	end.
 
 remove_peer(RemovedPeer) ->
+	{ok, Config} = application:get_env(arweave, config),
 	IPAddr = peer_to_ip_addr(RemovedPeer),
 	LocalIPs = [peer_to_ip_addr(Peer) || Peer <- Config#config.local_peers],
 	case lists:member(IPAddr, LocalIPs) of
