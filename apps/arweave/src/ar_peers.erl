@@ -383,12 +383,13 @@ handle_cast({invalid_data, Peer, _DataType}, State) ->
 
 handle_cast({warning, Peer}, State) ->
 	Performance = update_rating(Peer, false),
-	case Performance#performance.average_success < ?MINIMUM_SUCCESS of
-		true ->
-			remove_peer(Peer);
-		false ->
-			ok
-	end,
+	
+	%case Performance#performance.average_success < ?MINIMUM_SUCCESS of
+	%	true ->
+	%		remove_peer(Peer);
+	%	false ->
+	%		ok
+	%end,
 	{noreply, State};
 
 handle_cast(Cast, State) ->
