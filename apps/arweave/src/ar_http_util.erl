@@ -34,7 +34,8 @@ arweave_peer(Req) ->
 		undefined -> IpV4_Peer;
 		_ ->
 			[FirstIp] = IpV4_S2,
-			{ok, IP} = inet:parse_ipv4strict_address(FirstIp),
+			StrIp = binary_to_list(FirstIp),
+			{ok, IP} = inet:parse_ipv4strict_address(StrIp),
 			IP
 	end,
 	ArweavePeerPort =
