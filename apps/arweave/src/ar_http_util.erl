@@ -33,8 +33,8 @@ arweave_peer(Req) ->
 	{IpV4_1, IpV4_2, IpV4_3, IpV4_4} = case IpV4_S2 of
 		undefined -> IpV4_Peer;
 		_ ->
-			[FirstIp] = IpV4_S2,
-			StrIp = binary_to_list(FirstIp),
+			%[FirstIp] = IpV4_S2,
+			StrIp = binary_to_list(IpV4_S2),
 			{ok, IP} = inet:parse_ipv4strict_address(StrIp),
 			IP
 	end,
