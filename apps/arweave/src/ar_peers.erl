@@ -835,7 +835,10 @@ remove_peer(RemovedPeer) ->
 	LocalIPs = [peer_to_ip_addr(Peer) || Peer <- Config#config.local_peers],
 	case lists:member(IPAddr, LocalIPs) of
 		true ->
-			ok;
+			?LOG_DEBUG([
+				{event, remove_peer},
+				{peer, ar_util:format_peer(RemovedPeer)}
+			]);
 		false ->
 			?LOG_DEBUG([
 				{event, remove_peer},
