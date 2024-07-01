@@ -22,22 +22,7 @@ get_tx_content_type(#tx { tags = Tags }) ->
 	end.
 
 arweave_peer(Req) ->
-
-	IpV4_S1 = cowboy_req:header(<<"x-real-ip">>, Req),
-	IpV4_S2 = case IpV4_S1 of
-		undefined -> cowboy_req:header(<<"x-forwarded-for">>, Req);
-		_ -> IpV4_S1
-	end,
-	{IpV4_Peer, _TcpPeerPort} = cowboy_req:peer(Req),
-
-	{IpV4_1, IpV4_2, IpV4_3, IpV4_4} = case IpV4_S2 of
-		undefined -> IpV4_Peer;
-		_ ->
-			%[FirstIp] = IpV4_S2,
-			StrIp = binary_to_list(IpV4_S2),
-			{ok, IP} = inet:parse_ipv4strict_address(StrIp),
-			IP
-	end,
+	{{IpV4_1, IpV4_2, IpV4_3, IpV4_4}, _TcpPeerPort} = cowboy_req:peer(Req),
 	ArweavePeerPort =
 		case cowboy_req:header(<<"x-p2p-port">>, Req) of
 			undefined -> ?DEFAULT_HTTP_IFACE_PORT;
