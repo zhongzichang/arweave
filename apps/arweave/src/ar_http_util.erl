@@ -23,9 +23,9 @@ get_tx_content_type(#tx { tags = Tags }) ->
 
 arweave_peer(Req) ->
 
-	IpV4_S1 = cowboy_req:header(<<"x-real-ip">>),
+	IpV4_S1 = cowboy_req:header(<<"x-real-ip">>, Req),
 	IpV4_S2 = case IpV4_S1 of
-		undefined -> cowboy_req:header(<<"x-forwarded-for">>);
+		undefined -> cowboy_req:header(<<"x-forwarded-for">>, Req);
 		_ -> IpV4_S1
 	end,
 	{{IpV4_Peer}, _TcpPeerPort} = cowboy_req:peer(Req),
