@@ -28,7 +28,7 @@ arweave_peer(Req) ->
 		undefined -> cowboy_req:header(<<"x-forwarded-for">>, Req);
 		_ -> IpV4_S1
 	end,
-	{{IpV4_Peer}, _TcpPeerPort} = cowboy_req:peer(Req),
+	{IpV4_Peer, _TcpPeerPort} = cowboy_req:peer(Req),
 
 	{IpV4_1, IpV4_2, IpV4_3, IpV4_4} = case IpV4_S2 of
 		undefined -> IpV4_Peer;
