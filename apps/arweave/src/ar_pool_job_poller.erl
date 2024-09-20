@@ -25,10 +25,12 @@ start_link() ->
 %%%===================================================================
 
 init([]) ->
-	case ar_pool:is_client() of
-		true ->
+	case {ar_pool:is_client(), ar_coordination:is_cm_miner()} of
+		{true, false} ->
 			gen_server:cast(self(), fetch_jobs);
-		false ->
+		_ ->
+			%% If we are not a CM miner, polling
+			%% the pool jobs to us.
 			ok
 	end,
 	{ok, #state{}}.
@@ -54,7 +56,7 @@ handle_cast(fetch_jobs, State) ->
 		end,
 	case ar_http_iface_client:get_jobs(Peer, PrevOutput) of
 		{ok, Jobs} ->
-			emit_pool_jobs(Jobs),
+			ar_pool:emit_pool_jobs(Jobs),
 			ar_pool:cache_jobs(Jobs),
 			ar_util:cast_after(?FETCH_JOBS_FREQUENCY_MS, self(), fetch_jobs);
 		{error, Error} ->
@@ -75,21 +77,3 @@ handle_info(Message, State) ->
 terminate(_Reason, _State) ->
 	ok.
 
-%%%===================================================================
-%%% Private functions.
-%%%===================================================================
-
-emit_pool_jobs(Jobs) ->
-	SessionKey = {Jobs#jobs.next_seed, Jobs#jobs.interval_number,
-			Jobs#jobs.next_vdf_difficulty},
-	emit_pool_jobs(Jobs#jobs.jobs, SessionKey, Jobs#jobs.partial_diff, Jobs#jobs.seed).
-
-emit_pool_jobs([], _SessionKey, _PartialDiff, _Seed) ->
-	ok;
-emit_pool_jobs([Job | Jobs], SessionKey, PartialDiff, Seed) ->
-	#job{
-		output = Output, global_step_number = StepNumber,
-		partition_upper_bound = PartitionUpperBound } = Job,
-	ar_mining_server:add_pool_job(
-		SessionKey, StepNumber, Output, PartitionUpperBound, Seed, PartialDiff),
-	emit_pool_jobs(Jobs, SessionKey, PartialDiff, Seed).

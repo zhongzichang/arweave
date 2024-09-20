@@ -543,6 +543,14 @@ handle(<<"GET">>, [<<"jobs">>], Req, _Pid) ->
 			handle_get_jobs(<<>>, Req)
 	end;
 
+handle(<<"POST">>, [<<"pool_jobs">>], Req, Pid) ->
+	case ar_node:is_joined() of
+		false ->
+			not_joined(Req);
+		true ->
+			handle_post_pool_jobs(Req, Pid)
+	end;
+
 handle(<<"POST">>, [<<"pool_cm_jobs">>], Req, Pid) ->
 	case ar_node:is_joined() of
 		false ->
@@ -2637,6 +2645,38 @@ handle_get_jobs_pool_server(PrevOutput, Req) ->
 handle_get_jobs_cm_exit_peer_pool_client(PrevOutput, Req) ->
 	{200, #{}, ar_serialize:jsonify(
 			ar_serialize:jobs_to_json_struct(ar_pool:get_jobs(PrevOutput))), Req}.
+
+%% Only for cm miners that are NOT exit peers.
+handle_post_pool_jobs(Req, Pid) ->
+	PoolCMMiner = (not ar_coordination:is_exit_peer()) andalso ar_pool:is_client(),
+	case PoolCMMiner of
+		false ->
+			{501, #{}, jiffy:encode(#{ error => configuration }), Req};
+		true ->
+			case check_cm_api_secret(Req) of
+				{reject, {Status, Headers, Body}} ->
+					{Status, Headers, Body, Req};
+				pass ->
+					handle_post_pool_jobs2(Req, Pid)
+			end
+	end.
+
+handle_post_pool_jobs2(Req, Pid) ->
+	case read_complete_body(Req, Pid) of
+		{ok, Body, Req2} ->
+			case catch ar_serialize:json_struct_to_jobs(ar_serialize:dejsonify(Body)) of
+				{'EXIT', _} ->
+					{400, #{}, jiffy:encode(#{ error => invalid_json }), Req2};
+				Jobs ->
+					ar_pool:emit_jobs(Jobs),
+					ar_pool:cache_jobs(Jobs),
+					{200, #{}, <<>>, Req2}
+			end;
+		{error, body_size_too_large} ->
+			{413, #{}, <<"Payload too large">>, Req};
+		{error, timeout} ->
+			{500, #{}, <<"Handler timeout">>, Req}
+	end.
 
 %% Only for cm miners that are NOT exit peers.
 handle_post_pool_cm_jobs(Req, Pid) ->

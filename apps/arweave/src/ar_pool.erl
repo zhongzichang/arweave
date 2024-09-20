@@ -37,7 +37,7 @@
 
 -export([start_link/0, is_client/0, get_current_session_key_seed_pairs/0, get_jobs/1,
 		get_latest_job/0, cache_jobs/1, process_partial_solution/1,
-		post_partial_solution/1, pool_peer/0, process_cm_jobs/2]).
+		post_partial_solution/1, pool_peer/0, process_cm_jobs/2, emit_jobs/1]).
 
 -export([init/1, handle_cast/2, handle_call/3, handle_info/2, terminate/2]).
 
@@ -111,6 +111,22 @@ process_cm_jobs(Jobs, Peer) ->
 			ok
 	end,
 	process_h1_read_jobs(H1ReadJobs, Partitions).
+
+emit_jobs(Jobs) ->
+	SessionKey = {Jobs#jobs.next_seed, Jobs#jobs.interval_number,
+			Jobs#jobs.next_vdf_difficulty},
+	emit_jobs(Jobs#jobs.jobs, SessionKey, Jobs#jobs.partial_diff, Jobs#jobs.seed).
+
+emit_jobs([], _SessionKey, _PartialDiff, _Seed) ->
+	ok;
+emit_jobs([Job | Jobs], SessionKey, PartialDiff, Seed) ->
+	#job{
+		output = Output, global_step_number = StepNumber,
+		partition_upper_bound = PartitionUpperBound } = Job,
+	ar_mining_server:add_pool_job(
+		SessionKey, StepNumber, Output, PartitionUpperBound, Seed, PartialDiff),
+	emit_jobs(Jobs, SessionKey, PartialDiff, Seed).
+
 
 %%%===================================================================
 %%% Generic server callbacks.

@@ -106,6 +106,11 @@ is_exit_peer() ->
 	Config#config.coordinated_mining == true andalso
 			Config#config.cm_exit_peer == not_set.
 
+is_cm_miner() ->
+	{ok, Config} = application:get_env(arweave, config),
+	Config#config.coordinated_mining == true andalso
+			Config#config.cm_exit_peer /= not_set.
+
 %% @doc Return a list of unique partitions including local partitions and all of
 %% external (relevant pool peers') partitions.
 %%
