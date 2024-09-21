@@ -56,7 +56,7 @@ handle_cast(fetch_jobs, State) ->
 		end,
 	case ar_http_iface_client:get_jobs(Peer, PrevOutput) of
 		{ok, Jobs} ->
-			ar_pool:emit_pool_jobs(Jobs),
+			ar_pool:emit_jobs(Jobs),
 			ar_pool:cache_jobs(Jobs),
 			ar_util:cast_after(?FETCH_JOBS_FREQUENCY_MS, self(), fetch_jobs);
 		{error, Error} ->
@@ -77,3 +77,18 @@ handle_info(Message, State) ->
 terminate(_Reason, _State) ->
 	ok.
 
+%%%===================================================================
+%%% Private functions.
+%%%===================================================================
+
+push_jobs_to_cm_peers(Jobs) ->
+	{ok, Config} = application:get_env(arweave, config),
+	Peers = Config#config.cm_peers,
+	Payload = ar_serialize:jsonify(ar_serialize:jobs_to_json_struct(Jobs)),
+	push_jobs_to_cm_peers(Payload, Peers).
+
+push_jobs_to_cm_peers(_Payload, []) ->
+	ok;
+push_jobs_to_cm_peers(Payload, [Peer | Peers]) ->
+	spawn(fun() -> ar_http_iface_client:post_pool_jobs(Peer, Payload) end),
+	push_jobs_to_cm_peers(Payload, Peers).
