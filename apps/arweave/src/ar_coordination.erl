@@ -5,7 +5,7 @@
 -export([
 	start_link/0, computed_h1/2, compute_h2_for_peer/2, computed_h2_for_peer/1,
 	get_public_state/0, send_h1_batch_to_peer/0, stat_loop/0, get_peers/1, get_peer/1,
-	update_peer/2, remove_peer/1, garbage_collect/0, is_exit_peer/0,
+	update_peer/2, remove_peer/1, garbage_collect/0, is_exit_peer/0, is_cm_miner/0,
 	get_unique_partitions_list/0, get_self_plus_external_partitions_list/0,
 	get_cluster_partitions_list/0
 ]).
