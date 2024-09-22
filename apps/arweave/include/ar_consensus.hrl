@@ -9,8 +9,11 @@
 -define(PACKING_DIFFICULTY_2_6, 45).
 
 -define(RANDOMX_PACKING_ROUNDS, 8 * (?PACKING_DIFFICULTY)).
-
 -define(RANDOMX_PACKING_ROUNDS_2_6, 8 * (?PACKING_DIFFICULTY_2_6)).
+
+%% Stop supporting the legacy non-composite packing after this number of blocks
+%% passed since the fork 2.8. 365 * 24 * 60 * 60 / 128 = 246375.
+-define(LEGACY_PACKING_EXPIRATION_PERIOD_BLOCKS, (246375 * 4)).
 
 %% The size of the mining partition. The weave is broken down into partitions
 %% of equal size. A miner can search for a solution in each of the partitions
@@ -24,9 +27,16 @@
 %% The size of a recall range. The first range is randomly chosen from the given
 %% mining partition. The second range is chosen from the entire weave.
 -ifdef(DEBUG).
--define(RECALL_RANGE_SIZE, (512 * 1024)).
+-define(RECALL_RANGE_SIZE, (256 * 1024)).
 -else.
--define(RECALL_RANGE_SIZE, 104857600). % == 100 * 1024 * 1024
+-define(RECALL_RANGE_SIZE, 26214400). % == 25 * 1024 * 1024
+-endif.
+
+%% The size of a recall range before the fork 2.8.
+-ifdef(DEBUG).
+-define(LEGACY_RECALL_RANGE_SIZE, (512 * 1024)).
+-else.
+-define(LEGACY_RECALL_RANGE_SIZE, 104857600). % == 100 * 1024 * 1024
 -endif.
 
 -ifdef(FORKS_RESET).
@@ -75,7 +85,6 @@
 -define(POA1_DIFF_MULTIPLIER, 100).
 -endif.
 -endif.
-
 
 %% The number of nonce limiter steps sharing the entropy. We add the entropy
 %% from a past block every so often. If we did not add any entropy at all, even
@@ -135,6 +144,9 @@ end()).
 
 %% The key to initialize the RandomX state from, for RandomX packing.
 -define(RANDOMX_PACKING_KEY, <<"default arweave 2.5 pack key">>).
+
+-define(RANDOMX_HASHING_MODE_FAST, 0).
+-define(RANDOMX_HASHING_MODE_LIGHT, 1).
 
 %% The original plan was to cap the proof at 262144 (also the maximum chunk size).
 %% The maximum tree depth is then (262144 - 64) / (32 + 32 + 32) = 2730.

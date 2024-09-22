@@ -2,7 +2,7 @@
 
 -export([get_hash_rate_fixed_ratio/1, next_cumulative_diff/3, multiply_diff_pre_fork_2_5/2,
 			diff_pair/1, poa1_diff_multiplier/1, poa1_diff/2, scale_diff/3,
-			min_difficulty/1, switch_to_randomx_fork_diff/1]).
+			min_difficulty/1, switch_to_randomx_fork_diff/1, sub_diff/2]).
 
 -include_lib("arweave/include/ar.hrl").
 -include_lib("arweave/include/ar_consensus.hrl").
@@ -12,14 +12,37 @@
 %%%===================================================================
 
 %% @doc Return the block time hash rate for the given difficulty.
-get_hash_rate_fixed_ratio(Block) ->
-	Multiplier = poa1_diff_multiplier(Block#block.height),
-	HashRate = ?MAX_DIFF div (?MAX_DIFF - Block#block.diff),
-	case Multiplier > 1 of
+get_hash_rate_fixed_ratio(B) ->
+	HashRate = ?MAX_DIFF div (?MAX_DIFF - B#block.diff),
+	case B#block.height >= ar_fork:height_2_8() of
 		true ->
-			HashRate * Multiplier div (Multiplier + 1);
+			HashRate;
 		false ->
-			HashRate
+			%% Adjusting the hash rate by
+			%% (TwoChunkCount + OneChunkCount) / TwoChunkCount counts
+			%% the number of all the hashing attempts. In other words,
+			%% the adjusted value is useful when we want to see the total
+			%% amount of CPU work put into mining a block. This is not what
+			%% we use it for. We use it as a denominator when computing
+			%% a share contributed by a single partition - see
+			%% ar_pricing:get_v2_price_per_gib_minute. Therefore, the hash
+			%% rate computed here needs to have the same "units" as
+			%% the hash rate we estimate for the partition -
+			%% the "normalized" hash rate where a recall range only
+			%% produces 4 nonces from one recall range (chunk-1)
+			%% plus up to 400 nonces (chunk-2).
+			%%
+			%% Note that we did not even adjust it
+			%% by (TwoChunkCount + OneChunkCount) / TwoChunkCount but by
+			%% 100 div (100 + 1), what is wrong.
+			Multiplier = poa1_diff_multiplier(B#block.height),
+			HashRate = ?MAX_DIFF div (?MAX_DIFF - B#block.diff),
+			case Multiplier > 1 of
+				true ->
+					HashRate * Multiplier div (Multiplier + 1);
+				false ->
+					HashRate
+			end
 	end.
 
 %% @doc Calculate the cumulative difficulty for the next block.
@@ -58,6 +81,8 @@ poa1_diff(Diff, Height) ->
 %% @doc Scale the difficulty by ScaleDividend/ScaleDivisor.
 %% Example: scale_diff(Diff, {100, 1}, Height) will scale the difficulty by 100, increasing it
 %% Example: scale_diff(Diff, {3, 10}, Height) will scale the difficulty by 3/10, decreasing it
+scale_diff(infinity, _Coeff, _Height) ->
+	infinity;
 scale_diff(Diff, {1, 1}, _Height) ->
 	Diff;
 scale_diff(Diff, {ScaleDividend, ScaleDivisor}, Height) ->
@@ -71,6 +96,29 @@ scale_diff(Diff, {ScaleDividend, ScaleDivisor}, Height) ->
 		MinDiff,
 		MaxDiff - 1
 	).
+
+%% @doc Return the new difficulty computed such that N candidates have approximately the same
+%% chances with the new difficulty as a single candidate with the Diff difficulty.
+%%
+%% Let the probability a candidate satisfies the new difficulty be x.
+%% Let the probability a candidate satisfies the old diffiuclty be p.
+%% Then, the probability at least one of the N candidates satisfies
+%% the new difficulty is 1 - (1 - x) ^ N. We want it to be equal to p.
+%% So, (1 - x) ^ N = 1 - p => x = 1 - 32th root of (1 - p).
+%% The first three terms of the infinite series of (1 - p) ^ (1 / 32) are
+%% 1 - (1 / 32) * p - (31 * p ^ 2)/(2 * 32 ^ 2).
+%% Therefore, x is approximately p/32 + 31 * (p ^ 2) / (2 * 32 ^ 2).
+%% x = NewReverseDiff / MaxDiff, p = ReverseDiff / MaxDiff.
+sub_diff(infinity, _N) ->
+	infinity;
+sub_diff(Diff, N) ->
+	MaxDiff = ?MAX_DIFF,
+	ReverseDiff = MaxDiff - Diff,
+	MaxDiffSquared = MaxDiff * MaxDiff,
+	ReverseDiffSquared = ReverseDiff * ReverseDiff,
+	Dividend = 2 * N * ReverseDiff * MaxDiff + (N - 1) * ReverseDiffSquared,
+	Divisor = 2 * N * N * MaxDiffSquared,
+	(MaxDiff * Divisor - Dividend  * MaxDiff) div Divisor.
 
 -ifdef(DEBUG).
 min_difficulty(_Height) ->

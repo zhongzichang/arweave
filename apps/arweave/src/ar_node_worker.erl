@@ -86,9 +86,6 @@ init([]) ->
 	%% Trap exit to avoid corrupting any open files on quit.
 	process_flag(trap_exit, true),
 	[ok, ok, ok, ok, ok] = ar_events:subscribe([tx, block, nonce_limiter, miner, node_state]),
-	%% Initialize RandomX.
-	ar_randomx_state:start(),
-	ar_randomx_state:start_block_polling(),
 	%% Read persisted mempool.
 	ar_mempool:load_from_disk(),
 	%% Join the network.
@@ -1045,6 +1042,19 @@ get_chunk_hash(#poa{ chunk = Chunk }, Height) ->
 			end
 	end.
 
+get_unpacked_chunk_hash(PoA, PackingDifficulty, RecallByte) ->
+	case PackingDifficulty >= 1 of
+		false ->
+			undefined;
+		true ->
+			case RecallByte of
+				undefined ->
+					undefined;
+				_ ->
+					crypto:hash(sha256, PoA#poa.unpacked_chunk)
+			end
+	end.
+
 pack_block_with_transactions(B, PrevB) ->
 	#block{ reward_history = RewardHistory } = PrevB,
 	TXs = collect_mining_transactions(?BLOCK_TX_COUNT_LIMIT),
@@ -1562,13 +1572,15 @@ start_mining(State) ->
 	DiffPair = get_current_diff(),
 	[{_, MerkleRebaseThreshold}] = ets:lookup(node_state,
 			merkle_rebase_support_threshold),
+	[{_, Height}] = ets:lookup(node_state, height),
 	case maps:get(miner_2_6, State) of
 		undefined ->
-			ar_mining_server:start_mining({DiffPair, MerkleRebaseThreshold}),
+			ar_mining_server:start_mining({DiffPair, MerkleRebaseThreshold, Height}),
 			State#{ miner_2_6 => running };
 		_ ->
 			ar_mining_server:set_difficulty(DiffPair),
 			ar_mining_server:set_merkle_rebase_threshold(MerkleRebaseThreshold),
+			ar_mining_server:set_height(Height),
 			State
 	end.
 
@@ -1764,13 +1776,17 @@ handle_found_solution(Args, PrevB, State) ->
 		solution_hash = SolutionH,
 		start_interval_number = IntervalNumber,
 		step_number = StepNumber,
-		steps = SuppliedSteps
+		steps = SuppliedSteps,
+		packing_difficulty = PackingDifficulty
 	} = Solution,
 	MerkleRebaseThreshold = ?MERKLE_REBASE_SUPPORT_THRESHOLD,
 
 	#block{ indep_hash = PrevH, timestamp = PrevTimestamp,
 			wallet_list = WalletList,
-			nonce_limiter_info = PrevNonceLimiterInfo } = PrevB,
+			nonce_limiter_info = PrevNonceLimiterInfo,
+			height = PrevHeight } = PrevB,
+	Height = PrevHeight + 1,
+
 	Now = os:system_time(second),
 	MaxDeviation = ar_block:get_max_timestamp_deviation(),
 	Timestamp =
@@ -1785,10 +1801,8 @@ handle_found_solution(Args, PrevB, State) ->
 			false ->
 				Now
 		end,
-
 	IsBanned = ar_node_utils:is_account_banned(MiningAddress,
 			ar_wallets:get(WalletList, MiningAddress)),
-
 	%% Check the solution is ahead of the previous solution on the timeline.
 	NonceLimiterInfo = #nonce_limiter_info{ global_step_number = StepNumber,
 			output = NonceLimiterOutput,
@@ -1800,13 +1814,20 @@ handle_found_solution(Args, PrevB, State) ->
 						source => Source }}),
 				{false, address_banned};
 			false ->
-				case ar_nonce_limiter:is_ahead_on_the_timeline(NonceLimiterInfo,
-						PrevNonceLimiterInfo) of
+				case ar_block:validate_packing_difficulty(Height, PackingDifficulty) of
 					false ->
-						ar_events:send(solution, {stale, #{ source => Source }}),
-						{false, timeline};
+						ar_events:send(solution, {rejected,
+								#{ reason => invalid_packing_difficulty, source => Source }}),
+						{false, invalid_packing_difficulty};
 					true ->
-						true
+						case ar_nonce_limiter:is_ahead_on_the_timeline(NonceLimiterInfo,
+								PrevNonceLimiterInfo) of
+							false ->
+								ar_events:send(solution, {stale, #{ source => Source }}),
+								{false, timeline};
+							true ->
+								true
+						end
 				end
 		end,
 
@@ -1946,7 +1967,6 @@ handle_found_solution(Args, PrevB, State) ->
 					next_vdf_difficulty = NextVDFDifficulty,
 					last_step_checkpoints = LastStepCheckpoints2,
 					steps = Steps },
-			Height = PrevB#block.height + 1,
 			{Rate, ScheduledRate} = ar_pricing:recalculate_usd_to_ar_rate(PrevB),
 			{PricePerGiBMinute, ScheduledPricePerGiBMinute} =
 					ar_pricing:recalculate_price_per_gib_minute(PrevB),
@@ -1997,7 +2017,12 @@ handle_found_solution(Args, PrevB, State) ->
 				double_signing_proof = may_be_get_double_signing_proof(PrevB, State),
 				merkle_rebase_support_threshold = MerkleRebaseThreshold,
 				chunk_hash = get_chunk_hash(PoA1, Height),
-				chunk2_hash = get_chunk_hash(PoA2, Height)
+				chunk2_hash = get_chunk_hash(PoA2, Height),
+				packing_difficulty = PackingDifficulty,
+				unpacked_chunk_hash = get_unpacked_chunk_hash(
+						PoA1, PackingDifficulty, RecallByte1),
+				unpacked_chunk2_hash = get_unpacked_chunk_hash(
+						PoA2, PackingDifficulty, RecallByte2)
 			}, PrevB),
 			
 			BlockTimeHistory2 = lists:sublist(

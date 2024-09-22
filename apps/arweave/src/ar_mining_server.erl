@@ -3,10 +3,11 @@
 
 -behaviour(gen_server).
 
--export([start_link/0, start_mining/1, set_difficulty/1, set_merkle_rebase_threshold/1, 
-		compute_h2_for_peer/1, prepare_and_post_solution/1, post_solution/1, read_poa/3,
-		get_recall_bytes/4, active_sessions/0, encode_sessions/1, add_pool_job/6,
-		is_one_chunk_solution/1, fetch_poa_from_peers/1]).
+-export([start_link/0,
+		start_mining/1, set_difficulty/1, set_merkle_rebase_threshold/1, set_height/1,
+		compute_h2_for_peer/1, prepare_and_post_solution/1,
+		get_recall_bytes/5, active_sessions/0, encode_sessions/1, add_pool_job/6,
+		is_one_chunk_solution/1, fetch_poa_from_peers/2]).
 -export([pause/0]).
 
 -export([init/1, handle_cast/2, handle_call/3, handle_info/2, terminate/2]).
@@ -29,8 +30,16 @@
 	gc_frequency_ms				= undefined,
 	gc_process_ref				= undefined,
 	merkle_rebase_threshold		= infinity,
-	is_pool_client				= false
+	is_pool_client				= false,
+	allow_composite_packing		= false,
+	packing_difficulty			= 0
 }).
+
+-ifdef(DEBUG).
+-define(POST_2_8_COMPOSITE_PACKING_DELAY_BLOCKS, 0).
+-else.
+-define(POST_2_8_COMPOSITE_PACKING_DELAY_BLOCKS, 10).
+-endif.
 
 -define(FETCH_POA_FROM_PEERS_TIMEOUT_MS, 10000).
 
@@ -61,16 +70,16 @@ set_difficulty(DiffPair) ->
 set_merkle_rebase_threshold(Threshold) ->
 	gen_server:cast(?MODULE, {set_merkle_rebase_threshold, Threshold}).
 
+set_height(Height) ->
+	gen_server:cast(?MODULE, {set_height, Height}).
+
 %% @doc Add a pool job to the mining queue.
 add_pool_job(SessionKey, StepNumber, Output, PartitionUpperBound, Seed, PartialDiff) ->
 	Args = {SessionKey, StepNumber, Output, PartitionUpperBound, Seed, PartialDiff},
 	gen_server:cast(?MODULE, {add_pool_job, Args}).
 
-prepare_and_post_solution(Candidate) ->
-	gen_server:cast(?MODULE, {prepare_and_post_solution, Candidate}).
-
-post_solution(Solution) ->
-	gen_server:cast(?MODULE, {post_solution, Solution}).
+prepare_and_post_solution(CandidateOrSolution) ->
+	gen_server:cast(?MODULE, {prepare_and_post_solution, CandidateOrSolution}).
 
 active_sessions() ->
 	gen_server:call(?MODULE, active_sessions).
@@ -94,8 +103,9 @@ init([]) ->
 	ar_chunk_storage:open_files("default"),
 
 	Workers = lists:foldl(
-		fun({Partition, _}, Acc) ->
-			maps:put(Partition, ar_mining_worker:name(Partition), Acc)
+		fun({Partition, _MiningAddr, PackingDifficulty}, Acc) ->
+			maps:put({Partition, PackingDifficulty},
+					ar_mining_worker:name(Partition, PackingDifficulty), Acc)
 		end,
 		#{},
 		ar_mining_io:get_partitions(infinity)
@@ -123,10 +133,10 @@ handle_cast(pause, State) ->
 	{noreply, State2#state{ paused = true }};
 
 handle_cast({start_mining, Args}, State) ->
-	{DiffPair, RebaseThreshold} = Args,
+	{DiffPair, RebaseThreshold, Height} = Args,
 	ar:console("Starting mining.~n"),
 	?LOG_INFO([{event, start_mining}, {difficulty, DiffPair},
-			{rebase_threshold, RebaseThreshold}]),
+			{rebase_threshold, RebaseThreshold}, {height, Height}]),
 	ar_mining_stats:start_performance_reports(),
 
 	maps:foreach(
@@ -140,7 +150,9 @@ handle_cast({start_mining, Args}, State) ->
 		paused = false,
 		active_sessions	= sets:new(),
 		diff_pair = DiffPair,
-		merkle_rebase_threshold = RebaseThreshold }};
+		merkle_rebase_threshold = RebaseThreshold,
+		allow_composite_packing
+			= Height - ?POST_2_8_COMPOSITE_PACKING_DELAY_BLOCKS >= ar_fork:height_2_8() }};
 
 handle_cast({set_difficulty, DiffPair}, State) ->
 	State2 = set_difficulty(DiffPair, State),
@@ -149,6 +161,10 @@ handle_cast({set_difficulty, DiffPair}, State) ->
 handle_cast({set_merkle_rebase_threshold, Threshold}, State) ->
 	{noreply, State#state{ merkle_rebase_threshold = Threshold }};
 
+handle_cast({set_height, Height}, State) ->
+	{noreply, State#state{ allow_composite_packing
+			= Height - ?POST_2_8_COMPOSITE_PACKING_DELAY_BLOCKS >= ar_fork:height_2_8() }};
+
 handle_cast({add_pool_job, Args}, State) ->
 	{SessionKey, StepNumber, Output, PartitionUpperBound, Seed, PartialDiff} = Args,
 	State2 = set_seed(SessionKey, Seed, State),
@@ -156,8 +172,9 @@ handle_cast({add_pool_job, Args}, State) ->
 		SessionKey, StepNumber, Output, PartitionUpperBound, PartialDiff, State2);
 
 handle_cast({compute_h2_for_peer, Candidate}, State) ->
-	#mining_candidate{ partition_number2 = Partition2 } = Candidate,
-	case get_worker(Partition2, State) of
+	#mining_candidate{ partition_number2 = Partition2,
+			packing_difficulty = PackingDifficulty } = Candidate,
+	case get_worker({Partition2, PackingDifficulty}, State) of
 		not_found ->
 			ok;
 		Worker ->
@@ -165,12 +182,8 @@ handle_cast({compute_h2_for_peer, Candidate}, State) ->
 	end,
 	{noreply, State};
 
-handle_cast({prepare_and_post_solution, Candidate}, State) ->
-	prepare_and_post_solution(Candidate, State),
-	{noreply, State};
-
-handle_cast({post_solution, Solution}, State) ->
-	post_solution(Solution, State),
+handle_cast({prepare_and_post_solution, CandidateOrSolution}, State) ->
+	prepare_and_post_solution(CandidateOrSolution, State),
 	{noreply, State};
 
 handle_cast({manual_garbage_collect, Ref}, #state{ gc_process_ref = Ref } = State) ->
@@ -227,17 +240,17 @@ handle_info({garbage_collect, StartTime, GCResult}, State) ->
 	case GCResult == false orelse ElapsedTime > ?GC_LOG_THRESHOLD of
 		true ->
 			?LOG_DEBUG([
-				{event, mining_debug_garbage_collect}, {process, ar_mining_server}, {pid, self()},
-				{gc_time, ElapsedTime}, {gc_result, GCResult}]);
+				{event, mining_debug_garbage_collect}, {process, ar_mining_server},
+				{pid, self()}, {gc_time, ElapsedTime}, {gc_result, GCResult}]);
 		false ->
 			ok
 	end,
 	{noreply, State};
 
 handle_info({fetched_last_moment_proof, _}, State) ->
-    %% This is a no-op to handle "slow" response from peers that were queried by `fetch_poa_from_peers`
-    %% Only the first peer to respond with a PoA will be handled, all other responses will fall through to here
-    %% an be ignored.
+    %% This is a no-op to handle "slow" response from peers that were queried by
+	%% `fetch_poa_from_peers`. Only the first peer to respond with a PoA will be handled,
+	%% all other responses will fall through to here an be ignored.
 	{noreply, State};
 
 handle_info(Message, State) ->
@@ -251,8 +264,8 @@ terminate(_Reason, _State) ->
 %%% Private functions.
 %%%===================================================================
 
-get_worker(Partition, State) ->
-	maps:get(Partition, State#state.workers, not_found).
+get_worker(Key, State) ->
+	maps:get(Key, State#state.workers, not_found).
 
 set_difficulty(DiffPair, State) ->
 	maps:foreach(
@@ -360,7 +373,10 @@ update_cache_limits(NumActivePartitions, State) ->
 	%% This allows the cache to store enough chunks for 4 concurrent VDF steps per partition.
 	IdealStepsPerPartition = 4,
 	IdealRangesPerStep = 2,
-	ChunksPerRange = ?RECALL_RANGE_SIZE div ?DATA_CHUNK_SIZE,
+	%% The number of the sub-chunks in the recall range for packing difficulty = 0 is
+	%% the largest. Each mining worker will reduce it according to its packing difficulty
+	%% in set_cache_limits.
+	ChunksPerRange = ar_mining_worker:recall_range_sub_chunks(0),
 	IdealCacheLimit = ar_util:ceil_int(
 		IdealStepsPerPartition * IdealRangesPerStep * ChunksPerRange * NumActivePartitions, 100),
 
@@ -428,8 +444,13 @@ distribute_output(Candidate, State) ->
 
 distribute_output([], _Candidate, _State) ->
 	ok;
-distribute_output([{Partition, MiningAddress} | Partitions], Candidate, State) ->
-	case get_worker(Partition, State) of
+distribute_output([{_Partition, _MiningAddress, PackingDifficulty} | _Partitions],
+		_Candidate, #state{ allow_composite_packing = false }) when PackingDifficulty >= 1 ->
+	%% Do not mine with the composite packing until some time after the fork 2.8.
+	ok;
+distribute_output([{Partition, MiningAddress, PackingDifficulty} | Partitions],
+		Candidate, State) ->
+	case get_worker({Partition, PackingDifficulty}, State) of
 		not_found ->
 			?LOG_ERROR([{event, worker_not_found}, {partition, Partition}]),
 			ok;
@@ -438,31 +459,85 @@ distribute_output([{Partition, MiningAddress} | Partitions], Candidate, State) -
 				Worker, compute_h0,
 				Candidate#mining_candidate{
 					partition_number = Partition,
-					mining_address = MiningAddress
+					mining_address = MiningAddress,
+					packing_difficulty = PackingDifficulty
 				})
 	end,
 	distribute_output(Partitions, Candidate, State).
 
-get_recall_bytes(H0, PartitionNumber, Nonce, PartitionUpperBound) ->
+get_recall_bytes(H0, PartitionNumber, Nonce, PartitionUpperBound, PackingDifficulty) ->
 	{RecallRange1Start, RecallRange2Start} = ar_block:get_recall_range(H0,
 			PartitionNumber, PartitionUpperBound),
-	RelativeOffset = Nonce * (?DATA_CHUNK_SIZE),
-	{RecallRange1Start + RelativeOffset, RecallRange2Start + RelativeOffset}.
+	RecallByte1 = ar_block:get_recall_byte(RecallRange1Start, Nonce, PackingDifficulty),
+	RecallByte2 = ar_block:get_recall_byte(RecallRange2Start, Nonce, PackingDifficulty),
+	{RecallByte1, RecallByte2}.
 
-prepare_and_post_solution(Candidate, State) ->
-	Solution = prepare_solution(Candidate, State),
-	post_solution(Solution, State).
+prepare_and_post_solution(#mining_candidate{} = Candidate, State) ->
+	%% A solo miner builds a solution from a candidate here or a CM miner who received
+	%% H2 from another peer reads chunk1 and sends it to the exit peer.
+	Solution = prepare_solution_from_candidate(Candidate, State),
+	post_solution(Solution, State);
+prepare_and_post_solution(#mining_solution{} = Solution, State) ->
+	%% An exit peer receives a mining solution, possibly without the VDF data and chunk proofs.
+	Solution2 = prepare_solution(Solution, State),
+	post_solution(Solution2, State).
 
-prepare_solution(Candidate, State) ->
+prepare_solution(Solution, State) ->
+	#state{ merkle_rebase_threshold = RebaseThreshold, is_pool_client = IsPoolClient } = State,
+	#mining_solution{
+		mining_address = MiningAddress, next_seed = NextSeed,
+		next_vdf_difficulty = NextVDFDifficulty, nonce = Nonce,
+		nonce_limiter_output = NonceLimiterOutput, partition_number = PartitionNumber,
+		partition_upper_bound = PartitionUpperBound, poa1 = PoA1, poa2 = PoA2,
+		preimage = Preimage, seed = Seed, start_interval_number = StartIntervalNumber,
+		step_number = StepNumber, packing_difficulty = PackingDifficulty
+	} = Solution,
+	Candidate = #mining_candidate{
+		mining_address = MiningAddress, next_seed = NextSeed,
+		next_vdf_difficulty = NextVDFDifficulty, nonce = Nonce,
+		nonce_limiter_output = NonceLimiterOutput, partition_number = PartitionNumber,
+		partition_upper_bound = PartitionUpperBound, poa2 = PoA2,
+		preimage = Preimage, seed = Seed, start_interval_number = StartIntervalNumber,
+		step_number = StepNumber, packing_difficulty = PackingDifficulty
+	},
+	H0 = ar_block:compute_h0(NonceLimiterOutput, PartitionNumber,
+			Seed, MiningAddress, PackingDifficulty),
+	Chunk1 = PoA1#poa.chunk,
+	{H1, Preimage1} = ar_block:compute_h1(H0, Nonce, Chunk1),
+	Candidate2 = Candidate#mining_candidate{
+		h0 = H0,
+		h1 = H1,
+		chunk1 = Chunk1
+	},
+	Candidate3 =
+		case PoA2#poa.chunk of
+			<<>> ->
+				Preimage = Preimage1,
+				Candidate2;
+			Chunk2 ->
+				{H2, Preimage} = ar_block:compute_h2(H1, Chunk2, H0),
+				Candidate2#mining_candidate{ h2 = H2, chunk2 = Chunk2 }
+		end,
+	Solution2 = Solution#mining_solution{ merkle_rebase_threshold = RebaseThreshold },
+	%% A pool client does not validate VDF before sharing a solution.
+	case IsPoolClient of
+		true ->
+			prepare_solution(proofs, Candidate3, Solution2);
+		false ->
+			prepare_solution(last_step_checkpoints, Candidate3, Solution2)
+	end.
+
+prepare_solution_from_candidate(Candidate, State) ->
 	#state{ merkle_rebase_threshold = RebaseThreshold, is_pool_client = IsPoolClient } = State,
 	#mining_candidate{
 		mining_address = MiningAddress, next_seed = NextSeed, 
 		next_vdf_difficulty = NextVDFDifficulty, nonce = Nonce,
 		nonce_limiter_output = NonceLimiterOutput, partition_number = PartitionNumber,
 		partition_upper_bound = PartitionUpperBound, poa2 = PoA2, preimage = Preimage,
-		seed = Seed, start_interval_number = StartIntervalNumber, step_number = StepNumber
+		seed = Seed, start_interval_number = StartIntervalNumber, step_number = StepNumber,
+		packing_difficulty = PackingDifficulty
 	} = Candidate,
-	
+
 	Solution = #mining_solution{
 		mining_address = MiningAddress,
 		merkle_rebase_threshold = RebaseThreshold,
@@ -476,7 +551,8 @@ prepare_solution(Candidate, State) ->
 		preimage = Preimage,
 		seed = Seed,
 		start_interval_number = StartIntervalNumber,
-		step_number = StepNumber
+		step_number = StepNumber,
+		packing_difficulty = PackingDifficulty
 	},
 	%% A pool client does not validate VDF before sharing a solution.
 	case IsPoolClient of
@@ -523,7 +599,9 @@ prepare_solution(steps, Candidate, Solution) ->
 					ar:console("WARNING: found a solution but failed to find checkpoints, "
 							"start step number: ~B, end step number: ~B, next_seed: ~s.",
 							[PrevStepNumber, StepNumber, PrevNextSeed]),
-					error;
+					may_be_leave_it_to_exit_peer(
+							prepare_solution(proofs, Candidate,
+									Solution#mining_solution{ steps = [] }));
 				_ ->
 					prepare_solution(proofs, Candidate,
 							Solution#mining_solution{ steps = Steps })
@@ -540,10 +618,11 @@ prepare_solution(steps, Candidate, Solution) ->
 prepare_solution(proofs, Candidate, Solution) ->
 	#mining_candidate{
 		h0 = H0, h1 = H1, h2 = H2, nonce = Nonce, partition_number = PartitionNumber,
-		partition_upper_bound = PartitionUpperBound } = Candidate,
+		partition_upper_bound = PartitionUpperBound,
+		packing_difficulty = PackingDifficulty } = Candidate,
 	#mining_solution{ poa1 = PoA1, poa2 = PoA2 } = Solution,
 	{RecallByte1, RecallByte2} = get_recall_bytes(H0, PartitionNumber, Nonce,
-			PartitionUpperBound),
+			PartitionUpperBound, PackingDifficulty),
 	case { H1, H2 } of
 		{not_set, not_set} ->
 			?LOG_WARNING([{event, found_solution_but_h1_h2_not_set}]),
@@ -558,88 +637,170 @@ prepare_solution(proofs, Candidate, Solution) ->
 				poa1 = may_be_empty_poa(PoA1), poa2 = may_be_empty_poa(PoA2) })
 	end;
 
-prepare_solution(poa1, Candidate,
-		#mining_solution{ poa1 = #poa{ chunk = <<>> } } = Solution) ->
+prepare_solution(poa1, Candidate, Solution) ->
 	#mining_solution{
+		poa1 = CurrentPoA1,
+		packing_difficulty = PackingDifficulty,
 		mining_address = MiningAddress, partition_number = PartitionNumber,
 		recall_byte1 = RecallByte1 } = Solution,
 	#mining_candidate{
 		chunk1 = Chunk1, h0 = H0, nonce = Nonce,
+		packing_difficulty = PackingDifficulty,
 		partition_upper_bound = PartitionUpperBound } = Candidate,
-	case read_poa(RecallByte1, Chunk1, MiningAddress) of
-		{ok, PoA1} ->
-			Solution#mining_solution{ poa1 = PoA1 };
-		_ ->
-			Modules = ar_storage_module:get_all(RecallByte1 + 1),
-			ModuleIDs = [ar_storage_module:id(Module) || Module <- Modules],
-			?LOG_ERROR([{event, failed_to_find_poa_proofs_locally},
-					{tags, [solution_proofs]},
-					{recall_byte, RecallByte1},
-					{modules_covering_recall_byte, ModuleIDs}]),
-			ar:console("WARNING: we have mined a block but did not find the PoA1 proofs "
-					"locally - searching the peers...~n"),
-			case fetch_poa_from_peers(RecallByte1) of
-				not_found ->
-					{RecallRange1Start, _RecallRange2Start} = ar_block:get_recall_range(H0,
-							PartitionNumber, PartitionUpperBound),
-					?LOG_WARNING([{event, mined_block_but_failed_to_read_chunk_proofs},
-							{recall_byte1, RecallByte1},
-							{recall_range_start1, RecallRange1Start},
-							{nonce, Nonce},
-							{partition, PartitionNumber},
-							{mining_address, ar_util:safe_encode(MiningAddress)}]),
-					ar:console("WARNING: we have mined a block but failed to find "
-							"the PoA1 proofs required for publishing it. "
-							"Check logs for more details~n"),
-					error;
-				PoA1 ->
-					Solution#mining_solution{ poa1 = PoA1#poa{ chunk = Chunk1 } }
+	case is_poa_complete(CurrentPoA1, PackingDifficulty) of
+		true ->
+			Solution;
+		false ->
+			Packing = ar_block:get_packing(PackingDifficulty, MiningAddress),
+			case {Chunk1, read_poa(RecallByte1, Chunk1, Packing, Nonce)} of
+				{_Chunk1, {ok, PoA1}} ->
+					Solution#mining_solution{ poa1 = PoA1 };
+				{not_set, {error, Error}} ->
+					Modules = ar_storage_module:get_all(RecallByte1 + 1),
+					ModuleIDs = [ar_storage_module:id(Module) || Module <- Modules],
+					?LOG_ERROR([{event, failed_to_find_poa1_proofs_for_h2_solution},
+							{error, io_lib:format("~p", [Error])},
+							{tags, [solution_proofs]},
+							{recall_byte, RecallByte1},
+							{packing_difficulty, PackingDifficulty},
+							{modules_covering_recall_byte, ModuleIDs}]),
+					case ar_storage_module:get(RecallByte1 + 1, Packing) of
+						{_BucketSize, _Bucket, Packing} = StorageModule ->
+							StoreID = ar_storage_module:id(StorageModule),
+							case ar_chunk_storage:get(RecallByte1, StoreID) of
+								not_found ->
+									Modules = ar_storage_module:get_all(RecallByte1 + 1),
+									ModuleIDs = [ar_storage_module:id(Module) || Module <- Modules],
+									?LOG_ERROR([{event, failed_to_read_chunk_for_h2},
+											{tags, [solution_proofs]},
+											{recall_byte, RecallByte1},
+											{packing_difficulty, PackingDifficulty},
+											{modules_covering_recall_byte, ModuleIDs}]),
+									error;
+								{_EndOffset, Chunk} ->
+									SubChunk = get_sub_chunk(Chunk, PackingDifficulty, Nonce),
+									Solution#mining_solution{ poa1 = #poa{ chunk = SubChunk } }
+							end;
+						_ ->
+							Modules = ar_storage_module:get_all(RecallByte1 + 1),
+							ModuleIDs = [ar_storage_module:id(Module) || Module <- Modules],
+							?LOG_ERROR([{event, failed_to_find_storage_module_for_h2_poa1_chunk},
+									{tags, [solution_proofs]},
+									{recall_byte, RecallByte1},
+									{packing_difficulty, PackingDifficulty},
+									{modules_covering_recall_byte, ModuleIDs}]),
+							error
+					end;
+				{Chunk1, {error, Error}} ->
+					Modules = ar_storage_module:get_all(RecallByte1 + 1),
+					ModuleIDs = [ar_storage_module:id(Module) || Module <- Modules],
+					?LOG_ERROR([{event, failed_to_find_poa_proofs_locally},
+							{error, io_lib:format("~p", [Error])},
+							{tags, [solution_proofs]},
+							{recall_byte, RecallByte1},
+							{packing_difficulty, PackingDifficulty},
+							{modules_covering_recall_byte, ModuleIDs}]),
+					ar:console("WARNING: we have mined a block but did not find the PoA1 proofs "
+							"locally - searching the peers...~n"),
+					case fetch_poa_from_peers(RecallByte1, PackingDifficulty) of
+						not_found ->
+							{RecallRange1Start, _RecallRange2Start} = ar_block:get_recall_range(H0,
+									PartitionNumber, PartitionUpperBound),
+							?LOG_WARNING([{event, mined_block_but_failed_to_read_chunk_proofs},
+									{recall_byte1, RecallByte1},
+									{recall_range_start1, RecallRange1Start},
+									{nonce, Nonce},
+									{partition, PartitionNumber},
+									{mining_address, ar_util:safe_encode(MiningAddress)},
+									{packing_difficulty, PackingDifficulty}]),
+							ar:console("WARNING: we have mined a block but failed to find "
+									"the PoA1 proofs required for publishing it. "
+									"Check logs for more details~n"),
+							may_be_leave_it_to_exit_peer(
+									Solution#mining_solution{ poa1 = #poa{ chunk = Chunk1 } });
+						PoA1 ->
+							Solution#mining_solution{ poa1 = PoA1#poa{ chunk = Chunk1 } }
+					end
 			end
 	end;
-prepare_solution(poa2, Candidate,
-		#mining_solution{ poa2 = #poa{ chunk = <<>> } } = Solution) ->
-	#mining_solution{ mining_address = MiningAddress, partition_number = PartitionNumber,
+prepare_solution(poa2, Candidate, Solution) ->
+	#mining_solution{
+		poa2 = CurrentPoA2,
+		packing_difficulty = PackingDifficulty,
+		mining_address = MiningAddress, partition_number = PartitionNumber,
 		recall_byte2 = RecallByte2 } = Solution,
 	#mining_candidate{
 		chunk2 = Chunk2, h0 = H0, nonce = Nonce,
 		partition_upper_bound = PartitionUpperBound } = Candidate,
-	case read_poa(RecallByte2, Chunk2, MiningAddress) of
-		{ok, PoA2} ->
-			prepare_solution(poa1, Candidate, Solution#mining_solution{ poa2 = PoA2 });
-		_ ->
-			Modules = ar_storage_module:get_all(RecallByte2 + 1),
-			ModuleIDs = [ar_storage_module:id(Module) || Module <- Modules],
-			?LOG_ERROR([{event, failed_to_find_poa2_proofs_locally},
-					{tags, [solution_proofs]},
-					{recall_byte2, RecallByte2},
-					{modules_covering_recall_byte2, ModuleIDs}]),
-			ar:console("WARNING: we have mined a block but did not find the PoA2 proofs "
-					"locally - searching the peers...~n"),
-			case fetch_poa_from_peers(RecallByte2) of
-				not_found ->
-					{_RecallRange1Start, RecallRange2Start} = ar_block:get_recall_range(H0,
-							PartitionNumber, PartitionUpperBound),
-					?LOG_ERROR([{event, mined_block_but_failed_to_read_chunk_proofs},
+	Packing = ar_block:get_packing(PackingDifficulty, MiningAddress),
+	case is_poa_complete(CurrentPoA2, PackingDifficulty) of
+		true ->
+			prepare_solution(poa1, Candidate, Solution);
+		false ->
+			case read_poa(RecallByte2, Chunk2, Packing, Nonce) of
+				{ok, PoA2} ->
+					prepare_solution(poa1, Candidate, Solution#mining_solution{ poa2 = PoA2 });
+				{error, Error} ->
+					Modules = ar_storage_module:get_all(RecallByte2 + 1),
+					ModuleIDs = [ar_storage_module:id(Module) || Module <- Modules],
+					?LOG_ERROR([{event, failed_to_find_poa2_proofs_locally},
+							{error, io_lib:format("~p", [Error])},
 							{tags, [solution_proofs]},
 							{recall_byte2, RecallByte2},
-							{recall_range_start2, RecallRange2Start},
-							{nonce, Nonce},
-							{partition, PartitionNumber},
-							{mining_address, ar_util:safe_encode(MiningAddress)}]),
-					ar:console("WARNING: we have mined a block but failed to find "
-							"the PoA2 proofs required for publishing it. "
-							"Check logs for more details~n"),
-					error;
-				PoA2 ->
-					prepare_solution(poa1, Candidate,
-							Solution#mining_solution{ poa2 = PoA2#poa{ chunk = Chunk2 } })
+							{modules_covering_recall_byte2, ModuleIDs}]),
+					ar:console("WARNING: we have mined a block but did not find the PoA2 "
+							"proofs locally - searching the peers...~n"),
+					case fetch_poa_from_peers(RecallByte2, PackingDifficulty) of
+						not_found ->
+							{_RecallRange1Start, RecallRange2Start} =
+									ar_block:get_recall_range(H0, PartitionNumber,
+											PartitionUpperBound),
+							?LOG_ERROR([{event, mined_block_but_failed_to_read_chunk_proofs},
+									{tags, [solution_proofs]},
+									{recall_byte2, RecallByte2},
+									{recall_range_start2, RecallRange2Start},
+									{nonce, Nonce},
+									{partition, PartitionNumber},
+									{mining_address, ar_util:safe_encode(MiningAddress)}]),
+							ar:console("WARNING: we have mined a block but failed to find "
+									"the PoA2 proofs required for publishing it. "
+									"Check logs for more details~n"),
+							%% If we are a coordinated miner and not an exit node - the exit node
+							%% will fetch the proofs.
+							may_be_leave_it_to_exit_peer(
+									prepare_solution(poa1, Candidate,
+											Solution#mining_solution{
+													poa2 = #poa{ chunk = Chunk2 } }));
+						PoA2 ->
+							prepare_solution(poa1, Candidate,
+									Solution#mining_solution{
+											poa2 = PoA2#poa{ chunk = Chunk2 } })
+					end
 			end
-	end;
-prepare_solution(poa2, Candidate,
-		#mining_solution{ poa1 = #poa{ chunk = <<>> } } = Solution) ->
-	prepare_solution(poa1, Candidate, Solution);
-prepare_solution(_, _Candidate, Solution) ->
-	Solution.
+	end.
+
+%% Check if the chunk proof has been assembed already by the mining nodes.
+%% If not, we are the exit node and we will fetch the missing data.
+is_poa_complete(#poa{ chunk = <<>> }, _) ->
+	false;
+is_poa_complete(#poa{ data_path = <<>> }, _) ->
+	false;
+is_poa_complete(#poa{ tx_path = <<>> }, _) ->
+	false;
+is_poa_complete(#poa{ unpacked_chunk = <<>> }, PackingDifficulty)
+		when PackingDifficulty >= 1 ->
+	false;
+is_poa_complete(_, _) ->
+	true.
+
+may_be_leave_it_to_exit_peer(Solution) ->
+	case ar_coordination:is_coordinated_miner() andalso
+			not ar_coordination:is_exit_peer() of
+		true ->
+			Solution;
+		false ->
+			error
+	end.
 
 post_solution(error, _State) ->
 	?LOG_WARNING([{event, found_solution_but_could_not_build_a_block}]),
@@ -712,7 +873,9 @@ may_be_empty_poa(not_set) ->
 may_be_empty_poa(#poa{} = PoA) ->
 	PoA.
 
-fetch_poa_from_peers(RecallByte) ->
+fetch_poa_from_peers(_RecallByte, PackingDifficulty) when PackingDifficulty >= 1 ->
+	not_found;
+fetch_poa_from_peers(RecallByte, _PackingDifficulty) ->
 	Peers = ar_data_discovery:get_bucket_peers(RecallByte div ?NETWORK_DATA_BUCKET_SIZE),
 	From = self(),
 	lists:foreach(
@@ -732,9 +895,10 @@ fetch_poa_from_peers(RecallByte) ->
 		Peers
 	),
 	receive
-         %% The first spawned process to fetch a PoA from a peer will trigger this `receive` and allow
-         %% `fetch_poa_from_peers` to exit. All other processes that complete later will trigger the
-         %% `handle_info({fetched_last_moment_proof, _}, State) ->` above (which is a no-op)
+         %% The first spawned process to fetch a PoA from a peer will trigger this `receive`
+		 %% and allow `fetch_poa_from_peers` to exit. All other processes that complete later
+		 %% will trigger the
+		 %% `handle_info({fetched_last_moment_proof, _}, State) ->` above (which is a no-op).
 		{fetched_last_moment_proof, PoA} ->
 			PoA
 		after ?FETCH_POA_FROM_PEERS_TIMEOUT_MS ->
@@ -792,25 +956,80 @@ handle_computed_output(SessionKey, StepNumber, Output, PartitionUpperBound,
 	end,
 	{noreply, State3}.
 
-read_poa(RecallByte, Chunk, MiningAddress) ->
-	PoAReply = read_poa(RecallByte, MiningAddress),
-	case {Chunk, PoAReply} of
-		{not_set, _} ->
-			PoAReply;
-		{Chunk, {ok, #poa{ chunk = Chunk }}} ->
-			PoAReply;
-		{_Chunk, {ok, #poa{}}} ->
+read_poa(RecallByte, ChunkOrSubChunk, Packing, Nonce) ->
+	PoAReply = read_poa(RecallByte, Packing),
+	case {ChunkOrSubChunk, PoAReply, Packing} of
+		{not_set, {ok, #poa{ chunk = Chunk } = PoA}, {composite, _, PackingDifficulty}} ->
+			SubChunk = get_sub_chunk(Chunk, PackingDifficulty, Nonce),
+			{ok, PoA#poa{ chunk = SubChunk }};
+		{_ChunkOrSubChunk, {ok, #poa{ chunk = Chunk } = PoA}, {composite, _, _}} ->
+			case sub_chunk_belongs_to_chunk(ChunkOrSubChunk, Chunk) of
+				true ->
+					{ok, PoA#poa{ chunk = ChunkOrSubChunk }};
+				false ->
+					{error, sub_chunk_mismatch};
+				Error2 ->
+					Error2
+			end;
+		{not_set, {ok, #poa{} = PoA}, _Packing} ->
+			{ok, PoA};
+		{_ChunkOrSubChunk, {ok, #poa{ chunk = ChunkOrSubChunk } = PoA}, _Packing} ->
+			{ok, PoA};
+		{_ChunkOrSubChunk, {ok, #poa{}}, _Packing} ->
 			{error, chunk_mismatch};
-		{_, Error} ->
+		{_ChunkOrSubChunk, Error, _Packing} ->
 			Error
 	end.
 
-read_poa(RecallByte, MiningAddress) ->
-	Options = #{ pack => true, packing => {spora_2_6, MiningAddress},
-			is_miner_request => true },
+get_sub_chunk(Chunk, 0, _Nonce) ->
+	Chunk;
+get_sub_chunk(Chunk, PackingDifficulty, Nonce) ->
+	SubChunkSize = ?COMPOSITE_PACKING_SUB_CHUNK_SIZE,
+	SubChunkIndex = ar_block:get_sub_chunk_index(PackingDifficulty, Nonce),
+	SubChunkStartOffset = SubChunkSize * SubChunkIndex,
+	binary:part(Chunk, SubChunkStartOffset, SubChunkSize).
+
+sub_chunk_belongs_to_chunk(SubChunk,
+		<< SubChunk:?COMPOSITE_PACKING_SUB_CHUNK_SIZE/binary, _Rest/binary >>) ->
+	true;
+sub_chunk_belongs_to_chunk(SubChunk,
+		<< _SubChunk:?COMPOSITE_PACKING_SUB_CHUNK_SIZE/binary, Rest/binary >>) ->
+	sub_chunk_belongs_to_chunk(SubChunk, Rest);
+sub_chunk_belongs_to_chunk(_SubChunk, <<>>) ->
+	false;
+sub_chunk_belongs_to_chunk(_SubChunk, _Chunk) ->
+	{error, uneven_chunk}.
+
+read_poa(RecallByte, Packing) ->
+	Options = #{ pack => true, packing => Packing, is_miner_request => true },
 	case ar_data_sync:get_chunk(RecallByte + 1, Options) of
-		{ok, #{ chunk := Chunk, tx_path := TXPath, data_path := DataPath }} ->
-			{ok, #poa{ option = 1, chunk = Chunk, tx_path = TXPath, data_path = DataPath }};
+		{ok, Proof} ->
+			#{ chunk := Chunk, tx_path := TXPath, data_path := DataPath } = Proof,
+			case Packing of
+				{composite, _Addr, _PackingDifficulty} ->
+					case maps:get(unpacked_chunk, Proof, not_found) of
+						not_found ->
+							read_unpacked_chunk(RecallByte, Proof);
+						UnpackedChunk ->
+							{ok, #poa{ option = 1, chunk = Chunk,
+								unpacked_chunk = ar_packing_server:pad_chunk(UnpackedChunk),
+								tx_path = TXPath, data_path = DataPath }}
+					end;
+				_ ->
+					{ok, #poa{ option = 1, chunk = Chunk,
+							tx_path = TXPath, data_path = DataPath }}
+			end;
+		Error ->
+			Error
+	end.
+
+read_unpacked_chunk(RecallByte, Proof) ->
+	Options = #{ pack => true, packing => unpacked, is_miner_request => true },
+	case ar_data_sync:get_chunk(RecallByte + 1, Options) of
+		{ok, #{ chunk := UnpackedChunk, tx_path := TXPath, data_path := DataPath }} ->
+			{ok, #poa{ option = 1, chunk = maps:get(chunk, Proof),
+				unpacked_chunk = ar_packing_server:pad_chunk(UnpackedChunk),
+				tx_path = TXPath, data_path = DataPath }};
 		Error ->
 			Error
 	end.
@@ -821,21 +1040,25 @@ validate_solution(Solution, DiffPair) ->
 		nonce = Nonce, nonce_limiter_output = NonceLimiterOutput,
 		partition_number = PartitionNumber, partition_upper_bound = PartitionUpperBound,
 		poa1 = PoA1, recall_byte1 = RecallByte1, seed = Seed,
-		solution_hash = SolutionHash } = Solution,
-	H0 = ar_block:compute_h0(NonceLimiterOutput, PartitionNumber, Seed, MiningAddress),
+		solution_hash = SolutionHash,
+		packing_difficulty = PackingDifficulty } = Solution,
+	H0 = ar_block:compute_h0(NonceLimiterOutput, PartitionNumber, Seed, MiningAddress,
+			PackingDifficulty),
 	{H1, _Preimage1} = ar_block:compute_h1(H0, Nonce, PoA1#poa.chunk),
 	{RecallRange1Start, RecallRange2Start} = ar_block:get_recall_range(H0,
 			PartitionNumber, PartitionUpperBound),
 	%% Assert recall_byte1 is computed correctly.
-	RecallByte1 = RecallRange1Start + Nonce * ?DATA_CHUNK_SIZE,
+	RecallByte1 = ar_block:get_recall_byte(RecallRange1Start, Nonce, PackingDifficulty),
 	{BlockStart1, BlockEnd1, TXRoot1} = ar_block_index:get_block_bounds(RecallByte1),
 	BlockSize1 = BlockEnd1 - BlockStart1,
+	Packing = ar_block:get_packing(PackingDifficulty, MiningAddress),
+	SubChunkIndex = ar_block:get_sub_chunk_index(PackingDifficulty, Nonce),
 	case ar_poa:validate({BlockStart1, RecallByte1, TXRoot1, BlockSize1, PoA1,
-			{spora_2_6, MiningAddress}, not_set}) of
+			Packing, SubChunkIndex, not_set}) of
 		{true, ChunkID} ->
-			PoACache = {{BlockStart1, RecallByte1, TXRoot1, BlockSize1,
-					{spora_2_6, MiningAddress}}, ChunkID},
-			case ar_node_utils:h1_passes_diff_check(H1, DiffPair) of
+			PoACache = {{BlockStart1, RecallByte1, TXRoot1, BlockSize1, Packing,
+					SubChunkIndex}, ChunkID},
+			case ar_node_utils:h1_passes_diff_check(H1, DiffPair, PackingDifficulty) of
 				true ->
 					%% validates solution_hash
 					SolutionHash = H1,
@@ -851,24 +1074,23 @@ validate_solution(Solution, DiffPair) ->
 							#mining_solution{
 								recall_byte2 = RecallByte2, poa2 = PoA2 } = Solution,
 							{H2, _Preimage2} = ar_block:compute_h2(H1, PoA2#poa.chunk, H0),
-							case ar_node_utils:h2_passes_diff_check(H2, DiffPair) of
+							case ar_node_utils:h2_passes_diff_check(H2, DiffPair,
+									PackingDifficulty) of
 								false ->
 									{false, h2_diff_check};
 								true ->
-									
-									%% validates solution_hash
 									SolutionHash = H2,
-									%% validates recall_byte2
-									RecallByte2 = RecallRange2Start + Nonce * ?DATA_CHUNK_SIZE,
+									RecallByte2 = ar_block:get_recall_byte(RecallRange2Start,
+											Nonce, PackingDifficulty),
 									{BlockStart2, BlockEnd2, TXRoot2} =
 											ar_block_index:get_block_bounds(RecallByte2),
 									BlockSize2 = BlockEnd2 - BlockStart2,
 									case ar_poa:validate({BlockStart2, RecallByte2, TXRoot2,
 											BlockSize2, PoA2,
-											{spora_2_6, MiningAddress}, not_set}) of
+											Packing, SubChunkIndex, not_set}) of
 										{true, Chunk2ID} ->
 											PoA2Cache = {{BlockStart2, RecallByte2, TXRoot2,
-													BlockSize2, {spora_2_6, MiningAddress}},
+													BlockSize2, Packing, SubChunkIndex},
 													Chunk2ID},
 											{true, PoACache, PoA2Cache};
 										error ->

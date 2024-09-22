@@ -115,9 +115,9 @@
 	invalid_poa2,
 	invalid_nonce_limiter,
 	invalid_nonce_limiter_cache_mismatch,
-	invalid_chunk_hash,
-	invalid_chunk2_hash
+	invalid_packing_difficulty
 ]).
+
 -define(BLOCK_REJECTION_IGNORE, [
 	invalid_signature,
 	invalid_proof_size,
@@ -127,7 +127,11 @@
 	invalid_hash,
 	invalid_timestamp,
 	invalid_resigned_solution_hash,
-	invalid_nonce_limiter_global_step_number
+	invalid_nonce_limiter_global_step_number,
+	invalid_first_unpacked_chunk,
+	invalid_second_unpacked_chunk,
+	invalid_first_unpacked_chunk_hash,
+	invalid_second_unpacked_chunk_hash
 ]).
 
 %% We only do scoring of this many TCP ports per IP address. When there are not enough slots,
@@ -490,13 +494,21 @@ discover_peers([Peer | Peers]) ->
 		false ->
 			case check_peer(Peer, is_public_peer(Peer)) of
 				ok ->
-					case ar_http_iface_client:get_info(Peer, release) of
-						Release when is_integer(Release) ->
-							maybe_add_peer(Peer, Release);
+					case ar_http_iface_client:get_info(Peer) of
 						info_unavailable ->
-							maybe_add_peer(Peer, 0);
-						_ ->
-							ok
+							ok;
+						Info ->
+							case maps:get(atom_to_binary(network), Info, no_key) of
+								<<?NETWORK_NAME>> ->
+									case maps:get(atom_to_binary(release), Info, no_key) of
+										Release when is_integer(Release) ->
+											maybe_add_peer(Peer, Release);
+										no_key ->
+											maybe_add_peer(Peer, 0)
+									end;
+								_ ->
+									ok
+							end
 					end;
 				_ ->
 					ok
@@ -523,7 +535,7 @@ load_peers() ->
 		not_found ->
 			ok;
 		{ok, {_TotalRating, Records}} ->
-			?LOG_INFO([{event, polling_saved_peers}]),
+			?LOG_INFO([{event, polling_saved_peers}, {records, length(Records)}]),
 			ar:console("Polling saved peers...~n"),
 			load_peers(Records),
 			recalculate_total_rating(lifetime),
@@ -892,6 +904,7 @@ store_peers() ->
 					[],
 					?MODULE
 				),
+			?LOG_INFO([{event, store_peers}, {total, Total}, {records, length(Records)}]),
 			ar_storage:write_term(peers, {Total, Records})
 	end.
 

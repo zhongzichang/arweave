@@ -1,3 +1,9 @@
+#include <erl_nif.h>
+#include <string.h>
+#include <openssl/sha.h>
+#include <ar_nif.h>
+#include "vdf.h"
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //    SHA
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -42,75 +48,6 @@ static ERL_NIF_TERM vdf_sha2_nif(ErlNifEnv* envPtr, int argc, const ERL_NIF_TERM
 	return ok_tuple2(envPtr, make_output_binary(envPtr, temp_result, VDF_SHA_HASH_SIZE), outputTermCheckpoint);
 }
 
-static ERL_NIF_TERM vdf_parallel_sha_verify_nif(
-	ErlNifEnv* envPtr,
-	int argc,
-	const ERL_NIF_TERM argv[]
-) {
-	ErlNifBinary Salt, Seed, InCheckpoint, InRes;
-	int checkpointCount;
-	int skipCheckpointCount;
-	int hashingIterations;
-	int maxThreadCount;
-
-	if (argc != 8) {
-		return enif_make_badarg(envPtr);
-	}
-
-	// copypasted from vdf_sha2_nif
-	if (!enif_inspect_binary(envPtr, argv[0], &Salt)) {
-		return enif_make_badarg(envPtr);
-	}
-	if (Salt.size != SALT_SIZE) {
-		return enif_make_badarg(envPtr);
-	}
-	if (!enif_inspect_binary(envPtr, argv[1], &Seed)) {
-		return enif_make_badarg(envPtr);
-	}
-	if (Seed.size != VDF_SHA_HASH_SIZE) {
-		return enif_make_badarg(envPtr);
-	}
-	if (!enif_get_int(envPtr, argv[2], &checkpointCount)) {
-		return enif_make_badarg(envPtr);
-	}
-	if (!enif_get_int(envPtr, argv[3], &skipCheckpointCount)) {
-		return enif_make_badarg(envPtr);
-	}
-	if (!enif_get_int(envPtr, argv[4], &hashingIterations)) {
-		return enif_make_badarg(envPtr);
-	}
-	if (!enif_inspect_binary(envPtr, argv[5], &InCheckpoint)) {
-		return enif_make_badarg(envPtr);
-	}
-	if (InCheckpoint.size != checkpointCount*VDF_SHA_HASH_SIZE) {
-		return enif_make_badarg(envPtr);
-	}
-	if (!enif_inspect_binary(envPtr, argv[6], &InRes)) {
-		return enif_make_badarg(envPtr);
-	}
-	if (InRes.size != VDF_SHA_HASH_SIZE) {
-		return enif_make_badarg(envPtr);
-	}
-	if (!enif_get_int(envPtr, argv[7], &maxThreadCount)) {
-		return enif_make_badarg(envPtr);
-	}
-	if (maxThreadCount < 1) {
-		return enif_make_badarg(envPtr);
-	}
-
-	// NOTE last paramemter will be array later
-	size_t outCheckpointSize = VDF_SHA_HASH_SIZE*(1+checkpointCount)*(1+skipCheckpointCount);
-	ERL_NIF_TERM outputTermCheckpoint;
-	unsigned char* outCheckpoint = enif_make_new_binary(envPtr, outCheckpointSize, &outputTermCheckpoint);
-	bool res = vdf_parallel_sha_verify(Salt.data, Seed.data, checkpointCount, skipCheckpointCount, hashingIterations, InRes.data, InCheckpoint.data, outCheckpoint, maxThreadCount);
-	// TODO return all checkpoints
-	if (!res) {
-		return error(envPtr, "verification failed");
-	}
-
-	return ok_tuple(envPtr, outputTermCheckpoint);
-}
-
 static ERL_NIF_TERM vdf_parallel_sha_verify_with_reset_nif(
 	ErlNifEnv* envPtr,
 	int argc,
@@ -126,7 +63,6 @@ static ERL_NIF_TERM vdf_parallel_sha_verify_with_reset_nif(
 		return enif_make_badarg(envPtr);
 	}
 
-	// copypasted from vdf_sha2_nif
 	if (!enif_inspect_binary(envPtr, argv[0], &Salt)) {
 		return enif_make_badarg(envPtr);
 	}
@@ -182,12 +118,24 @@ static ERL_NIF_TERM vdf_parallel_sha_verify_with_reset_nif(
 	// NOTE last paramemter will be array later
 	size_t outCheckpointSize = VDF_SHA_HASH_SIZE*(1+checkpointCount)*(1+skipCheckpointCount);
 	ERL_NIF_TERM outputTermCheckpoint;
-	unsigned char* outCheckpoint = enif_make_new_binary(envPtr, outCheckpointSize, &outputTermCheckpoint);
-	bool res = vdf_parallel_sha_verify_with_reset(Salt.data, Seed.data, checkpointCount, skipCheckpointCount, hashingIterations, InRes.data, InCheckpoint.data, outCheckpoint, ResetSalt.data, ResetSeed.data, maxThreadCount);
+	unsigned char* outCheckpoint = enif_make_new_binary(
+		envPtr, outCheckpointSize, &outputTermCheckpoint);
+	bool res = vdf_parallel_sha_verify_with_reset(
+		Salt.data, Seed.data, checkpointCount, skipCheckpointCount, hashingIterations,
+		InRes.data, InCheckpoint.data, outCheckpoint, ResetSalt.data, ResetSeed.data,
+		maxThreadCount);
 	// TODO return all checkpoints
 	if (!res) {
-		return error(envPtr, "verification failed");
+		return error_tuple(envPtr, "verification failed");
 	}
 
 	return ok_tuple(envPtr, outputTermCheckpoint);
 }
+
+static ErlNifFunc nif_funcs[] = {
+	{"vdf_sha2_nif", 5, vdf_sha2_nif, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+	{"vdf_parallel_sha_verify_with_reset_nif", 10, vdf_parallel_sha_verify_with_reset_nif,
+		ERL_NIF_DIRTY_JOB_CPU_BOUND}
+};
+
+ERL_NIF_INIT(ar_vdf_nif, nif_funcs, NULL, NULL, NULL, NULL);

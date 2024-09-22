@@ -310,6 +310,22 @@
 %% Maximum size of a single data chunk, in bytes.
 -define(DATA_CHUNK_SIZE, (256 * 1024)).
 
+%% The maximum allowed packing difficulty.
+-define(MAX_PACKING_DIFFICULTY, 32).
+
+%% The number of sub-chunks in a compositely packed chunk.
+%% The composite packing with the packing difficulty 1 matches approximately the non-composite
+%% 2.6 packing in terms of computational costs.
+-define(COMPOSITE_PACKING_SUB_CHUNK_COUNT, 32).
+
+%% The size of a unit sub-chunk in the compositely packed chunk.
+-define(COMPOSITE_PACKING_SUB_CHUNK_SIZE,
+		(?DATA_CHUNK_SIZE div ?COMPOSITE_PACKING_SUB_CHUNK_COUNT)).
+
+%% The number of RandomX rounds used for a single iteration of packing of a single sub-chunk
+%% during the composite packing.
+-define(COMPOSITE_PACKING_ROUND_COUNT, 10).
+
 %% Maximum size of a `data_path`, in bytes.
 -define(MAX_PATH_SIZE, (256 * 1024)).
 
@@ -359,7 +375,14 @@
 	%% of the corresponding transaction. Proofs the inclusion of the chunk
 	%% in the corresponding "data_root" under a particular offset.
 	data_path = <<>>,
-	chunk = <<>>
+	%% When packing difficulty is 0 chunk stores a full ?DATA_CHUNK_SIZE-sized packed chunk.
+	%% When packing difficulty >= 1, chunk stores a ?COMPOSITE_PACKING_SUB_CHUNK_SIZE-sized
+	%% packed sub-chunk.
+	chunk = <<>>,
+	%% When packing difficulty is 0 unpacked_chunk is <<>>.
+	%% When packing difficulty >= 1, unpacked_chunk stores a full 0-padded
+	%% ?DATA_CHUNK_SIZE-sized unpacked chunk.
+	unpacked_chunk = <<>>
 }).
 
 %% @doc The information which simplifies validation of the nonce limiting procedures.
@@ -612,6 +635,30 @@
 	%% two-chunk) of the latest ?BLOCK_TIME_HISTORY_BLOCKS blocks.
 	%% Used internally, not gossiped.
 	block_time_history = [], % {block_interval, vdf_interval, chunk_count}
+
+	%%
+	%% The fields below were added at the fork 2.8.
+	%%
+
+	%% The packing difficulty of the replica the block was mined with.
+	%% Applies to both poa1 and poa2.
+	%%
+	%% Packing difficulty 0 denotes the usual pre-2.8 packing scheme.
+	%% Packing difficulty 1 refers to the new composite packing of approximately the same
+	%% computational cost as the difficulty 0 packing. Packing difficulty 2 is the composite
+	%% packing where each sub-chunk is hashed twice as many times. The maximum allowed
+	%% value is 32.
+	%%
+	%% When packing_difficulty >= 1, both poa1 and poa2 contain the unpacked chunks.
+	%% The values of the "chunk" fields are now 8192-byte packed sub-chunks.
+	packing_difficulty = 0,
+	%% The SHA2-256 of the unpacked 0-padded (if less than 256 KiB) chunk.
+	%% undefined when packing_difficulty == 0, has a value otherwise.
+	unpacked_chunk_hash,
+	%% The SHA2-256 of the unpacked 0-padded (if less than 256 KiB) chunk2.
+	%% undefined when packing_difficulty == 0 or recall_byte2 == undefined,
+	%% has a value otherwise.
+	unpacked_chunk2_hash,
 
 	%% Used internally, not gossiped. Convenient for validating potentially non-unique
 	%% merkle proofs assigned to the different signatures of the same solution
