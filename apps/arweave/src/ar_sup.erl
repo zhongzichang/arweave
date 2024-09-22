@@ -78,6 +78,7 @@ init([]) ->
 		?CHILD_SUP(ar_data_sync_sup, supervisor),
 		?CHILD_SUP(ar_chunk_storage_sup, supervisor),
 		?CHILD(ar_global_sync_record, worker),
+		?CHILD(ar_nonce_limiter, worker),
 		?CHILD_SUP(ar_mining_sup, supervisor),
 		?CHILD(ar_coordination, worker),
 		?CHILD_SUP(ar_tx_emitter_sup, supervisor),
