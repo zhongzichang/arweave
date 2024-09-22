@@ -43,10 +43,8 @@ maybe_request_sessions(SessionKey) ->
 
 init([]) ->
 	case ar_config:use_remote_vdf_server() andalso ar_config:pull_from_remote_vdf_server() of
-		false ->
-			ok;
-		true ->
-			gen_server:cast(?MODULE, pull)
+		_ ->
+			ok
 	end,
 	{ok, Config} = application:get_env(arweave, config),
 	Now =  erlang:system_time(millisecond),
