@@ -56,7 +56,6 @@ handle_cast(fetch_jobs, State) ->
 		end,
 	case ar_http_iface_client:get_jobs(Peer, PrevOutput) of
 		{ok, Jobs} ->
-			ar_pool:emit_jobs(Jobs),
 			ar_pool:cache_jobs(Jobs),
 			push_jobs_to_cm_peers(Jobs),
 			ar_util:cast_after(?FETCH_JOBS_FREQUENCY_MS, self(), fetch_jobs);
