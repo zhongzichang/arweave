@@ -2613,7 +2613,7 @@ handle_get_jobs_cm_exit_peer_pool_client(PrevOutput, Req) ->
 
 %% Only for cm miners that are NOT exit peers.
 handle_post_pool_jobs(Req, Pid) ->
-	PoolCMMiner = (not ar_coordination:is_exit_peer()) andalso ar_pool:is_client(),
+	PoolCMMiner = ar_pool:is_client(),
 	case PoolCMMiner of
 		false ->
 			{501, #{}, jiffy:encode(#{ error => configuration }), Req};
