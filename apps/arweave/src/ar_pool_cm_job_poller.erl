@@ -27,8 +27,8 @@ start_link() ->
 
 init([]) ->
 	case {ar_pool:is_client(), ar_coordination:is_exit_peer()} of
-		%%{true, true} ->
-		%%	gen_server:cast(self(), fetch_cm_jobs);
+		{true, true} ->
+			gen_server:cast(self(), fetch_cm_jobs);
 		_ ->
 			%% If we are a CM miner and not an exit peer, our exit peer will push
 			%% the pool CM jobs to us.
