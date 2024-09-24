@@ -7,6 +7,8 @@
 
 %% The frequency in milliseconds of asking the pool or CM exit node about new jobs.
 -define(FETCH_JOBS_FREQUENCY_MS, 500).
+-define(FETCH_JOBS_FROM_CM_EXIT_FREQUENCY_MS, 20).
+
 
 %% The time in milliseconds we wait before retrying a failed fetch jobs request.
 -define(FETCH_JOBS_RETRY_MS, 2000).

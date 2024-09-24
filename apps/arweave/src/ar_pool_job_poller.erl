@@ -40,23 +40,23 @@ handle_call(Request, _From, State) ->
 handle_cast(fetch_jobs, State) ->
 	PrevOutput = (ar_pool:get_latest_job())#job.output,
 	{ok, Config} = application:get_env(arweave, config),
-	Peer =
+	{Peer, Frequency } =
 		case {Config#config.coordinated_mining, Config#config.cm_exit_peer} of
 			{true, not_set} ->
 				%% We are a CM exit node.
-				ar_pool:pool_peer();
+				{ar_pool:pool_peer(), ?FETCH_JOBS_FREQUENCY_MS};
 			{true, ExitPeer} ->
 				%% We are a CM miner.
-				ExitPeer;
+				{ExitPeer, ?FETCH_JOBS_FROM_CM_EXIT_FREQUENCY_MS};
 			_ ->
 				%% We are a standalone pool client (a non-CM miner and a pool client).
-				ar_pool:pool_peer()
+				{ar_pool:pool_peer(), ?FETCH_JOBS_FREQUENCY_MS}
 		end,
 	case ar_http_iface_client:get_jobs(Peer, PrevOutput) of
 		{ok, Jobs} ->
 			emit_pool_jobs(Jobs),
 			ar_pool:cache_jobs(Jobs),
-			ar_util:cast_after(?FETCH_JOBS_FREQUENCY_MS, self(), fetch_jobs);
+			ar_util:cast_after(Frequency, self(), fetch_jobs);
 		{error, Error} ->
 			?LOG_WARNING([{event, failed_to_fetch_pool_jobs},
 					{error, io_lib:format("~p", [Error])}]),
