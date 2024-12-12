@@ -1,8 +1,9 @@
 -module(ar_storage_module).
 
--export([id/1, label/1, address_label/1, address_label/2, packing_label/1, label_by_id/1,
-		get_by_id/1, get_range/1, get_packing/1, get_size/1, get/2, get_all/1, get_all/2,
-		has_any/1, has_range/2, get_cover/3]).
+-export([id/1, label/1, address_label/1, address_label/2, module_address/1,
+		module_packing_difficulty/1, packing_label/1, label_by_id/1, get_by_id/1,
+		get_range/1, module_range/1, module_range/2, get_packing/1, get_size/1,
+		get/2, get_all/1, get_all/2, has_any/1, has_range/2, get_cover/3]).
 
 -export([get_unique_sorted_intervals/1]).
 
@@ -21,6 +22,9 @@
 -else.
 -define(OVERLAP, (?LEGACY_RECALL_RANGE_SIZE)).
 -endif.
+
+-type storage_module() :: {integer(), integer(), {atom(), binary()}}
+						| {integer(), integer(), {atom(), binary(), integer()}}.
 
 %%%===================================================================
 %%% Public interface.
@@ -85,6 +89,20 @@ address_label(Addr, PackingDifficulty) ->
 			integer_to_list(Label)
 	end.
 
+-spec module_address(ar_storage_module:storage_module()) -> binary() | undefined.
+module_address({_, _, {spora_2_6, Addr}}) ->
+	Addr;
+module_address({_, _, {composite, Addr, _PackingDifficulty}}) ->
+	Addr;
+module_address(_StorageModule) ->
+	undefined.
+
+-spec module_packing_difficulty(ar_storage_module:storage_module()) -> integer().
+module_packing_difficulty({_, _, {composite, _Addr, PackingDifficulty}}) ->
+	PackingDifficulty;
+module_packing_difficulty(_StorageModule) ->
+	0.
+
 packing_label({spora_2_6, Addr}) ->
 	AddrLabel = ar_storage_module:address_label(Addr),
 	list_to_atom("spora_2_6_" ++ AddrLabel);
@@ -134,11 +152,18 @@ get_range(ID) ->
 get_range(ID, [Module | Modules]) ->
 	case ar_storage_module:id(Module) == ID of
 		true ->
-			{BucketSize, Bucket, _Packing} = Module,
-			{BucketSize * Bucket, (Bucket + 1) * BucketSize + ?OVERLAP};
+			module_range(Module);
 		false ->
 			get_range(ID, Modules)
 	end.
+
+-spec module_range(ar_storage_module:storage_module()) ->
+	{non_neg_integer(), non_neg_integer()}.
+module_range(Module) ->
+	module_range(Module, ?OVERLAP).
+module_range(Module, Overlap) ->	
+	{BucketSize, Bucket, _Packing} = Module,
+	{BucketSize * Bucket, (Bucket + 1) * BucketSize + Overlap}.
 
 %% @doc Return the packing configured for the given module.
 get_packing(ID) ->

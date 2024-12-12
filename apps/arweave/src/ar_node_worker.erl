@@ -383,7 +383,12 @@ handle_info({event, node_state, _Event}, State) ->
 handle_info({event, nonce_limiter, initialized}, State) ->
 	[{_, {Height, Blocks, BI}}] = ets:lookup(node_state, join_state),
 	ar_storage:store_block_index(BI),
-	B = hd(Blocks),
+	RecentBI = lists:sublist(BI, ?BLOCK_INDEX_HEAD_LEN),
+	Current = element(1, hd(RecentBI)),
+	RecentBlocks = lists:sublist(Blocks, ?STORE_BLOCKS_BEHIND_CURRENT),
+	RecentBlocks2 = set_poa_caches(RecentBlocks),
+	ar_block_cache:initialize_from_list(block_cache, RecentBlocks2),
+	B = hd(RecentBlocks2),
 	RewardHistory = [{H, {Addr, HashRate, Reward, Denomination}}
 			|| {{Addr, HashRate, Reward, Denomination}, {H, _, _}}
 			<- lists:zip(B#block.reward_history,
@@ -394,15 +399,11 @@ handle_info({event, nonce_limiter, initialized}, State) ->
 			<- lists:zip(B#block.block_time_history,
 					lists:sublist(BI, length(B#block.block_time_history)))],
 	ar_storage:store_block_time_history_part2(BlockTimeHistory),
-	RecentBI = lists:sublist(BI, ?BLOCK_INDEX_HEAD_LEN),
 	Height = B#block.height,
 	ar_disk_cache:write_block(B),
 	ar_data_sync:join(RecentBI),
 	ar_header_sync:join(Height, RecentBI, Blocks),
 	ar_tx_blacklist:start_taking_down(),
-	Current = element(1, hd(RecentBI)),
-	ar_block_cache:initialize_from_list(block_cache,
-			lists:sublist(Blocks, ?STORE_BLOCKS_BEHIND_CURRENT)),
 	BlockTXPairs = [block_txs_pair(Block) || Block <- Blocks],
 	{BlockAnchors, RecentTXMap} = get_block_anchors_and_recent_txs_map(BlockTXPairs),
 	{Rate, ScheduledRate} = {B#block.usd_to_ar_rate, B#block.scheduled_usd_to_ar_rate},
@@ -1680,14 +1681,34 @@ start_from_state(BI, Height) ->
 		{Skipped, Blocks} ->
 			BI2 = lists:nthtail(Skipped, BI),
 			Height2 = Height - Skipped,
-			RewardHistoryBI = ar_rewards:trim_buffered_reward_history(Height, BI2),
+
+			%% Until we hit ~2 months post 2.8 hardfork, the reward history accumulated
+			%% by any node will be shorter than the full expected length. Specicifically
+			%% it will be 21,600 blocks plus the number of blocks that have elapsed since
+			%% the 2.8 HF activatin.
+			InterimRewardHistoryLength = (Height - ar_fork:height_2_8()) + 21600,
+			RewardHistoryBI = lists:sublist(
+					ar_rewards:trim_buffered_reward_history(Height, BI2),
+					InterimRewardHistoryLength
+			),
+
 			BlockTimeHistoryBI = lists:sublist(BI2,
 					ar_block_time_history:history_length() + ?STORE_BLOCKS_BEHIND_CURRENT),
 			case {ar_storage:read_reward_history(RewardHistoryBI),
 					ar_storage:read_block_time_history(Height2, BlockTimeHistoryBI)} of
 				{not_found, _} ->
+					?LOG_ERROR([{event, start_from_state_error},
+							{reason, reward_history_not_found},
+							{height, Height2},
+							{block_index, length(BI2)},
+							{reward_history, length(RewardHistoryBI)}]),
 					reward_history_not_found;
 				{_, not_found} ->
+					?LOG_ERROR([{event, start_from_state_error},
+							{reason, block_time_history_not_found},
+							{height, Height2},
+							{block_index, length(BI2)},
+							{block_time_history, length(BlockTimeHistoryBI)}]),
 					block_time_history_not_found;
 				{RewardHistory, BlockTimeHistory} ->
 					Blocks2 = ar_rewards:set_reward_history(Blocks, RewardHistory),
@@ -1754,6 +1775,39 @@ read_recent_blocks3([{BH, _, _} | BI], BlocksToRead, Blocks) ->
 					[ar_util:encode(BH), io_lib:format("~p", [Error])]),
 			not_found
 	end.
+
+set_poa_caches([]) ->
+	[];
+set_poa_caches([B | Blocks]) ->
+	[set_poa_cache(B) | set_poa_caches(Blocks)].
+
+set_poa_cache(B) ->
+	PoA1 = B#block.poa,
+	PoA2 = B#block.poa2,
+	MiningAddress = B#block.reward_addr,
+	PackingDifficulty = B#block.packing_difficulty,
+	Nonce = B#block.nonce,
+	RecallByte1 = B#block.recall_byte,
+	RecallByte2 = B#block.recall_byte2,
+	Packing = ar_block:get_packing(PackingDifficulty, MiningAddress),
+	PoACache = compute_poa_cache(B, PoA1, RecallByte1, Nonce, Packing),
+	B2 = B#block{ poa_cache = PoACache },
+	%% Compute PoA2 cache if PoA2 is present.
+	case RecallByte2 of
+		undefined ->
+			B2;
+		_ ->
+			PoA2Cache = compute_poa_cache(B, PoA2, RecallByte2, Nonce, Packing),
+			B2#block{ poa2_cache = PoA2Cache }
+	end.
+
+compute_poa_cache(B, PoA, RecallByte, Nonce, Packing) ->
+	PackingDifficulty = B#block.packing_difficulty,
+	SubChunkIndex = ar_block:get_sub_chunk_index(PackingDifficulty, Nonce),
+	{BlockStart, BlockEnd, TXRoot} = ar_block_index:get_block_bounds(RecallByte),
+	BlockSize = BlockEnd - BlockStart,
+	ChunkID = ar_tx:generate_chunk_id(PoA#poa.chunk),
+	{{BlockStart, RecallByte, TXRoot, BlockSize, Packing, SubChunkIndex}, ChunkID}.
 
 dump_mempool(TXs, MempoolSize) ->
 	SerializedTXs = maps:map(fun(_, {TX, St}) -> {ar_serialize:tx_to_binary(TX), St} end, TXs),

@@ -114,7 +114,10 @@ verify_chunks({IntervalEnd, IntervalStart}, Intervals, State) ->
 
 verify_chunk({error, Reason}, _Intervals, State) ->
 	#state{ cursor = Cursor } = State,
-	log_error(get_chunk_error, Cursor, ?DATA_CHUNK_SIZE, [{reason, Reason}], State);
+	NextCursor = ar_data_sync:advance_chunks_index_cursor(Cursor),
+	RangeSkipped = NextCursor - Cursor,
+	State2 = log_error(get_chunk_error, Cursor, RangeSkipped, [{reason, Reason}], State),
+	State2#state{ cursor = NextCursor };
 verify_chunk({ok, _Key, MetaData}, Intervals, State) ->
 	{AbsoluteOffset, _ChunkDataKey, _TXRoot, _DataRoot, _TXPath,
 		_TXRelativeOffset, ChunkSize} = MetaData,
@@ -535,11 +538,12 @@ test_verify_chunk() ->
 			{Interval, not_found},
 			#state{})),
 	ExpectedState = #state{ 
+		cursor = 33554432, %% = 2 * 2^24. From ar_data_sync:advance_chunks_index_cursor/1
 		packing = unpacked,
 		verify_report = #verify_report{
-			total_error_bytes = ?DATA_CHUNK_SIZE,
+			total_error_bytes = 33554432,
 			total_error_chunks = 1,
-			error_bytes = #{get_chunk_error => ?DATA_CHUNK_SIZE},
+			error_bytes = #{get_chunk_error => 33554432},
 			error_chunks = #{get_chunk_error => 1}
 		}
 	},
@@ -548,5 +552,5 @@ test_verify_chunk() ->
 		verify_chunk(
 			{error, some_error},
 			{Interval, not_found},
-			#state{ packing = unpacked })),
+			#state{ cursor = 0, packing = unpacked })),
 	ok.

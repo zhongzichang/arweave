@@ -4,8 +4,9 @@
 
 -module(ar_http_iface_client).
 
+-export([send_tx_json/3, send_tx_json/4, send_tx_binary/3, send_tx_binary/4]).
 -export([send_block_json/3, send_block_binary/3, send_block_binary/4,
-	 send_tx_json/3, send_tx_binary/3, send_block_announcement/2,
+	 send_block_announcement/2,
 	 get_block/3, get_tx/2, get_txs/2, get_tx_from_remote_peer/2,
 	 get_tx_data/2, get_wallet_list_chunk/2, get_wallet_list_chunk/3,
 	 get_wallet_list/2, add_peer/1, get_info/1, get_info/2, get_peers/1,
@@ -27,29 +28,85 @@
 -include_lib("arweave/include/ar_data_discovery.hrl").
 -include_lib("arweave/include/ar_mining.hrl").
 -include_lib("arweave/include/ar_wallets.hrl").
+-include_lib("arweave/include/ar_pool.hrl").
 
-%% @doc Send a JSON-encoded transaction to the given Peer.
+%%--------------------------------------------------------------------
+%% @doc Send a JSON-encoded transaction to the given Peer with default
+%% parameters.
+%%
+%% == Examples ==
+%%
+%% ```
+%% Host = {127,0,0,1},
+%% Port = 1984,
+%% Peer = {Host, Port},
+%% TXID = <<0:256>>,
+%% Bin = ar_serialize:tx_to_binary(#tx{}),
+%% send_tx_json(Peer, TXID, Bin).
+%% '''
+%%
+%% @see send_tx_json/4
+%% @end
+%%--------------------------------------------------------------------
 send_tx_json(Peer, TXID, Bin) ->
+	send_tx_json(Peer, TXID, Bin, #{}).
+
+%%--------------------------------------------------------------------
+%% @doc Send a JSON-encoded transaction to the given Peer.
+%%
+%% == Examples ==
+%%
+%% ```
+%% Host = {127,0,0,1},
+%% Port = 1984,
+%% Peer = {Host, Port},
+%% TXID = <<0:256>>,
+%% Bin = ar_serialize:tx_to_binary(#tx{}),
+%% Opts = #{ connect_timeout => 5
+%%         , timeout => 30
+%%         },
+%% send_tx_json(Peer, TXID, Bin, Opts).
+%% '''
+%%
+%% @end
+%%--------------------------------------------------------------------
+send_tx_json(Peer, TXID, Bin, Opts) ->
+	ConnectTimeout = maps:get(connect_timeout, Opts, 5),
+	Timeout = maps:get(timeout, Opts, 30),
 	ar_http:req(#{
 		method => post,
 		peer => Peer,
 		path => "/tx",
 		headers => add_header(<<"arweave-tx-id">>, ar_util:encode(TXID), p2p_headers()),
 		body => Bin,
-		connect_timeout => 5000,
-		timeout => 30 * 1000
+		connect_timeout => ConnectTimeout * 1000,
+		timeout => Timeout * 1000
 	}).
 
-%% @doc Send a binary-encoded transaction to the given Peer.
+%%--------------------------------------------------------------------
+%% @doc Send a binary-encoded transaction to the given Peer with
+%% default parameters.
+%% @see send_tx_binary/4
+%% @end
+%%--------------------------------------------------------------------
 send_tx_binary(Peer, TXID, Bin) ->
+	send_tx_binary(Peer, TXID, Bin, #{}).
+
+%%--------------------------------------------------------------------
+%% @doc Send a binary-encoded transaction to the given Peer.
+%% @end
+%%--------------------------------------------------------------------
+send_tx_binary(Peer, TXID, Bin, Opts) ->
+	ConnectTimeout = maps:get(connect_timeout, Opts, 5),
+	Timeout = maps:get(timeout, Opts, 30),
 	ar_http:req(#{
 		method => post,
 		peer => Peer,
 		path => "/tx2",
 		headers => add_header(<<"arweave-tx-id">>, ar_util:encode(TXID), p2p_headers()),
 		body => Bin,
-		connect_timeout => 5000,
-		timeout => 30 * 1000
+		connect_timeout => ConnectTimeout * 1000,
+		timeout => Timeout * 1000
 	}).
 
 %% @doc Announce a block to Peer.
@@ -624,6 +681,7 @@ cm_publish_send(Peer, Solution) ->
 
 %% @doc Fetch the jobs from the pool or coordinated mining exit peer.
 get_jobs(Peer, PrevOutput) ->
+	prometheus_counter:inc(pool_job_request_count),
 	Req = build_cm_or_pool_request(get, Peer,
 		"/jobs/" ++ binary_to_list(ar_util:encode(PrevOutput))),
 	handle_get_jobs_response(ar_http:req(Req)).
@@ -738,6 +796,7 @@ handle_get_jobs_response({ok, {{<<"200">>, _}, _, Body, _, _}}) ->
 		{'EXIT', _} ->
 			{error, invalid_json};
 		Jobs ->
+			prometheus_counter:inc(pool_total_job_got_count, length(Jobs#jobs.jobs)),
 			{ok, Jobs}
 	end;
 handle_get_jobs_response(Reply) ->

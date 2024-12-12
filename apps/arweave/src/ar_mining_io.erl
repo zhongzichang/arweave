@@ -2,8 +2,9 @@
 
 -behaviour(gen_server).
 
--export([start_link/0, set_largest_seen_upper_bound/1, 
-			get_partitions/0, get_partitions/1, read_recall_range/4, garbage_collect/0]).
+-export([start_link/0, start_link/1, set_largest_seen_upper_bound/1, 
+			get_packing/0, get_partitions/0, get_partitions/1, read_recall_range/4,
+			garbage_collect/0]).
 
 -export([init/1, handle_cast/2, handle_call/3, handle_info/2, terminate/2]).
 
@@ -16,9 +17,12 @@
 -define(CACHE_TTL_MS, 2000).
 
 -record(state, {
+	mode = miner,
 	partition_upper_bound = 0,
 	io_threads = #{},
-	io_thread_monitor_refs = #{}
+	io_thread_monitor_refs = #{},
+	store_id_to_device = #{},
+	partition_to_store_ids = #{}
 }).
 
 %%%===================================================================
@@ -27,7 +31,10 @@
 
 %% @doc Start the gen_server.
 start_link() ->
-	gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+	start_link(miner).
+
+start_link(Mode) ->
+	gen_server:start_link({local, ?MODULE}, ?MODULE, Mode, []).
 
 set_largest_seen_upper_bound(PartitionUpperBound) ->
 	gen_server:call(?MODULE, {set_largest_seen_upper_bound, PartitionUpperBound}, 60000).
@@ -39,24 +46,45 @@ read_recall_range(WhichChunk, Worker, Candidate, RecallRangeStart) ->
 	gen_server:call(?MODULE,
 			{read_recall_range, WhichChunk, Worker, Candidate, RecallRangeStart}, 60000).
 
+get_packing() ->
+	{ok, Config} = application:get_env(arweave, config),
+	%% ar_config:validate_storage_modules/1 ensures that we only mine against a single
+	%% packing format. So we can grab it any partition.
+	case Config#config.storage_modules of
+		[] -> undefined;
+        [{_, _, Packing} | _Rest] -> Packing
+    end.
+
 get_partitions(PartitionUpperBound) when PartitionUpperBound =< 0 ->
 	[];
 get_partitions(PartitionUpperBound) ->
+	{ok, Config} = application:get_env(arweave, config),
 	Max = ar_node:get_max_partition_number(PartitionUpperBound),
-	lists:sort(sets:to_list(
-		lists:foldl(
-			fun({Partition, MiningAddress, PackingDifficulty, _StoreID}, Acc) ->
-				case Partition > Max of
-					true ->
-						Acc;
-					_ ->
-						sets:add_element({Partition, MiningAddress, PackingDifficulty}, Acc)
-				end
-			end,
-			sets:new(), %% Ensure only one entry per partition (i.e. collapse storage modules)
-			get_io_channels()
-		))
-	).
+	AllPartitions = lists:foldl(
+		fun	(Module, Acc) ->
+				Addr = ar_storage_module:module_address(Module),
+				PackingDifficulty = 
+					ar_storage_module:module_packing_difficulty(Module),
+				{Start, End} = ar_storage_module:module_range(Module, 0),
+				Partitions = get_store_id_partitions({Start, End}, []),
+				lists:foldl(
+					fun(PartitionNumber, AccInner) ->
+						sets:add_element({PartitionNumber, Addr, PackingDifficulty}, AccInner)
+					end,
+					Acc,
+					Partitions
+				)
+		end,
+		sets:new(),
+		Config#config.storage_modules
+	),
+	FilteredPartitions = sets:filter(
+        fun ({PartitionNumber, Addr, _PackingDifficulty}) ->
+            PartitionNumber =< Max andalso Addr == Config#config.mining_addr
+        end,
+        AllPartitions
+    ),
+    lists:sort(sets:to_list(FilteredPartitions)).
 
 garbage_collect() ->
 	gen_server:cast(?MODULE, garbage_collect).
@@ -65,17 +93,8 @@ garbage_collect() ->
 %%% Generic server callbacks.
 %%%===================================================================
 
-init([]) ->
-	State =
-		lists:foldl(
-			fun	({PartitionNumber, MiningAddress, PackingDifficulty, StoreID}, Acc) ->
-				start_io_thread(PartitionNumber, MiningAddress,
-						PackingDifficulty, StoreID, Acc)
-			end,
-			#state{},
-			get_io_channels()
-		),
-	{ok, State}.
+init(Mode) ->
+	{ok, start_io_threads(#state{ mode = Mode })}.
 
 handle_call({set_largest_seen_upper_bound, PartitionUpperBound}, _From, State) ->
 	#state{ partition_upper_bound = CurrentUpperBound } = State,
@@ -89,18 +108,15 @@ handle_call({set_largest_seen_upper_bound, PartitionUpperBound}, _From, State) -
 handle_call(get_partitions, _From, #state{ partition_upper_bound = PartitionUpperBound } = State) ->
 	{reply, get_partitions(PartitionUpperBound), State};
 
-handle_call({read_recall_range, WhichChunk, Worker, Candidate, RecallRangeStart}, _From,
-		#state{ io_threads = IOThreads } = State) ->
-	#mining_candidate{ mining_address = MiningAddress,
-		packing_difficulty = PackingDifficulty } = Candidate,
-	PartitionNumber = ar_node:get_partition_number(RecallRangeStart),
+handle_call({read_recall_range, WhichChunk, Worker, Candidate, RecallRangeStart},
+		_From, State) ->
+	#mining_candidate{ packing_difficulty = PackingDifficulty } = Candidate,
 	RangeEnd = RecallRangeStart + ar_block:get_recall_range_size(PackingDifficulty),
-	ThreadFound = case find_thread(PartitionNumber, MiningAddress, PackingDifficulty,
-			RangeEnd, RecallRangeStart, IOThreads) of
+	ThreadFound = case find_thread(RecallRangeStart, RangeEnd, State) of
 		not_found ->
 			false;
-		Thread ->
-			Thread ! {WhichChunk, {Worker, Candidate, RecallRangeStart}},
+		{Thread, StoreID} ->
+			Thread ! {WhichChunk, {Worker, Candidate, RecallRangeStart, StoreID}},
 			true
 	end,
 	{reply, ThreadFound, State};
@@ -159,102 +175,146 @@ terminate(_Reason, _State) ->
 %%% Private functions.
 %%%===================================================================
 
-%% @doc Returns tuples {PartitionNumber, MiningAddress, PackingDifficulty, StoreID} covering
-%% all attached storage modules (excluding the "default" storage module).
-%% The assumption is that each IO channel represents a distinct 200MiB/s read channel to
-%% which we will (later) assign an IO thread.
-get_io_channels() ->
+get_system_device(StorageModule) ->
 	{ok, Config} = application:get_env(arweave, config),
-	MiningAddress = Config#config.mining_addr,
+	StoreID = ar_storage_module:id(StorageModule),
+	Path = ar_chunk_storage:get_chunk_storage_path(Config#config.data_dir, StoreID),
+	Command = "df -P " ++ Path ++ " | awk 'NR==2 {print $1}'",
+	Device = os:cmd(Command),
+	TrimmedDevice = string:trim(Device),
+	case TrimmedDevice of
+		"" -> StoreID;  % If the command fails or returns an empty string, return StoreID
+		_ -> TrimmedDevice
+	end.
 
-	%% First get the start/end ranges for all storage modules configured for the mining address.
-	StorageModules =
-		lists:foldl(
-			fun	({BucketSize, Bucket, {spora_2_6, Addr}} = M, Acc) when Addr == MiningAddress ->
-					Start = Bucket * BucketSize,
-					End = (Bucket + 1) * BucketSize,
-					StoreID = ar_storage_module:id(M),
-					[{Start, End, MiningAddress, 0, StoreID} | Acc];
-				({BucketSize, Bucket, {composite, Addr, PackingDifficulty}} = M, Acc)
-						when Addr == MiningAddress ->
-					Start = Bucket * BucketSize,
-					End = (Bucket + 1) * BucketSize,
-					StoreID = ar_storage_module:id(M),
-					[{Start, End, MiningAddress, PackingDifficulty, StoreID} | Acc];
-				(_Module, Acc) ->
-					Acc
-			end,
-			[],
-			Config#config.storage_modules
-		),
+start_io_threads(State) ->
+	#state{ mode = Mode } = State,
 
-	%% And then map those storage modules to partitions.
-	get_io_channels(StorageModules, []).
+    % Step 1: Group StoreIDs by their system device
+    DeviceToStoreIDs = map_device_to_store_ids(),
 
-get_io_channels([], Channels) ->
-	Channels;
-get_io_channels([{Start, End, _MiningAddress, _PackingDifficulty, _StoreID} | StorageModules],
-		Channels) when Start >= End ->
-	get_io_channels(StorageModules, Channels);
-get_io_channels([{Start, End, MiningAddress, PackingDifficulty, StoreID} | StorageModules],
-		Channels) ->
-	PartitionNumber = ar_node:get_partition_number(Start),
-	Channels2 = [{PartitionNumber, MiningAddress, PackingDifficulty, StoreID} | Channels],
-	StorageModules2 = [{Start + ?PARTITION_SIZE,
-			End, MiningAddress, PackingDifficulty, StoreID} | StorageModules],
-	get_io_channels(StorageModules2, Channels2).
+    % Step 2: Start IO threads for each device and populate map indices
+	maps:fold(
+		fun(Device, StoreIDs, StateAcc) ->
+			#state{ io_threads = Threads, io_thread_monitor_refs = Refs,
+				store_id_to_device = StoreIDToDevice,
+				partition_to_store_ids = PartitionToStoreIDs } = StateAcc,
+			
+			Thread = start_io_thread(Mode, StoreIDs),
+			ThreadRef = monitor(process, Thread),
 
-start_io_thread(PartitionNumber, MiningAddress, PackingDifficulty, StoreID,
-		#state{ io_threads = Threads } = State)
-		when is_map_key({PartitionNumber, MiningAddress, PackingDifficulty, StoreID}, Threads) ->
-	State;
-start_io_thread(PartitionNumber, MiningAddress, PackingDifficulty, StoreID,
-		#state{ io_threads = Threads, io_thread_monitor_refs = Refs } = State) ->
-	Now = os:system_time(millisecond),
-	Thread =
-		spawn(
-			fun() ->
-				case StoreID of
-					"default" ->
-						ok;
-					_ ->
-						ar_chunk_storage:open_files(StoreID)
+			StoreIDToDevice2 = lists:foldl(
+				fun(StoreID, Acc) -> 
+					maps:put(StoreID, Device, Acc) 
 				end,
-				io_thread(PartitionNumber, MiningAddress, PackingDifficulty, StoreID, #{}, Now)
+				StoreIDToDevice, StoreIDs),
+
+			PartitionToStoreIDs2 = map_partition_to_store_ids(StoreIDs, PartitionToStoreIDs),
+			StateAcc#state{
+				io_threads = maps:put(Device, Thread, Threads),
+				io_thread_monitor_refs = maps:put(ThreadRef, Device, Refs),
+				store_id_to_device = StoreIDToDevice2,
+				partition_to_store_ids = PartitionToStoreIDs2
+			}
+		end,
+		State,
+		DeviceToStoreIDs
+	).
+
+start_io_thread(Mode, StoreIDs) ->
+	Now = os:system_time(millisecond),
+	spawn(
+		fun() ->
+			open_files(StoreIDs),
+			io_thread(Mode, #{}, Now)
+		end
+	).
+
+map_partition_to_store_ids([], PartitionToStoreIDs) ->
+	PartitionToStoreIDs;
+map_partition_to_store_ids([StoreID | StoreIDs], PartitionToStoreIDs) ->
+	StorageModule = ar_storage_module:get_by_id(StoreID),
+	{Start, End} = ar_storage_module:module_range(StorageModule, 0),
+	Partitions = get_store_id_partitions({Start, End}, []),
+	PartitionToStoreIDs2 = lists:foldl(
+		fun(Partition, Acc) ->
+			maps:update_with(Partition,
+				fun(PartitionStoreIDs) -> [StoreID | PartitionStoreIDs] end,
+			[StoreID], Acc)
+		end,
+		PartitionToStoreIDs, Partitions),
+	map_partition_to_store_ids(StoreIDs, PartitionToStoreIDs2).
+
+map_device_to_store_ids() ->
+	{ok, Config} = application:get_env(arweave, config),
+	lists:foldl(
+        fun(Module, Acc) ->
+			StoreID = ar_storage_module:id(Module),
+            Device = get_system_device(Module),
+            maps:update_with(Device, fun(StoreIDs) -> [StoreID | StoreIDs] end, [StoreID], Acc)
+        end,
+        #{},
+        Config#config.storage_modules
+    ).
+
+get_store_ids_for_device(Device, #state{store_id_to_device = StoreIDToDevice}) ->
+	maps:fold(
+		fun(StoreID, MappedDevice, Acc) ->
+			case MappedDevice == Device of
+				true -> [StoreID | Acc];
+				false -> Acc
 			end
-		),
-	Ref = monitor(process, Thread),
-	Key = {PartitionNumber, MiningAddress, PackingDifficulty, StoreID},
-	Threads2 = maps:put(Key, Thread, Threads),
-	Refs2 = maps:put(Ref, Key, Refs),
-	?LOG_DEBUG([{event, started_io_mining_thread},
-			{partition_number, PartitionNumber},
-			{mining_addr, ar_util:safe_encode(MiningAddress)},
-			{packing_difficulty, PackingDifficulty},
-			{store_id, StoreID}]),
-	State#state{ io_threads = Threads2, io_thread_monitor_refs = Refs2 }.
+		end,
+		[],
+		StoreIDToDevice
+	).
+
+get_store_id_partitions({Start, End}, Partitions) when Start >= End ->
+	Partitions;
+get_store_id_partitions({Start, End}, Partitions) ->
+	PartitionNumber = ar_node:get_partition_number(Start),
+	get_store_id_partitions({Start + ?PARTITION_SIZE, End}, [PartitionNumber | Partitions]).
+
+open_files(StoreIDs) ->
+	lists:foreach(
+		fun(StoreID) ->
+			case StoreID of
+				"default" ->
+					ok;
+				_ ->
+					ar_chunk_storage:open_files(StoreID)
+			end
+		end,
+		StoreIDs).
 
 handle_io_thread_down(Ref, Reason,
-		#state{ io_threads = Threads, io_thread_monitor_refs = Refs } = State) ->
+		#state{ mode = Mode, io_threads = Threads, io_thread_monitor_refs = Refs } = State) ->
 	?LOG_WARNING([{event, mining_io_thread_down}, {reason, io_lib:format("~p", [Reason])}]),
-	ThreadID = {PartitionNumber, MiningAddress, PackingDifficulty,
-			StoreID} = maps:get(Ref, Refs),
+	Device = maps:get(Ref, Refs),
 	Refs2 = maps:remove(Ref, Refs),
-	Threads2 = maps:remove(ThreadID, Threads),
-	start_io_thread(PartitionNumber, MiningAddress, PackingDifficulty, StoreID,
-			State#state{ io_threads = Threads2, io_thread_monitor_refs = Refs2 }).
+	Threads2 = maps:remove(Device, Threads),
 
-io_thread(PartitionNumber, MiningAddress, PackingDifficulty, StoreID, Cache, LastClearTime) ->
+	StoreIDs = get_store_ids_for_device(Device, State),
+	Thread = start_io_thread(Mode, StoreIDs),
+	ThreadRef = monitor(process, Thread),
+	State#state{ io_threads = maps:put(Device, Thread, Threads2),	
+		io_thread_monitor_refs = maps:put(ThreadRef, Device, Refs2) }.
+
+io_thread(Mode, Cache, LastClearTime) ->
 	receive
-		{WhichChunk, {Worker, Candidate, RecallRangeStart}} ->
+		{WhichChunk, {Worker, Candidate, RecallRangeStart, StoreID}} ->
 			{ChunkOffsets, Cache2} =
-				get_chunks(WhichChunk, Candidate, RecallRangeStart, StoreID, Cache),
-			ar_mining_worker:chunks_read(
-				Worker, WhichChunk, Candidate, RecallRangeStart, ChunkOffsets),
+				get_chunks(Mode, WhichChunk, Candidate, RecallRangeStart, StoreID, Cache),
+			chunks_read(Mode, Worker, WhichChunk, Candidate, RecallRangeStart, ChunkOffsets),
 			{Cache3, LastClearTime2} = maybe_clear_cached_chunks(Cache2, LastClearTime),
-			io_thread(PartitionNumber, MiningAddress, PackingDifficulty, StoreID,
-					Cache3, LastClearTime2)
+			io_thread(Mode, Cache3, LastClearTime2)
 	end.
+
+chunks_read(miner, Worker, WhichChunk, Candidate, RecallRangeStart, ChunkOffsets) ->
+	ar_mining_worker:chunks_read(
+		Worker, WhichChunk, Candidate, RecallRangeStart, ChunkOffsets);
+chunks_read(standalone, Worker, WhichChunk, Candidate, RecallRangeStart, ChunkOffsets) ->
+	Worker ! {chunks_read, WhichChunk, Candidate, RecallRangeStart, ChunkOffsets}.
 
 get_packed_intervals(Start, End, MiningAddress, PackingDifficulty, "default", Intervals) ->
 	Packing = ar_block:get_packing(PackingDifficulty, MiningAddress),
@@ -297,20 +357,20 @@ maybe_clear_cached_chunks(Cache, LastClearTime) ->
 %% 
 %% However if the request is from our local miner there's no need to cache since the H1
 %% batch is always handled all at once.
-get_chunks(WhichChunk, Candidate, RangeStart, StoreID, Cache) ->
+get_chunks(Mode, WhichChunk, Candidate, RangeStart, StoreID, Cache) ->
 	case Candidate#mining_candidate.cm_lead_peer of
 		not_set ->
-			ChunkOffsets = read_range(WhichChunk, Candidate, RangeStart, StoreID),
+			ChunkOffsets = read_range(Mode, WhichChunk, Candidate, RangeStart, StoreID),
 			{ChunkOffsets, Cache};
 		_ ->
-			cached_read_range(WhichChunk, Candidate, RangeStart, StoreID, Cache)
+			cached_read_range(Mode, WhichChunk, Candidate, RangeStart, StoreID, Cache)
 	end.
 
-cached_read_range(WhichChunk, Candidate, RangeStart, StoreID, Cache) ->
+cached_read_range(Mode, WhichChunk, Candidate, RangeStart, StoreID, Cache) ->
 	Now = os:system_time(millisecond),
 	case maps:get(RangeStart, Cache, not_found) of
 		not_found ->	
-			ChunkOffsets = read_range(WhichChunk, Candidate, RangeStart, StoreID),
+			ChunkOffsets = read_range(Mode, WhichChunk, Candidate, RangeStart, StoreID),
 			Cache2 = maps:put(RangeStart, {Now, ChunkOffsets}, Cache),
 			{ChunkOffsets, Cache2};
 		{_CachedTime, ChunkOffsets} ->
@@ -326,7 +386,7 @@ cached_read_range(WhichChunk, Candidate, RangeStart, StoreID, Cache) ->
 			{ChunkOffsets, Cache}
 	end.
 
-read_range(WhichChunk, Candidate, RangeStart, StoreID) ->
+read_range(Mode, WhichChunk, Candidate, RangeStart, StoreID) ->
 	StartTime = erlang:monotonic_time(),
 	#mining_candidate{ mining_address = MiningAddress,
 			packing_difficulty = PackingDifficulty } = Candidate,
@@ -335,7 +395,7 @@ read_range(WhichChunk, Candidate, RangeStart, StoreID) ->
 			MiningAddress, PackingDifficulty, StoreID, ar_intervals:new()),
 	ChunkOffsets = ar_chunk_storage:get_range(RangeStart, RecallRangeSize, StoreID),
 	ChunkOffsets2 = filter_by_packing(ChunkOffsets, Intervals, StoreID),
-	log_read_range(Candidate, WhichChunk, length(ChunkOffsets), StartTime),
+	log_read_range(Mode, Candidate, WhichChunk, length(ChunkOffsets), StartTime),
 	ChunkOffsets2.
 
 filter_by_packing([], _Intervals, _StoreID) ->
@@ -350,7 +410,9 @@ filter_by_packing([{EndOffset, Chunk} | ChunkOffsets], Intervals, "default" = St
 filter_by_packing(ChunkOffsets, _Intervals, _StoreID) ->
 	ChunkOffsets.
 
-log_read_range(Candidate, WhichChunk, FoundChunks, StartTime) ->
+log_read_range(standalone, _Candidate, _WhichChunk, _FoundChunks, _StartTime) ->
+	ok;
+log_read_range(_Mode, Candidate, WhichChunk, FoundChunks, StartTime) ->
 	EndTime = erlang:monotonic_time(),
 	ElapsedTime = erlang:convert_time_unit(EndTime-StartTime, native, millisecond),
 	ReadRate = case ElapsedTime > 0 of 
@@ -375,35 +437,28 @@ log_read_range(Candidate, WhichChunk, FoundChunks, StartTime) ->
 	% 		{partition_number, PartitionNumber}]),
 	ok.
 
-find_thread(PartitionNumber, MiningAddress, PackingDifficulty, RangeEnd, RangeStart, Threads) ->
-	Keys = find_thread2(PartitionNumber, MiningAddress, PackingDifficulty,
-			maps:iterator(Threads)),
-	case find_thread3(Keys, RangeEnd, RangeStart, 0, not_found) of
+find_thread(RangeStart, RangeEnd, State) ->
+	PartitionNumber = ar_node:get_partition_number(RangeStart),
+	StoreIDs = maps:get(PartitionNumber, State#state.partition_to_store_ids, not_found),
+	StoreID = find_largest_intersection(StoreIDs, RangeStart, RangeEnd, 0, not_found),
+	Device = maps:get(StoreID, State#state.store_id_to_device, not_found),
+	Thread = maps:get(Device, State#state.io_threads, not_found),
+	case Thread of
 		not_found ->
 			not_found;
-		Key ->
-			maps:get(Key, Threads)
+		_ ->
+			{Thread, StoreID}
 	end.
 
-find_thread2(PartitionNumber, MiningAddress, PackingDifficulty, Iterator) ->
-	case maps:next(Iterator) of
-		none ->
-			[];
-		{{PartitionNumber, MiningAddress, PackingDifficulty, _StoreID} = Key,
-				_Thread, Iterator2} ->
-			[Key | find_thread2(PartitionNumber, MiningAddress, PackingDifficulty, Iterator2)];
-		{_Key, _Thread, Iterator2} ->
-			find_thread2(PartitionNumber, MiningAddress, PackingDifficulty, Iterator2)
-	end.
-
-find_thread3([Key | Keys], RangeEnd, RangeStart, Max, MaxKey) ->
-	{_PartitionNumber, _MiningAddress, _PackingDifficulty, StoreID} = Key,
+find_largest_intersection(not_found, _RangeStart, _RangeEnd, _Max, _MaxKey) ->
+	not_found;
+find_largest_intersection([StoreID | StoreIDs], RangeStart, RangeEnd, Max, MaxKey) ->
 	I = ar_sync_record:get_intersection_size(RangeEnd, RangeStart, ar_chunk_storage, StoreID),
 	case I > Max of
 		true ->
-			find_thread3(Keys, RangeEnd, RangeStart, I, Key);
+			find_largest_intersection(StoreIDs, RangeStart, RangeEnd, I, StoreID);
 		false ->
-			find_thread3(Keys, RangeEnd, RangeStart, Max, MaxKey)
+			find_largest_intersection(StoreIDs, RangeStart, RangeEnd, Max, MaxKey)
 	end;
-find_thread3([], _RangeEnd, _RangeStart, _Max, MaxKey) ->
+find_largest_intersection([], _RangeStart, _RangeEnd, _Max, MaxKey) ->
 	MaxKey.
