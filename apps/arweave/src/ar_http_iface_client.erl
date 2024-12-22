@@ -707,7 +707,8 @@ post_partial_solution(Peer, Solution) ->
 				timeout => 20 * 1000,
 				connect_timeout => 5 * 1000
 			}));
-		_ -> ok
+		{'EXIT', Reason, _ } -> {error, Reason};
+		_ -> {error, failed_to_serialize_partial_solution}
 	end.
 
 get_pool_cm_jobs(Peer, Jobs) ->
