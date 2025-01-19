@@ -769,7 +769,7 @@ build_cm_or_pool_request(Method, Peer, Path, Body) ->
 		method => Method,
 		path => BasePath ++ Path,
 		timeout => 5 * 1000,
-		connect_timeout => 500,
+		connect_timeout => 5 * 1000,
 		headers => Headers2,
 		body => Body,
 		is_peer_request => IsPeerRequest
