@@ -2,16 +2,27 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
--include_lib("arweave/include/ar.hrl").
--include_lib("arweave/include/ar_consensus.hrl").
--include_lib("arweave/include/ar_config.hrl").
--include_lib("arweave/include/ar_data_sync.hrl").
+-include("../include/ar.hrl").
+-include("../include/ar_consensus.hrl").
+-include("../include/ar_config.hrl").
 
 -import(ar_test_node, [assert_wait_until_height/2, test_with_mocked_functions/2]).
 
+recovers_from_corruption_test_() ->
+	{timeout, 140, fun test_recovers_from_corruption/0}.
+
+test_recovers_from_corruption() ->
+	ar_test_data_sync:setup_nodes(),
+	{ok, Config} = application:get_env(arweave, config),
+	StoreID = ar_storage_module:id(hd(ar_storage_module:get_all(262144 * 3))),
+	?debugFmt("Corrupting ~s...", [StoreID]),
+	[ar_chunk_storage:write_chunk(PaddedEndOffset, << 0:(262144*8) >>, #{}, StoreID)
+			|| PaddedEndOffset <- lists:seq(262144, 262144 * 3, 262144)],
+	ar_test_node:mine(),
+	ar_test_node:assert_wait_until_height(main, 1).
+
 syncs_data_test_() ->
-	ar_test_node:test_with_mocked_functions([{ar_fork, height_2_5, fun() -> 0 end}],
-		fun test_syncs_data/0, 240).
+	{timeout, 240, fun test_syncs_data/0}.
 
 test_syncs_data() ->
 	Wallet = ar_test_data_sync:setup_nodes(),
@@ -73,20 +84,20 @@ test_syncs_after_joining() ->
 
 test_syncs_after_joining(Split) ->
 	Wallet = ar_test_data_sync:setup_nodes(),
-	{TX1, Chunks1} = ar_test_data_sync:tx(Wallet, {Split, 17}, v2, ?AR(1)),
+	{TX1, Chunks1} = ar_test_data_sync:tx(Wallet, {Split, 1}, v2, ?AR(1)),
 	B1 = ar_test_node:post_and_mine(#{ miner => main, await_on => peer1 }, [TX1]),
 	Proofs1 = ar_test_data_sync:post_proofs(main, B1, TX1, Chunks1),
 	UpperBound = ar_node:get_partition_upper_bound(ar_node:get_block_index()),
 	ar_test_data_sync:wait_until_syncs_chunks(peer1, Proofs1, UpperBound),
 	ar_test_data_sync:wait_until_syncs_chunks(Proofs1),
 	ar_test_node:disconnect_from(peer1),
-	{MainTX2, MainChunks2} = ar_test_data_sync:tx(Wallet, {Split, 13}, v2, ?AR(1)),
+	{MainTX2, MainChunks2} = ar_test_data_sync:tx(Wallet, {Split, 3}, v2, ?AR(1)),
 	MainB2 = ar_test_node:post_and_mine(#{ miner => main, await_on => main }, [MainTX2]),
 	MainProofs2 = ar_test_data_sync:post_proofs(main, MainB2, MainTX2, MainChunks2),
-	{MainTX3, MainChunks3} = ar_test_data_sync:tx(Wallet, {Split, 12}, v2, ?AR(1)),
+	{MainTX3, MainChunks3} = ar_test_data_sync:tx(Wallet, {Split, 2}, v2, ?AR(1)),
 	MainB3 = ar_test_node:post_and_mine(#{ miner => main, await_on => main }, [MainTX3]),
 	MainProofs3 = ar_test_data_sync:post_proofs(main, MainB3, MainTX3, MainChunks3),
-	{PeerTX2, PeerChunks2} = ar_test_data_sync:tx(Wallet, {Split, 20}, v2, ?AR(1)),
+	{PeerTX2, PeerChunks2} = ar_test_data_sync:tx(Wallet, {Split, 2}, v2, ?AR(1)),
 	PeerB2 = ar_test_node:post_and_mine( #{ miner => peer1, await_on => peer1 }, [PeerTX2] ),
 	PeerProofs2 = ar_test_data_sync:post_proofs(peer1, PeerB2, PeerTX2, PeerChunks2),
 	ar_test_data_sync:wait_until_syncs_chunks(peer1, PeerProofs2, infinity),
@@ -99,8 +110,11 @@ test_syncs_after_joining(Split) ->
 	ar_test_data_sync:wait_until_syncs_chunks(peer1, Proofs1, infinity).
 
 mines_off_only_last_chunks_test_() ->
-	test_with_mocked_functions([{ar_fork, height_2_6, fun() -> 0 end}],
+	test_with_mocked_functions([{ar_fork, height_2_6, fun() -> 0 end}, mock_reset_frequency()],
 			fun test_mines_off_only_last_chunks/0).
+
+mock_reset_frequency() ->
+	{ar_nonce_limiter, get_reset_frequency, fun() -> 5 end}.
 
 test_mines_off_only_last_chunks() ->
 	Wallet = ar_test_data_sync:setup_nodes(),
@@ -134,10 +148,10 @@ test_mines_off_only_last_chunks() ->
 					true = ar_util:do_until(
 						fun() ->
 							ar_nonce_limiter:get_current_step_number()
-									> PrevStepNumber + ?NONCE_LIMITER_RESET_FREQUENCY
+									> PrevStepNumber + ar_nonce_limiter:get_reset_frequency()
 						end,
-						200,
-						20000
+						100,
+						60000
 					);
 				0 ->
 					%% Wait until the new chunks fall below the new upper bound and
@@ -162,7 +176,7 @@ test_mines_off_only_last_chunks() ->
 	).
 
 mines_off_only_second_last_chunks_test_() ->
-	test_with_mocked_functions([{ar_fork, height_2_6, fun() -> 0 end}],
+	test_with_mocked_functions([{ar_fork, height_2_6, fun() -> 0 end}, mock_reset_frequency()],
 			fun test_mines_off_only_second_last_chunks/0).
 
 test_mines_off_only_second_last_chunks() ->
@@ -212,7 +226,7 @@ test_mines_off_only_second_last_chunks() ->
 	).
 
 disk_pool_rotation_test_() ->
-	{timeout, 60, fun test_disk_pool_rotation/0}.
+	{timeout, 120, fun test_disk_pool_rotation/0}.
 
 test_disk_pool_rotation() ->
 	Addr = ar_wallet:to_address(ar_wallet:new_keyfile()),

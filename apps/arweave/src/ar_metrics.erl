@@ -2,7 +2,7 @@
 
 -include_lib("arweave/include/ar.hrl").
 
--export([register/0, get_status_class/1]).
+-export([register/0, get_status_class/1, record_rate_metric/4]).
 
 %%%===================================================================
 %%% Public interface.
@@ -416,12 +416,12 @@ register() ->
 		{buckets, [1, 5, 10, 50, 100, 500, 1000]},
 		{help, "The packing/unpacking time in milliseconds. The type label indicates what "
 				"type of operation was requested either: 'pack', 'unpack',"
-				"or 'unpack_sub_chunk'. The packing "
+				"'unpack_sub_chunk', or 'pack_sub_chunk'. The packing "
 				"label differs based on the type. If type is 'unpack' then the packing label "
 				"indicates the format of the chunk before being unpacked. If type is 'pack' "
 				"then the packing label indicates the format that the chunk will be packed "
-				"to. In all cases its value can be 'spora_2_5', 'spora_2_6', or 'composite'. "
-				"The trigger label shows where the request was triggered: "
+				"to. In all cases its value can be 'spora_2_5', 'spora_2_6', 'composite', "
+				"or 'replica_2_9'. The trigger label shows where the request was triggered: "
 				"'external' (e.g. an HTTP request) or 'internal' (e.g. during syncing or "
 				"repacking)."}
 	]),
@@ -434,8 +434,8 @@ register() ->
 				"label differs based on the type. If type is 'unpack' then the packing label "
 				"indicates the format of the chunk before being unpacked. If type is 'pack' "
 				"then the packing label indicates the format that the chunk will be packed "
-				"to. In all cases its value can be 'unpacked', 'spora_2_5', 'spora_2_6' or"
-				" 'composite'. "
+				"to. In all cases its value can be 'unpacked', 'unpacked_padded', "
+				"'spora_2_5', 'spora_2_6', 'composite', or 'replica_2_9'. "
 				"The from label shows where the request was initiated (e.g. the "
 				"calling function, or message). "}
 	]),
@@ -443,49 +443,50 @@ register() ->
 		{name, validating_packed_spora},
 		{labels, [packing]},
 		{help, "The number of SPoRA solutions based on packed chunks entered validation. "
-				"The packing label can be 'spora_2_5', 'spora_2_6', or 'composite'."}
-	]),
-	prometheus_gauge:new([
-		{name, packing_latency_benchmark},
-		{labels, [benchmark, type, packing]},
-		{help, "The benchmark packing latency. The benchmark label indicates which "
-				"benchmark is being recorded - 'protocol' records the ?PACKING_LATENCY "
-				"value, and 'init' records the latency sampled at node startup. "
-				"The type label can be 'pack' or 'unpack'. The packing label can be "
-				"'spora_2_5', 'spora_2_6', or 'composite'. "
-				"The 'packing_duration_milliseconds' metric "
-				"records the actual latency observed during node operation."}
-	]),
-	prometheus_gauge:new([
-		{name, packing_rate_benchmark},
-		{labels, [benchmark]},
-		{help, "The benchmark packing rate. The benchmark label indicates which "
-				"benchmark is being recorded - 'protocol' records the maximum rate allowed by "
-				"the protocol, 'configured' records the packing rate configured by the user. "
-				"The 'packing_duration_milliseconds' metric records the actual rate observed "
-				"during node operation."}
-	]),
-	prometheus_gauge:new([
-		{name, packing_schedulers},
-		{help, "The number of schedulers available for packing."}
+				"The packing label can be 'spora_2_5', 'spora_2_6', 'composite', "
+				" or replica_2_9."}
 	]),
 
 	prometheus_gauge:new([{name, packing_buffer_size},
-			{help, "The number of chunks in the packing server queue."}]),
+		{help, "The number of chunks in the packing server queue."}]),
 	prometheus_gauge:new([{name, chunk_cache_size},
 			{help, "The number of chunks scheduled for downloading."}]),
 	prometheus_counter:new([{name, chunks_stored},
-			{help, "The counter is incremented every time a chunk is written to "
-					"chunk_storage."}]),
-
+		{labels, [packing, store_id]},
+		{help, "The counter is incremented every time a chunk is written to "
+				"chunk_storage."}]),
 	prometheus_gauge:new([{name, sync_tasks},
-			{labels, [state, type, peer]},
-			{help, "The number of syncing tasks. 'state' can be 'queued' or 'scheduled'. "
-					"'type' can be 'sync_range' or 'read_range'. 'peer' is the peer the task "
-					"is intended for - for 'read_range' tasks this will be 'localhost'."}]),
-	%% --------------------------------------------------------------------------------------------
+		{labels, [state, type, peer]},
+		{help, "The number of syncing tasks. 'state' can be 'queued' or 'scheduled'. "
+				"'type' can be 'sync_range' or 'read_range'. 'peer' is the peer the task "
+				"is intended for - for 'read_range' tasks this will be 'localhost'."}]),
+
+	prometheus_gauge:new([{name, device_lock_status},
+		{labels, [store_id, mode]},
+		{help, "The device lock status of the storage module. "
+				"-1: off, 0: paused, 1: active, 2: complete -2: unknown"}]),
+	prometheus_gauge:new([{name, sync_intervals_queue_size},
+		{labels, [store_id]},
+		{help, "The size of the syncing intervals queue."}]),
+
+	%% ---------------------------------------------------------------------------------------
+	%% Replica 2.9 metrics
+	%% ---------------------------------------------------------------------------------------
+	prometheus_counter:new([{name, replica_2_9_entropy_stored},
+		{labels, [store_id]},
+		{help, "The number of bytes of replica.2.9 entropy written to chunk storage."}]),
+	prometheus_histogram:new([
+		{name, replica_2_9_entropy_duration_milliseconds},
+		{labels, [count]},
+		{buckets, [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 250, 500, 1000]},
+		{help, "The time, in milliseconds, to generate replica.2.9 entropy. The count label "
+				"indicates whether this is the time to generate a single 8 MiB entropy or "
+				"the time to generate all 32 entropies needed for full chunks."}
+	]),
+
+	%% ---------------------------------------------------------------------------------------
 	%% Pool related metrics
-	%% --------------------------------------------------------------------------------------------
+	%% ---------------------------------------------------------------------------------------
 	prometheus_counter:new([
 		{name, pool_job_request_count},
 		{help, "The number of requests to pool /job from start of arweave node"}
@@ -496,9 +497,9 @@ register() ->
 		{help, "The number of jobs received from /job requests."}
 	]),
 
-	%% --------------------------------------------------------------------------------------------
+	%% ---------------------------------------------------------------------------------------
 	%% Debug-only metrics
-	%% --------------------------------------------------------------------------------------------
+	%% ---------------------------------------------------------------------------------------
 	prometheus_counter:new([{name, process_functions},
 			{labels, [process]},
 			{help, "Sampling active functions. The 'process' label is a fully qualified "
@@ -516,6 +517,20 @@ register() ->
 	prometheus_gauge:new([{name, allocator},
 			{labels, [type, instance, section, metric]},
 			{help, "Erlang VM memory allocator metrics. Only set when debug=true."}]).
+
+record_rate_metric(StartTime, Bytes, Metric, Labels) ->
+	EndTime = erlang:monotonic_time(),
+	ElapsedTime =
+		erlang:convert_time_unit(EndTime - StartTime,
+								native,
+								microsecond),
+	%% bytes per second
+	Rate =
+		case ElapsedTime > 0 of
+			true -> 1_000_000 * Bytes / ElapsedTime;
+			false -> 0
+		end,
+	prometheus_histogram:observe(Metric, Labels, Rate).
 
 
 %% @doc Return the HTTP status class label for cowboy_requests_total and gun_requests_total

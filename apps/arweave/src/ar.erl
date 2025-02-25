@@ -6,15 +6,17 @@
 -behaviour(application).
 
 -export([main/0, main/1, create_wallet/0, create_wallet/1,
-		benchmark_packing/1, benchmark_packing/0, benchmark_vdf/0,
+		create_ecdsa_wallet/0, create_ecdsa_wallet/1,
+		benchmark_packing/1, benchmark_packing/0, benchmark_2_9/0, benchmark_2_9/1, 
+		benchmark_vdf/0,
 		benchmark_hash/1, benchmark_hash/0, start/0,
 		start/1, start/2, stop/1, stop_dependencies/0, start_dependencies/0,
-		tests/0, tests/1, tests/2, shell/0, stop_shell/0,
+		tests/0, tests/1, tests/2, e2e/0, e2e/1, shell/0, stop_shell/0,
 		docs/0, shutdown/1, console/1, console/2]).
 
--include_lib("arweave/include/ar.hrl").
--include_lib("arweave/include/ar_consensus.hrl").
--include_lib("arweave/include/ar_config.hrl").
+-include("../include/ar.hrl").
+-include("../include/ar_consensus.hrl").
+-include("../include/ar_config.hrl").
 
 -include_lib("eunit/include/eunit.hrl").
 
@@ -97,12 +99,13 @@ show_help() ->
 			{"storage_module", "A storage module is responsible for syncronizing and storing "
 					"a particular data range. The data and metadata related to the module "
 					"are stored in a dedicated folder "
-					"([data_dir]/storage_modules/storage_module_[partition_number]_[packing]/"
-					") where packing is either {mining address}.{packing difficulty} "
-					"(packing difficulty is an integer), or \"unpacked\"."
+					"([data_dir]/storage_modules/storage_module_[partition_number]_[replica_type]/"
+					") where replica_type is either {mining_address} or"
+					" {mining address}.{composite packing difficulty} or"
+					" {mining address}.replica.2.9 or \"unpacked\"."
 					" Example: storage_module 0,En2eqsVJARnTVOSh723PBXAKGmKgrGSjQ2YIGwE_ZRI.1. "
 					"To configure a module of a custom size, set "
-					"storage_module {number},{size_in_bytes},{packing}. For instance, "
+					"storage_module {number},{size_in_bytes},{replica_type}. For instance, "
 					"storage_module "
 					"22,1000000000000,En2eqsVJARnTVOSh723PBXAKGmKgrGSjQ2YIGwE_ZRI.1 will be "
 					"syncing the weave data between the offsets 22 TB and 23 TB. Make sure "
@@ -117,20 +120,14 @@ show_help() ->
 					"Q5EfKawrRazp11HEDf_NJpxjYMV385j21nlQNjR8_pY, specify "
 					"storage_module "
 					"22,En2eqsVJARnTVOSh723PBXAKGmKgrGSjQ2YIGwE_ZRI.1,repack_in_place,"
-					"Q5EfKawrRazp11HEDf_NJpxjYMV385j21nlQNjR8_pY.1. This storage module "
+					"Q5EfKawrRazp11HEDf_NJpxjYMV385j21nlQNjR8_pY.replica.2.9. This storage module "
 					"will only do the repacking - it won't be used for mining and won't "
 					"serve any data to peers. Once the repacking is complete, a message will "
 					"be logged to the file and written to the console. We suggest you rename "
-					"the storage module folder according to the new packing then."
+					"the storage module folder according to the new packing then. "
 
-					" If you changed your mind and want to repack "
-					"a module already being repacked to the yet different packing, simply "
-					"restart the node specifying the corresponding packing. E.g., in "
-					"the example above, you can restart with storage_module "
-					"22,En2eqsVJARnTVOSh723PBXAKGmKgrGSjQ2YIGwE_ZRI.1,repack_in_place,unpacked."
-					" The node will unpack everything that was repacked to "
-					"Q5EfKawrRazp11HEDf_NJpxjYMV385j21nlQNjR8_pY and also unpack everything "
-					"that is still packed with En2eqsVJARnTVOSh723PBXAKGmKgrGSjQ2YIGwE_ZRI.1."
+					"Note: as of 2.9.1 you can only repack in place to the replica_2_9 "
+					"format."
 			},
 			{"repack_batch_size", io_lib:format("The number of chunk fetched from disk "
 				"at a time during in-place repacking. Default: ~B.",
@@ -154,8 +151,8 @@ show_help() ->
 				" is set but no mining_addr is specified, an RSA PSS key is created"
 				" and stored in the [data_dir]/~s directory. If the directory already"
 				" contains such keys, the one written later is picked, no new files are"
-				" created. After the fork 2.6, the specified address is also a packing key, "
-				"so it is used to pack synced data even if the \"mine\" flag is not "
+				" created. After the fork 2.6, the specified address is also a replication key, "
+				"so it is used to prepare synced data for mining even if the \"mine\" flag is not "
 				"specified. The data already packed with different addresses is not repacked.",
 				[?WALLET_DIR])},
 			{"hashing_threads (num)", io_lib:format("The number of hashing processes to spawn."
@@ -263,8 +260,16 @@ show_help() ->
 				)
 			)},
 			{"packing_rate",
-				"The maximum number of chunks per second to pack or unpack. "
-				"The default value is determined based on the number of CPU cores."},
+				"DEPRECATED. Does not affect anything. Use packing_workers instead."},
+			{"packing_workers (num)",
+				"The number of packing workers to spawn. The default is the number of "
+				"logical CPU cores."},
+			{"replica_2_9_workers (num)", io_lib:format(
+				"The number of replica 2.9 workers to spawn. Replica 2.9 workers are used "
+				"to generate entropy the replica.2.9 format. At most one worker will be "
+				"active per physical disk at a time. Default: ~B",
+				[?DEFAULT_REPLICA_2_9_WORKERS]
+			)},
 			{"max_vdf_validation_thread_count", io_lib:format("\tThe maximum number "
 					"of threads used for VDF validation. Default: ~B",
 					[?DEFAULT_MAX_NONCE_LIMITER_VALIDATION_THREAD_COUNT])},
@@ -562,8 +567,14 @@ parse_cli_args(["max_disk_pool_data_root_buffer_mb", Num | Rest], C) ->
 	parse_cli_args(Rest, C#config{ max_disk_pool_data_root_buffer_mb = list_to_integer(Num) });
 parse_cli_args(["disk_cache_size_mb", Num | Rest], C) ->
 	parse_cli_args(Rest, C#config{ disk_cache_size = list_to_integer(Num) });
-parse_cli_args(["packing_rate", Num | Rest], C) ->
-	parse_cli_args(Rest, C#config{ packing_rate = list_to_integer(Num) });
+parse_cli_args(["packing_rate", _Num | Rest], C) ->
+	?LOG_WARNING("Deprecated option found 'packing_rate': "
+		" this option has been removed and is now a no-op.", []),
+	parse_cli_args(Rest, C#config{ });
+parse_cli_args(["packing_workers", Num | Rest], C) ->
+	parse_cli_args(Rest, C#config{ packing_workers = list_to_integer(Num) });
+parse_cli_args(["replica_2_9_workers", Num | Rest], C) ->
+	parse_cli_args(Rest, C#config{ replica_2_9_workers = list_to_integer(Num) });
 parse_cli_args(["max_vdf_validation_thread_count", Num | Rest], C) ->
 	parse_cli_args(Rest,
 			C#config{ max_nonce_limiter_validation_thread_count = list_to_integer(Num) });
@@ -696,54 +707,11 @@ start(Config) ->
 	end,
 	start_dependencies().
 
+
 start(normal, _Args) ->
 	{ok, Config} = application:get_env(arweave, config),
-	%% Configure logging for console output.
-	LoggerFormatterConsole = #{
-		legacy_header => false,
-		single_line => true,
-		chars_limit => 16256,
-		max_size => 8128,
-		depth => 256,
-		template => [time," [",level,"] ",mfa,":",line," ",msg,"\n"]
-	},
-	logger:set_handler_config(default, formatter, {logger_formatter, LoggerFormatterConsole}),
-	logger:set_handler_config(default, level, error),
-	%% Configure logging to the logfile.
-	LoggerConfigDisk = #{
-		file => lists:flatten(filename:join(Config#config.log_dir, atom_to_list(node()))),
-		type => wrap,
-		max_no_files => 10,
-		max_no_bytes => 51418800 % 10 x 5MB
-	},
-	logger:add_handler(disk_log, logger_disk_log_h,
-			#{ config => LoggerConfigDisk, level => info }),
-	Level =
-		case Config#config.debug of
-			false ->
-				info;
-			true ->
-				DebugLoggerConfigDisk = #{
-					file => lists:flatten(filename:join([Config#config.log_dir, "debug_logs",
-							atom_to_list(node())])),
-					type => wrap,
-					max_no_files => 20,
-					max_no_bytes => 51418800 % 10 x 5MB
-				},
-				logger:add_handler(disk_debug_log, logger_disk_log_h,
-						#{ config => DebugLoggerConfigDisk, level => debug }),
-				debug
-		end,
-	LoggerFormatterDisk = #{
-		chars_limit => 16256,
-		max_size => 8128,
-		depth => 256,
-		legacy_header => false,
-		single_line => true,
-		template => [time," [",level,"] ",mfa,":",line," ",msg,"\n"]
-	},
-	logger:set_handler_config(disk_log, formatter, {logger_formatter, LoggerFormatterDisk}),
-	logger:set_application_level(arweave, Level),
+	%% Configure logger
+	ar_logger:init(Config),
 	%% Start the Prometheus metrics subsystem.
 	prometheus_registry:register_collector(prometheus_process_collector),
 	prometheus_registry:register_collector(ar_metrics_collector),
@@ -756,12 +724,19 @@ start(normal, _Args) ->
 	ar_sup:start_link().
 
 set_mining_address(#config{ mining_addr = not_set } = C) ->
-	W = ar_wallet:get_or_create_wallet([{?RSA_SIGN_ALG, 65537}]),
-	Addr = ar_wallet:to_address(W),
-	ar:console("~nSetting the mining address to ~s.~n", [ar_util:encode(Addr)]),
-	C2 = C#config{ mining_addr = Addr },
-	application:set_env(arweave, config, C2),
-	set_mining_address(C2);
+	case ar_wallet:get_or_create_wallet([{?RSA_SIGN_ALG, 65537}]) of
+		{error, Reason} ->
+			ar:console("~nFailed to create a wallet, reason: ~p.~n",
+				[io_lib:format("~p", [Reason])]),
+			timer:sleep(500),
+			erlang:halt();
+		W ->
+			Addr = ar_wallet:to_address(W),
+			ar:console("~nSetting the mining address to ~s.~n", [ar_util:encode(Addr)]),
+			C2 = C#config{ mining_addr = Addr },
+			application:set_env(arweave, config, C2),
+			set_mining_address(C2)
+	end;
 set_mining_address(#config{ mine = false }) ->
 	ok;
 set_mining_address(#config{ mining_addr = Addr, cm_exit_peer = CmExitPeer,
@@ -785,24 +760,45 @@ set_mining_address(#config{ mining_addr = Addr, cm_exit_peer = CmExitPeer,
 	end.
 
 create_wallet([DataDir]) ->
+	create_wallet(DataDir, ?RSA_KEY_TYPE);
+create_wallet(_) ->
+	create_wallet_fail(?RSA_KEY_TYPE).
+
+create_ecdsa_wallet() ->
+	create_wallet_fail(?ECDSA_KEY_TYPE).
+
+create_ecdsa_wallet([DataDir]) ->
+	create_wallet(DataDir, ?ECDSA_KEY_TYPE);
+create_ecdsa_wallet(_) ->
+	create_wallet_fail(?ECDSA_KEY_TYPE).
+
+create_wallet(DataDir, KeyType) ->
 	case filelib:is_dir(DataDir) of
 		false ->
-			create_wallet_fail();
+			create_wallet_fail(KeyType);
 		true ->
 			ok = application:set_env(arweave, config, #config{ data_dir = DataDir }),
-			W = ar_wallet:new_keyfile({?RSA_SIGN_ALG, 65537}),
-			Addr = ar_wallet:to_address(W),
-			ar:console("Created a wallet with address ~s.~n", [ar_util:encode(Addr)]),
-			erlang:halt()
-	end;
-create_wallet(_) ->
-	create_wallet_fail().
+			case ar_wallet:new_keyfile(KeyType) of
+				{error, Reason} ->
+					ar:console("Failed to create a wallet, reason: ~p.~n~n",
+							[io_lib:format("~p", [Reason])]),
+					timer:sleep(500),
+					erlang:halt();
+				W ->
+					Addr = ar_wallet:to_address(W),
+					ar:console("Created a wallet with address ~s.~n", [ar_util:encode(Addr)]),
+					erlang:halt()
+			end
+	end.
 
 create_wallet() ->
-	create_wallet_fail().
+	create_wallet_fail(?RSA_KEY_TYPE).
 
-create_wallet_fail() ->
+create_wallet_fail(?RSA_KEY_TYPE) ->
 	io:format("Usage: ./bin/create-wallet [data_dir]~n"),
+	erlang:halt();
+create_wallet_fail(?ECDSA_KEY_TYPE) ->
+	io:format("Usage: ./bin/create-ecdsa-wallet [data_dir]~n"),
 	erlang:halt().
 
 benchmark_packing() ->
@@ -822,6 +818,12 @@ benchmark_hash(Args) ->
 	ar_bench_hash:run_benchmark_from_cli(Args),
 	erlang:halt().
 
+benchmark_2_9() ->
+	ar_bench_2_9:show_help().
+benchmark_2_9(Args) ->
+	ar_bench_2_9:run_benchmark_from_cli(Args),
+	erlang:halt().
+	
 shutdown([NodeName]) ->
 	rpc:cast(NodeName, init, stop, []).
 
@@ -851,21 +853,29 @@ warn_if_single_scheduler() ->
 
 shell() ->
 	Config = #config{ debug = true },
-	start_for_tests(Config),
-	ar_test_node:boot_peers().
+	start_for_tests(test,Config),
+	ar_test_node:boot_peers(test).
 
 stop_shell() ->
-	ar_test_node:stop_peers(),
+	ar_test_node:stop_peers(test),
 	init:stop().
 
 %% @doc Run all of the tests associated with the core project.
 tests() ->
-	tests([], #config{ debug = true }).
+	tests(test, [], #config{ debug = true }).
 
-tests(Mods, Config) when is_list(Mods) ->
+tests(Mod) ->
+	tests(test, Mod).
+
+tests(TestType, Mods, Config) when is_list(Mods) ->
+	TotalTimeout = case TestType of
+		e2e -> ?E2E_TEST_TIMEOUT;
+		_ -> ?TEST_TIMEOUT
+	end,
 	try
-		start_for_tests(Config),
-		ar_test_node:boot_peers()
+		start_for_tests(TestType, Config),
+		ar_test_node:boot_peers(TestType),
+		ar_test_node:wait_for_peers(TestType)
 	catch
 		Type:Reason ->
 			io:format("Failed to start the peers due to ~p:~p~n", [Type, Reason]),
@@ -873,9 +883,9 @@ tests(Mods, Config) when is_list(Mods) ->
 	end,
 	Result =
 		try
-			eunit:test({timeout, ?TEST_TIMEOUT, [Mods]}, [verbose, {print_depth, 100}])
+			eunit:test({timeout, TotalTimeout, [Mods]}, [verbose, {print_depth, 100}])
 		after
-			ar_test_node:stop_peers()
+			ar_test_node:stop_peers(TestType)
 		end,
 	case Result of
 		ok -> ok;
@@ -883,22 +893,21 @@ tests(Mods, Config) when is_list(Mods) ->
 	end.
 
 
-start_for_tests(Config) ->
+start_for_tests(TestType, Config) ->
 	UniqueName = ar_test_node:get_node_namespace(),
 	TestConfig = Config#config{
 		peers = [],
-		data_dir = ".tmp/data_test_main_" ++ UniqueName,
+		data_dir = ".tmp/data_" ++ atom_to_list(TestType) ++ "_main_" ++ UniqueName,
 		port = ar_test_node:get_unused_port(),
 		disable = [randomx_jit],
-		packing_rate = 20,
 		auto_join = false
 	},
 	start(TestConfig).
 
 %% @doc Run the tests for a set of module(s).
 %% Supports strings so that it can be trivially induced from a unix shell call.
-tests(Mod) when not is_list(Mod) -> tests([Mod]);
-tests(Args) ->
+tests(TestType, Mod) when not is_list(Mod) -> tests(TestType, [Mod]);
+tests(TestType, Args) ->
 	Mods =
 		lists:map(
 			fun(Mod) when is_atom(Mod) -> Mod;
@@ -906,7 +915,12 @@ tests(Args) ->
 			end,
 			Args
 		),
-	tests(Mods, #config{ debug = true }).
+	tests(TestType, Mods, #config{ debug = true }).
+
+e2e() ->
+	tests(e2e, [ar_sync_pack_mine_tests, ar_repack_mine_tests, ar_repack_in_place_mine_tests]).
+e2e(Mod) ->
+	tests(e2e, Mod).
 
 %% @doc Generate the project documentation.
 docs() ->
@@ -926,7 +940,7 @@ docs() ->
 
 %% @doc Ensure that parsing of core command line options functions correctly.
 commandline_parser_test_() ->
-	{timeout, 20, fun() ->
+	{timeout, 60, fun() ->
 		Addr = crypto:strong_rand_bytes(32),
 		Tests =
 			[
@@ -946,12 +960,12 @@ commandline_parser_test_() ->
 		)
 	end}.
 
--ifdef(DEBUG).
-console(_) ->
-	ok.
+-ifdef(AR_TEST).
+console(Format) ->
+	?LOG_INFO(io_lib:format(Format, [])).
 
-console(_, _) ->
-	ok.
+console(Format, Params) ->
+	?LOG_INFO(io_lib:format(Format, Params)).
 -else.
 console(Format) ->
 	io:format(Format).

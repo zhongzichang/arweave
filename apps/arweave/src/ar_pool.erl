@@ -411,7 +411,8 @@ process_partial_solution_partition_number(Solution, Ref) ->
 
 process_partial_solution_packing_difficulty(Solution, Ref) ->
 	#mining_solution{ packing_difficulty = PackingDifficulty } = Solution,
-	case ar_block:validate_packing_difficulty(PackingDifficulty) of
+	Height = ar_node:get_height(),
+	case ar_block:validate_replica_format(Height, PackingDifficulty, 0) of
 		true ->
 			process_partial_solution_nonce(Solution, Ref);
 		false ->
@@ -498,7 +499,8 @@ process_partial_solution_poa(Solution, Ref, H0, H1) ->
 		solution_hash = SolutionH,
 		recall_byte2 = RecallByte2,
 		poa2 = PoA2,
-		packing_difficulty = PackingDifficulty
+		packing_difficulty = PackingDifficulty,
+		replica_format = ReplicaFormat
 	} = Solution,
 	{RecallRange1Start, RecallRange2Start} = ar_block:get_recall_range(H0,
 			PartitionNumber, PartitionUpperBound),
@@ -506,7 +508,7 @@ process_partial_solution_poa(Solution, Ref, H0, H1) ->
 			PackingDifficulty),
 	{BlockStart1, BlockEnd1, TXRoot1} = ar_block_index:get_block_bounds(ComputedRecallByte1),
 	BlockSize1 = BlockEnd1 - BlockStart1,
-	Packing = ar_block:get_packing(PackingDifficulty, MiningAddress),
+	Packing = ar_block:get_packing(PackingDifficulty, MiningAddress, ReplicaFormat),
 	SubChunkIndex = ar_block:get_sub_chunk_index(PackingDifficulty, Nonce),
 	case RecallByte1 == ComputedRecallByte1 andalso
 			ar_poa:validate({BlockStart1, RecallByte1, TXRoot1, BlockSize1, PoA1,
@@ -583,8 +585,7 @@ process_partial_solution_vdf(Solution, Ref, PoACache, PoA2Cache) ->
 					%% ar_node_worker will fetch the required steps based on the prev block.
 					steps = not_found
 				},
-			ar_events:send(miner, {found_solution, {pool, Ref},
-					Solution2, PoACache, PoA2Cache}),
+			ar_node_worker:found_solution({pool, Ref}, Solution2, PoACache, PoA2Cache),
 			noreply;
 		_ ->
 			%% {Output, Seed, PartitionUpperBound} mismatch (pattern matching against
@@ -720,7 +721,8 @@ process_partial_solution_test_() ->
 						false
 				end
 			end},
-		{ar_node, get_current_diff, fun() -> {?MAX_DIFF, ?MAX_DIFF} end}],
+		{ar_node, get_current_diff, fun() -> {?MAX_DIFF, ?MAX_DIFF} end},
+		{ar_node, get_height, fun() -> 0 end}],
 		fun test_process_partial_solution/0
 	).
 
@@ -953,6 +955,7 @@ process_solution_test_() ->
 				end
 			end},
 		{ar_node, get_current_diff, fun() -> {0, 0} end},
+		{ar_node, get_height, fun() -> 0 end},
 		{ar_nonce_limiter, get_step_checkpoints,
 			fun(S, {N, SIN, D}) ->
 				case {S, N, SIN, D} of
@@ -992,7 +995,8 @@ process_solution_test_() ->
 						1
 				end
 			end},
-		{ar_events, send, fun(_Type, _Payload) -> ok end}],
+		{ar_events, send, fun(_Type, _Payload) -> ok end},
+		{ar_node_worker, found_solution, fun(_, _, _, _) -> ok end}],
 		fun test_process_solution/0
 	).
 

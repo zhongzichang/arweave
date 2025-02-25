@@ -12,7 +12,7 @@
 		poa_no_chunk_map_to_binary/1, binary_to_no_chunk_map/1,
 		poa_map_to_json_map/1, poa_no_chunk_map_to_json_map/1, json_map_to_poa_map/1,
 
-		block_index_to_binary/1, binary_to_block_index/1, encode_double_signing_proof/1,
+		block_index_to_binary/1, binary_to_block_index/1, encode_double_signing_proof/2,
 		json_struct_to_poa/1, poa_to_json_struct/1,
 		tx_to_json_struct/1, json_struct_to_tx/1, json_struct_to_v1_tx/1,
 		etf_to_wallet_chunk_response/1, wallet_list_to_json_struct/3,
@@ -33,10 +33,11 @@
 		partial_solution_response_to_json_struct/1,
 		pool_cm_jobs_to_json_struct/1, json_map_to_pool_cm_jobs/1]).
 
--include_lib("arweave/include/ar.hrl").
--include_lib("arweave/include/ar_vdf.hrl").
--include_lib("arweave/include/ar_mining.hrl").
--include_lib("arweave/include/ar_pool.hrl").
+-include("../include/ar.hrl").
+-include("../include/ar_consensus.hrl").
+-include("../include/ar_vdf.hrl").
+-include("../include/ar_mining.hrl").
+-include("../include/ar_pool.hrl").
 
 -include_lib("eunit/include/eunit.hrl").
 
@@ -147,7 +148,8 @@ block_to_json_struct(
 			recall_byte2 = RecallByte2,
 			packing_difficulty = PackingDifficulty,
 			unpacked_chunk_hash = UnpackedChunkHash,
-			unpacked_chunk2_hash = UnpackedChunk2Hash } = B) ->
+			unpacked_chunk2_hash = UnpackedChunk2Hash,
+			replica_format = ReplicaFormat } = B) ->
 	{JSONDiff, JSONCDiff} =
 		case Height >= ar_fork:height_1_8() of
 			true ->
@@ -328,7 +330,14 @@ block_to_json_struct(
 							| JSONElements8]
 				end
 		end,
-	{JSONElements9}.
+	JSONElements10 =
+		case Height >= ar_fork:height_2_9() of
+			false ->
+				JSONElements9;
+			true ->
+				[{replica_format, ReplicaFormat} | JSONElements9]
+		end,
+	{JSONElements10}.
 
 reward_history_to_binary(RewardHistory) ->
 	reward_history_to_binary(RewardHistory, []).
@@ -621,15 +630,27 @@ binary_to_nonce_limiter_update_response(
 		_SessionFoundBin, _StepNumberSize, _StepNumber, _Postpone, _Format) ->
 	{error, invalid1}.
 
-encode_double_signing_proof(undefined) ->
+encode_double_signing_proof(undefined, _Height) ->
 	<< 0:8 >>;
-encode_double_signing_proof(Proof) ->
-	{Key, Sig1, CDiff1, PrevCDiff1, Preimage1, Sig2, CDiff2, PrevCDiff2, Preimage2} = Proof,
-	<< 1:8, Key:512/binary, Sig1:512/binary,
-		(ar_serialize:encode_int(CDiff1, 16))/binary,
-		(ar_serialize:encode_int(PrevCDiff1, 16))/binary, Preimage1:64/binary,
-		Sig2:512/binary, (ar_serialize:encode_int(CDiff2, 16))/binary,
-		(ar_serialize:encode_int(PrevCDiff2, 16))/binary, Preimage2:64/binary >>.
+encode_double_signing_proof(Proof, Height) ->
+	{Key, Sig1, CDiff1, PrevCDiff1, Preimage1,
+			Sig2, CDiff2, PrevCDiff2, Preimage2} = Proof,
+	case Height >= ar_fork:height_2_9() of
+		false ->
+			<< 1:8, Key:512/binary, Sig1:512/binary,
+				(ar_serialize:encode_int(CDiff1, 16))/binary,
+				(ar_serialize:encode_int(PrevCDiff1, 16))/binary, Preimage1:64/binary,
+				Sig2:512/binary, (ar_serialize:encode_int(CDiff2, 16))/binary,
+				(ar_serialize:encode_int(PrevCDiff2, 16))/binary, Preimage2:64/binary >>;
+		true ->
+			<< 1:8, (ar_serialize:encode_bin(Key, 16))/binary,
+				(ar_serialize:encode_bin(Sig1, 16))/binary,
+				(ar_serialize:encode_int(CDiff1, 16))/binary,
+				(ar_serialize:encode_int(PrevCDiff1, 16))/binary, Preimage1:64/binary,
+				(ar_serialize:encode_bin(Sig2, 16))/binary,
+				(ar_serialize:encode_int(CDiff2, 16))/binary,
+				(ar_serialize:encode_int(PrevCDiff2, 16))/binary, Preimage2:64/binary >>
+	end.
 
 %%%===================================================================
 %%% Private functions.
@@ -667,7 +688,7 @@ encode_post_2_6_fields(#block{ height = Height, hash_preimage = HashPreimage,
 				KryderPlusRateMultiplier:24, KryderPlusRateMultiplierLatch:8,
 				Denomination:24, (encode_int(RedenominationHeight, 8))/binary,
 				(encode_int(PrevCDiff, 16))/binary,
-				(encode_double_signing_proof(DoubleSigningProof))/binary,
+				(encode_double_signing_proof(DoubleSigningProof, Height))/binary,
 				(encode_post_2_7_fields(B))/binary >>
 	end.
 
@@ -693,7 +714,7 @@ encode_post_2_8_fields(#block{ height = Height,
 		packing_difficulty = PackingDifficulty,
 		unpacked_chunk_hash = UnpackedChunkHash, unpacked_chunk2_hash = UnpackedChunk2Hash,
 		poa = #poa{ unpacked_chunk = UnpackedChunk },
-		poa2 = #poa{ unpacked_chunk = UnpackedChunk2 }}) ->
+		poa2 = #poa{ unpacked_chunk = UnpackedChunk2 }} = B) ->
 	case Height >= ar_fork:height_2_8() of
 		false ->
 			<<>>;
@@ -702,7 +723,16 @@ encode_post_2_8_fields(#block{ height = Height,
 				(ar_serialize:encode_bin(UnpackedChunkHash, 8))/binary,
 				(ar_serialize:encode_bin(UnpackedChunk2Hash, 8))/binary,
 				(ar_serialize:encode_bin(UnpackedChunk, 24))/binary,
-				(ar_serialize:encode_bin(UnpackedChunk2, 24))/binary >>
+				(ar_serialize:encode_bin(UnpackedChunk2, 24))/binary,
+				(encode_post_2_9_fields(B))/binary >>
+	end.
+
+encode_post_2_9_fields(#block{ height = Height, replica_format = ReplicaFormat }) ->
+	case Height >= ar_fork:height_2_9() of
+		false ->
+			<<>>;
+		true ->
+			<< ReplicaFormat:8 >>
 	end.
 
 encode_nonce_limiter_info(#nonce_limiter_info{ output = Output, global_step_number = N,
@@ -753,13 +783,19 @@ encode_tx(#tx{ format = Format, id = TXID, last_tx = LastTX, owner = Owner,
 		tags = Tags, target = Target, quantity = Quantity, data = Data,
 		data_size = DataSize, data_root = DataRoot, signature = Signature,
 		reward = Reward, signature_type = SignatureType } = TX) ->
+	Owner2 =
+		case SignatureType of
+			?ECDSA_KEY_TYPE ->
+				<<>>;
+			_ ->
+				Owner
+		end,
 	<< Format:8, TXID:32/binary,
-			(encode_bin(LastTX, 8))/binary, (encode_bin(Owner, 16))/binary,
+			(encode_bin(LastTX, 8))/binary, (encode_bin(Owner2, 16))/binary,
 			(encode_bin(Target, 8))/binary, (encode_int(Quantity, 8))/binary,
 			(encode_int(DataSize, 16))/binary, (encode_bin(DataRoot, 8))/binary,
 			(encode_bin(Signature, 16))/binary, (encode_int(Reward, 8))/binary,
 			(encode_bin(Data, 24))/binary, (encode_tx_tags(Tags))/binary,
-			(encode_signature_type(SignatureType))/binary,
 			(may_be_encode_tx_denomination(TX))/binary >>.
 
 encode_tx_tags(Tags) ->
@@ -772,13 +808,6 @@ encode_tx_tags([{Name, Value} | Tags], Encoded, N) ->
 	TagValueSize = byte_size(Value),
 	Tag = << TagNameSize:16, TagValueSize:16, Name/binary, Value/binary >>,
 	encode_tx_tags(Tags, [Tag | Encoded], N + 1).
-
-encode_signature_type(?DEFAULT_KEY_TYPE) ->
-	<<>>;
-encode_signature_type({?ECDSA_SIGN_ALG, secp256k1}) ->
-	<< 1:8 >>;
-encode_signature_type({?EDDSA_SIGN_ALG, ed25519}) ->
-	<< 2:8 >>.
 
 may_be_encode_tx_denomination(#tx{ denomination = 0 }) ->
 	<<>>;
@@ -841,11 +870,18 @@ parse_block_post_2_6_fields(B, << HashPreimageSize:8, HashPreimage:HashPreimageS
 			last_step_checkpoints = parse_checkpoints(LastCheckpoints, Height),
 			steps = parse_checkpoints(Steps, Height) },
 	RecallByte2_2 = case RecallByte2Size of 0 -> undefined; _ -> RecallByte2 end,
+	SigType =
+		case {RewardKeySize, Height >= ar_fork:height_2_9()} of
+			{?ECDSA_PUB_KEY_SIZE, true} ->
+				?ECDSA_KEY_TYPE;
+			_ ->
+				?RSA_KEY_TYPE
+		end,
 	B2 = B#block{ hash_preimage = HashPreimage, recall_byte = RecallByte_2,
 			reward = Reward, nonce = Nonce, recall_byte2 = RecallByte2_2,
 			previous_solution_hash = PreviousSolutionHash,
 			signature = Sig, partition_number = PartitionNumber,
-			reward_key = {{?RSA_SIGN_ALG, 65537}, RewardKey},
+			reward_key = {SigType, RewardKey},
 			nonce_limiter_info = NonceLimiterInfo,
 			poa2 = #poa{ chunk = Chunk, data_path = DataPath, tx_path = TXPath },
 			price_per_gib_minute = PricePerGiBMinute,
@@ -902,17 +938,41 @@ parse_block_transactions(_N, _Rest, _TXs) ->
 
 parse_double_signing_proof(<< 0:8, Rest/binary >>, B) ->
 	parse_post_2_7_fields(Rest, B);
-parse_double_signing_proof(<< 1:8, Key:512/binary, Sig1:512/binary,
-		CDiff1Size:16, CDiff1:(CDiff1Size * 8),
-		PrevCDiff1Size:16, PrevCDiff1:(PrevCDiff1Size * 8),
-		Preimage1:64/binary, Sig2:512/binary, CDiff2Size:16, CDiff2:(CDiff2Size * 8),
-		PrevCDiff2Size:16, PrevCDiff2:(PrevCDiff2Size * 8),
-		Preimage2:64/binary, Rest/binary >>, B) ->
-	B2 = B#block{ double_signing_proof = {Key, Sig1, CDiff1, PrevCDiff1, Preimage1,
-			Sig2, CDiff2, PrevCDiff2, Preimage2} },
-	parse_post_2_7_fields(Rest, B2);
-parse_double_signing_proof(_Bin, _B) ->
-	{error, invalid_double_signing_proof_input}.
+parse_double_signing_proof(Bin, #block{ height = Height } = B) ->
+	case {Bin, Height >= ar_fork:height_2_9()} of
+		{<< 1:8, Key:512/binary, Sig1:512/binary,
+				CDiff1Size:16, CDiff1:(CDiff1Size * 8),
+				PrevCDiff1Size:16, PrevCDiff1:(PrevCDiff1Size * 8),
+				Preimage1:64/binary, Sig2:512/binary,
+				CDiff2Size:16, CDiff2:(CDiff2Size * 8),
+				PrevCDiff2Size:16, PrevCDiff2:(PrevCDiff2Size * 8),
+				Preimage2:64/binary, Rest/binary >>, false} ->
+			Proof = {Key, Sig1, CDiff1, PrevCDiff1, Preimage1,
+					Sig2, CDiff2, PrevCDiff2, Preimage2},
+			B2 = B#block{ double_signing_proof = Proof },
+			parse_post_2_7_fields(Rest, B2);
+		{_Bin, false} ->
+			{error, invalid_double_signing_proof_input};
+		{<< 1:8, KeySize:16, Key:KeySize/binary, Sig1Size:16, Sig1:Sig1Size/binary,
+				CDiff1Size:16, CDiff1:(CDiff1Size * 8),
+				PrevCDiff1Size:16, PrevCDiff1:(PrevCDiff1Size * 8),
+				Preimage1:64/binary, Sig2Size:16, Sig2:Sig2Size/binary,
+				CDiff2Size:16, CDiff2:(CDiff2Size * 8),
+				PrevCDiff2Size:16, PrevCDiff2:(PrevCDiff2Size * 8),
+				Preimage2:64/binary, Rest/binary >>, true}
+					when (KeySize == ?RSA_BLOCK_SIG_SIZE andalso
+							Sig1Size == ?RSA_BLOCK_SIG_SIZE andalso
+							Sig2Size == ?RSA_BLOCK_SIG_SIZE) orelse
+						(KeySize == ?ECDSA_PUB_KEY_SIZE andalso
+							Sig1Size == ?ECDSA_SIG_SIZE andalso
+							Sig2Size == ?ECDSA_SIG_SIZE) ->
+			Proof = {Key, Sig1, CDiff1, PrevCDiff1, Preimage1,
+					Sig2, CDiff2, PrevCDiff2, Preimage2},
+			B2 = B#block{ double_signing_proof = Proof },
+			parse_post_2_7_fields(Rest, B2);
+		{_Bin, true} ->
+			{error, invalid_double_signing_proof_input2}
+end.
 
 parse_post_2_7_fields(Rest, #block{ height = Height } = B) ->
 	case {Rest, Height >= ar_fork:height_2_7()} of
@@ -947,7 +1007,7 @@ parse_post_2_8_fields(Rest, #block{ height = Height, poa = PoA, poa2 = PoA2 } = 
 				UnpackedChunkSize:24,
 				UnpackedChunk:UnpackedChunkSize/binary,
 				UnpackedChunk2Size:24,
-				UnpackedChunk2:UnpackedChunk2Size/binary >>, true} ->
+				UnpackedChunk2:UnpackedChunk2Size/binary, Rest2/binary >>, true} ->
 			UnpackedChunkHash_2 =
 				case UnpackedChunkHash of
 					<<>> -> undefined;
@@ -958,13 +1018,23 @@ parse_post_2_8_fields(Rest, #block{ height = Height, poa = PoA, poa2 = PoA2 } = 
 					<<>> -> undefined;
 					_ -> UnpackedChunk2Hash
 				end,
-			{ok, B#block{ packing_difficulty = PackingDifficulty,
+			parse_post_2_9_fields(Rest2, B#block{ packing_difficulty = PackingDifficulty,
 					unpacked_chunk_hash = UnpackedChunkHash_2,
 					unpacked_chunk2_hash = UnpackedChunk2Hash_2,
 					poa = PoA#poa{ unpacked_chunk = UnpackedChunk },
-					poa2 = PoA2#poa{ unpacked_chunk = UnpackedChunk2 } }};
+					poa2 = PoA2#poa{ unpacked_chunk = UnpackedChunk2 } });
 		_ ->
 			{error, invalid_packing_difficulty}
+	end.
+
+parse_post_2_9_fields(Rest, #block{ height = Height } = B) ->
+	case {Rest, Height >= ar_fork:height_2_9()} of
+		{<<>>, false} ->
+			{ok, B};
+		{<< ReplicaFormat:8 >>, true} ->
+			{ok, B#block{ replica_format = ReplicaFormat }};
+		_ ->
+			{error, invalid_replica_format}
 	end.
 
 parse_tx(<< TXID:32/binary >>) ->
@@ -984,13 +1054,23 @@ parse_tx(<< Format:8, TXID:32/binary,
 		{error, Reason} ->
 			{error, Reason};
 		{ok, Tags, Rest2} ->
+			SigType = set_sig_type_from_pub_key(Owner, Signature),
 			case parse_tx_denomination(Rest2) of
 				{ok, Denomination} ->
 					DataSize2 = case Format of 1 -> byte_size(Data); _ -> DataSize end,
-					{ok, #tx{ format = Format, id = TXID, last_tx = LastTX, owner = Owner,
+					TX = #tx{ format = Format, id = TXID, last_tx = LastTX, owner = Owner,
 							target = Target, quantity = Quantity, data_size = DataSize2,
 							data_root = DataRoot, signature = Signature, reward = Reward,
-							data = Data, tags = Tags, denomination = Denomination }};
+							data = Data, tags = Tags, denomination = Denomination,
+							signature_type = SigType },
+					case SigType of
+						{?ECDSA_SIGN_ALG, secp256k1} ->
+							DataSegment = ar_tx:generate_signature_data_segment(TX),
+							Owner2 = ar_wallet:recover_key(DataSegment, Signature, SigType),
+							{ok, TX#tx{ owner = Owner2 }};
+						{?RSA_SIGN_ALG, 65537} ->
+							{ok, TX}
+					end;
 				{error, Reason} ->
 					{error, Reason}
 			end
@@ -1018,15 +1098,6 @@ parse_tx_denomination(<< Denomination:24 >>) when Denomination > 0 ->
 	{ok, Denomination};
 parse_tx_denomination(_Rest) ->
 	{error, invalid_denomination}.
-
-%parse_signature_type(<<>>) ->
-%	{ok, ?DEFAULT_KEY_TYPE};
-%parse_signature_type(<< 1:8 >>) ->
-%	{ok, {?ECDSA_SIGN_ALG, secp256k1}};
-%parse_signature_type(<< 2:8 >>) ->
-%	{ok, {?EDDSA_SIGN_ALG, ed25519}};
-%parse_signature_type(_Rest) ->
-%	{error, invalid_input}.
 
 tx_to_binary(TX) ->
 	Bin = encode_tx(TX),
@@ -1362,10 +1433,18 @@ tx_to_json_struct(
 		data = Data,
 		reward = Reward,
 		signature = Sig,
+		signature_type = SigType,
 		data_size = DataSize,
 		data_root = DataRoot,
 		denomination = Denomination
 	}) ->
+	Owner2 =
+		case SigType of
+			?ECDSA_KEY_TYPE ->
+				<<>>;
+			_ ->
+				Owner
+		end,
 	Fields = [
 		{format,
 			case Format of
@@ -1376,7 +1455,7 @@ tx_to_json_struct(
 			end},
 		{id, ar_util:encode(ID)},
 		{last_tx, ar_util:encode(Last)},
-		{owner, ar_util:encode(Owner)},
+		{owner, ar_util:encode(Owner2)},
 		{tags,
 			lists:map(
 				fun({Name, Value}) ->
@@ -1521,11 +1600,14 @@ json_struct_to_tx(TXStruct, ComputeDataSize) ->
 		end,
 	TXID = ar_util:decode(find_value(<<"id">>, TXStruct)),
 	32 = byte_size(TXID),
-	#tx{
+	Owner = ar_util:decode(find_value(<<"owner">>, TXStruct)),
+	Sig = ar_util:decode(find_value(<<"signature">>, TXStruct)),
+	SigType = set_sig_type_from_pub_key(Owner, Sig),
+	TX = #tx{
 		format = Format,
 		id = TXID,
 		last_tx = ar_util:decode(find_value(<<"last_tx">>, TXStruct)),
-		owner = ar_util:decode(find_value(<<"owner">>, TXStruct)),
+		owner = Owner,
 		tags = [{ar_util:decode(Name), ar_util:decode(Value)}
 				%% Only the elements matching this pattern are included in the list.
 				|| {[{<<"name">>, Name}, {<<"value">>, Value}]} <- Tags],
@@ -1534,7 +1616,8 @@ json_struct_to_tx(TXStruct, ComputeDataSize) ->
 		quantity = binary_to_integer(find_value(<<"quantity">>, TXStruct)),
 		data = Data,
 		reward = binary_to_integer(find_value(<<"reward">>, TXStruct)),
-		signature = ar_util:decode(find_value(<<"signature">>, TXStruct)),
+		signature = Sig,
+		signature_type = SigType,
 		data_size = parse_data_size(Format, TXStruct, Data, ComputeDataSize),
 		data_root =
 			case find_value(<<"data_root">>, TXStruct) of
@@ -1542,7 +1625,27 @@ json_struct_to_tx(TXStruct, ComputeDataSize) ->
 				DR -> ar_util:decode(DR)
 			end,
 		denomination = Denomination
-	}.
+	},
+	case SigType of
+		?ECDSA_KEY_TYPE ->
+			DataSegment = ar_tx:generate_signature_data_segment(TX),
+			Owner2 = ar_wallet:recover_key(DataSegment, Sig, SigType),
+			TX#tx{ owner = Owner2 };
+		?RSA_KEY_TYPE ->
+			TX
+	end.
+
+set_sig_type_from_pub_key(_Owner, <<>>) ->
+	%% Transactions with the empty signatures are used in some old tests,
+	%% e.g., ar_http_iface_tests.erl.
+	?RSA_KEY_TYPE;
+set_sig_type_from_pub_key(Owner, _Sig) ->
+	case Owner of
+		<<>> ->
+			?ECDSA_KEY_TYPE;
+		_ ->
+			?RSA_KEY_TYPE
+	end.
 
 json_list_to_diff_pair(List) ->
 	[PoA1DiffBin, DiffBin] = 
@@ -1826,7 +1929,8 @@ candidate_to_json_struct(
 		start_interval_number = StartIntervalNumber,
 		step_number = StepNumber,
 		label = Label,
-		packing_difficulty = PackingDifficulty
+		packing_difficulty = PackingDifficulty,
+		replica_format = ReplicaFormat
 	}) ->
 	JSON = [
 		{cm_diff, diff_pair_to_json_list(DiffPair)},
@@ -1844,7 +1948,8 @@ candidate_to_json_struct(
 		{step_number, integer_to_binary(StepNumber)},
 		{nonce_limiter_output, ar_util:encode(NonceLimiterOutput)},
 		{label, Label},
-		{packing_difficulty, PackingDifficulty}
+		{packing_difficulty, PackingDifficulty},
+		{replica_format, ReplicaFormat}
 	],
 
 	JSON2 = encode_if_set(JSON, h1, H1, fun ar_util:encode/1),
@@ -1891,7 +1996,11 @@ json_map_to_candidate(JSON) ->
 	StepNumber = binary_to_integer(maps:get(<<"step_number">>, JSON)),
 	Label = maps:get(<<"label">>, JSON, <<"not_set">>),
 	PackingDifficulty = maps:get(<<"packing_difficulty">>, JSON, 0),
-	true = PackingDifficulty >= 0 andalso PackingDifficulty =< ?MAX_PACKING_DIFFICULTY,
+	ReplicaFormat = maps:get(<<"replica_format">>, JSON, 0),
+	true = (PackingDifficulty >= 0 andalso PackingDifficulty =< ?MAX_PACKING_DIFFICULTY
+			andalso ReplicaFormat == 0)
+			orelse (ReplicaFormat == 1
+					andalso PackingDifficulty == ?REPLICA_2_9_PACKING_DIFFICULTY),
 	#mining_candidate{
 		cm_diff = DiffPair,
 		cm_h1_list = H1List,
@@ -1913,7 +2022,8 @@ json_map_to_candidate(JSON) ->
 		start_interval_number = StartIntervalNumber,
 		step_number = StepNumber,
 		label = Label,
-		packing_difficulty = PackingDifficulty
+		packing_difficulty = PackingDifficulty,
+		replica_format = ReplicaFormat
 	}.
 
 json_struct_to_h1_list(JSON) ->
@@ -1950,7 +2060,8 @@ solution_to_json_struct(
 		start_interval_number = StartIntervalNumber,
 		step_number = StepNumber,
 		steps = Steps,
-		packing_difficulty = PackingDifficulty
+		packing_difficulty = PackingDifficulty,
+		replica_format = ReplicaFormat
 	}) ->
 	JSON = [
 		{last_step_checkpoints, ar_util:encode(iolist_to_binary(LastStepCheckpoints))},
@@ -1970,7 +2081,8 @@ solution_to_json_struct(
 		{start_interval_number, integer_to_binary(StartIntervalNumber)},
 		{step_number, integer_to_binary(StepNumber)},
 		{steps, ar_util:encode(iolist_to_binary(Steps))},
-		{packing_difficulty, PackingDifficulty}
+		{packing_difficulty, PackingDifficulty},
+		{replica_format, ReplicaFormat}
 	],
 	{encode_if_set(JSON, recall_byte2, RecallByte2, fun integer_to_binary/1)}.
 
@@ -2002,7 +2114,11 @@ json_map_to_solution(JSON) ->
 	StepNumber = binary_to_integer(maps:get(<<"step_number">>, JSON)),
 	Steps = parse_json_checkpoints(ar_util:decode(maps:get(<<"steps">>, JSON, <<>>))),
 	PackingDifficulty = maps:get(<<"packing_difficulty">>, JSON, 0),
-	true = PackingDifficulty >= 0 andalso PackingDifficulty =< ?MAX_PACKING_DIFFICULTY,
+	ReplicaFormat = maps:get(<<"replica_format">>, JSON, 0),
+	true = (PackingDifficulty >= 0 andalso PackingDifficulty =< ?MAX_PACKING_DIFFICULTY
+			andalso ReplicaFormat == 0)
+			orelse (ReplicaFormat == 1
+					andalso PackingDifficulty == ?REPLICA_2_9_PACKING_DIFFICULTY),
 	#mining_solution{
 		last_step_checkpoints = LastStepCheckpoints,
 		mining_address = MiningAddress,
@@ -2022,7 +2138,8 @@ json_map_to_solution(JSON) ->
 		start_interval_number = StartIntervalNumber,
 		step_number = StepNumber,
 		steps = Steps,
-		packing_difficulty = PackingDifficulty
+		packing_difficulty = PackingDifficulty,
+		replica_format = ReplicaFormat
 	}.
 
 encode_if_set(JSON, _JSONProperty, not_set, _Encoder) ->
@@ -2110,6 +2227,8 @@ partition_to_json_struct(Bucket, BucketSize, Addr, PackingDifficulty) ->
 
 encode_packing(undefined, false) ->
 	"undefined";
+encode_packing(none, false) ->
+	"none";
 encode_packing(any, false) ->
 	"any";
 encode_packing({spora_2_6, Addr}, _Strict) ->
@@ -2120,7 +2239,11 @@ encode_packing({composite, Addr, PackingDifficulty}, _Strict) ->
 encode_packing(spora_2_5, _Strict) ->
 	"spora_2_5";
 encode_packing(unpacked, _Strict) ->
-	"unpacked".
+	"unpacked";
+encode_packing({replica_2_9, Addr}, _Strict) ->
+	"replica_2_9_" ++ binary_to_list(ar_util:encode(Addr));
+encode_packing(unpacked_padded, _Strict) ->
+	"unpacked_padded".
 
 decode_packing(<<"unpacked">>, _Error) ->
 	unpacked;
@@ -2152,6 +2275,15 @@ decode_packing(<<"composite_", Rest/binary>>, Error) ->
 		_ ->
 			Error
 	end;
+decode_packing(<< "replica_2_9_", Addr/binary >>, Error) ->
+	case ar_util:safe_decode(Addr) of
+		{ok, DecodedAddr} ->
+			{replica_2_9, DecodedAddr};
+		_ ->
+			Error
+	end;
+decode_packing(<<"unpacked_padded">>, _Error) ->
+	unpacked_padded;
 decode_packing(_, Error) ->
 	Error.
 
@@ -2174,7 +2306,16 @@ binary_to_packing(<< "composite_", PackingDifficulty:8, Addr/binary >>, Error)
 			{composite, DecodedAddr, PackingDifficulty};
 		_ ->
 			Error
-	end.
+	end;
+binary_to_packing(<< "replica_2_9_", Addr/binary >>, Error) when byte_size(Addr) =< 64 ->
+	case ar_util:safe_decode(Addr) of
+		{ok, DecodedAddr} ->
+			{replica_2_9, DecodedAddr};
+		_ ->
+			Error
+	end;
+binary_to_packing(<<"unpacked_padded">>, _Error) ->
+	unpacked_padded.
 
 packing_to_binary(unpacked) ->
 	<<"unpacked">>;
@@ -2184,7 +2325,11 @@ packing_to_binary({spora_2_6, Addr}) ->
 	iolist_to_binary([<<"spora_2_6_">>, ar_util:encode(Addr)]);
 packing_to_binary({composite, Addr, PackingDifficulty}) ->
 	iolist_to_binary([<<"composite_">>, << PackingDifficulty:8 >>,
-						ar_util:encode(Addr)]).
+						ar_util:encode(Addr)]);
+packing_to_binary({replica_2_9, Addr}) ->
+	iolist_to_binary([<<"replica_2_9_">>, ar_util:encode(Addr)]);
+packing_to_binary(unpacked_padded) ->
+	<<"unpacked_padded">>.
 
 pool_cm_jobs_to_json_struct(Jobs) ->
 	#pool_cm_jobs{ h1_to_h2_jobs = H1ToH2Jobs, h1_read_jobs = H1ReadJobs,

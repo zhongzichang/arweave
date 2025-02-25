@@ -29,14 +29,14 @@ handle_call(Request, _From, State) ->
 	?LOG_WARNING([{event, unhandled_call}, {module, ?MODULE}, {request, Request}]),
 	{reply, ok, State}.
 
-handle_cast({emit, TXID, Peer, ReplyTo}, State) ->
+handle_cast({emit, TXID, Peer, ConnectTimeout, Timeout, ReplyTo}, State) ->
 	case ar_mempool:get_tx(TXID) of
 		not_found ->
 			ok;
 		TX ->
 			StartedAt = erlang:timestamp(),
-			Opts = #{ connect_timeout => 1
-				, timeout => 5
+			Opts = #{ connect_timeout => ConnectTimeout div 1000
+				, timeout => Timeout div 1000
 				},
 			emit(#{ tx_id => TXID
 			      , peer => Peer
@@ -53,21 +53,6 @@ handle_cast(Msg, State) ->
 	{noreply, State}.
 
 handle_info({event, tx, _}, State) ->
-	{noreply, State};
-
-handle_info({gun_down, _, http, normal, _, _}, State) ->
-	{noreply, State};
-handle_info({gun_down, _, http, closed, _, _}, State) ->
-	{noreply, State};
-handle_info({gun_down, _, http, {error,econnrefused}, _, _}, State) ->
-	{noreply, State};
-handle_info({gun_up, _, http}, State) ->
-	{noreply, State};
-handle_info({gun_response, _, _, _, _, _}, State) ->
-	{noreply, State};
-handle_info({gun_data, _, _, _, _}, state) ->
-	{noreply, state};
-handle_info({gun_error, _, _, _}, State) ->
 	{noreply, State};
 
 handle_info(Info, State) ->

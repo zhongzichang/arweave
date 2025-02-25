@@ -1,11 +1,12 @@
 -module(ar_post_block_tests).
 
--include_lib("arweave/include/ar_consensus.hrl").
--include_lib("arweave/include/ar_config.hrl").
+-include("../include/ar_consensus.hrl").
+-include("../include/ar_config.hrl").
+
 -include_lib("eunit/include/eunit.hrl").
 
 -import(ar_test_node, [
-		wait_until_height/1, post_block/2,
+		wait_until_height/2, post_block/2,
 		send_new_block/2, sign_block/3,
 		read_block_when_stored/2,
 		assert_wait_until_height/2,
@@ -23,15 +24,14 @@ reset_node() ->
 	ar_test_node:connect_to_peer(peer1),
 
 	Height = height(peer1),
-	[{PrevH, _, _} | _] = wait_until_height(Height),
+	[{PrevH, _, _} | _] = wait_until_height(main, Height),
 	ar_test_node:disconnect_from(peer1),
 	ar_test_node:mine(peer1),
 	[{H, _, _} | _] = ar_test_node:assert_wait_until_height(peer1, Height + 1),
 	B = ar_test_node:remote_call(peer1, ar_block_cache, get, [block_cache, H]),
 	PrevB = ar_test_node:remote_call(peer1, ar_block_cache, get, [block_cache, PrevH]),
 	{ok, Config} = ar_test_node:remote_call(peer1, application, get_env, [arweave, config]),
-	Key = element(1,
-		ar_test_node:remote_call(peer1, ar_wallet, load_key, [Config#config.mining_addr])),
+	Key = ar_test_node:remote_call(peer1, ar_wallet, load_key, [Config#config.mining_addr]),
 	{Key, B, PrevB}.
 
 setup_all_post_2_7() ->
@@ -54,7 +54,7 @@ cleanup_all_post_fork({Cleanup, Functions}) ->
 	Cleanup(Functions).
 
 instantiator(TestFun) ->
-	fun (Fixture) -> {timeout, 60, {with, Fixture, [TestFun]}} end.
+	fun (Fixture) -> {timeout, 120, {with, Fixture, [TestFun]}} end.
 
 post_2_7_test_() ->
 	{setup, fun setup_all_post_2_7/0, fun cleanup_all_post_fork/1,
@@ -294,8 +294,7 @@ test_add_external_block_with_invalid_timestamp() ->
 	post_block(B5, valid).
 
 rejects_invalid_blocks_test_() ->
-	ar_test_node:test_with_mocked_functions([{ar_fork, height_2_7, fun() -> 0 end}],
-		fun test_rejects_invalid_blocks/0).
+	{timeout, 120, fun test_rejects_invalid_blocks/0}.
 
 test_rejects_invalid_blocks() ->
 	[B0] = ar_weave:init([], ar_retarget:switch_to_linear_diff(2)),
@@ -324,7 +323,7 @@ test_rejects_invalid_blocks() ->
 	%% Nonce limiter output too far in the future.
 	Info1 = B1#block.nonce_limiter_info,
 	{ok, Config} = ar_test_node:remote_call(peer1, application, get_env, [arweave, config]),
-	Key = element(1, ar_test_node:remote_call(peer1, ar_wallet, load_key, [Config#config.mining_addr])),
+	Key = ar_test_node:remote_call(peer1, ar_wallet, load_key, [Config#config.mining_addr]),
 	B3 = sign_block(B1#block{
 			%% Change the solution hash so that the validator does not go down
 			%% the comparing the resigned solution with the cached solution path.
@@ -356,7 +355,7 @@ test_rejects_invalid_blocks() ->
 			%% Change the solution hash so that the validator does not go down
 			%% the comparing the resigned solution with the cached solution path.
 			hash = crypto:strong_rand_bytes(32),
-			reward_key = element(2, InvalidKey) }, B0, element(1, InvalidKey)),
+			reward_key = element(2, InvalidKey) }, B0, InvalidKey),
 	timer:sleep(100 * 2), % ?THROTTLE_BY_IP_INTERVAL_MS * 2
 	post_block(B6, [invalid_hash_preimage, invalid_pow]),
 	?assertMatch({ok, {{<<"403">>, _}, _,
@@ -468,19 +467,46 @@ test_rejects_invalid_blocks() ->
 	ar_blacklist_middleware:reset().
 
 rejects_blocks_with_invalid_double_signing_proof_test_() ->
-	ar_test_node:test_with_mocked_functions([{ar_fork, height_2_6, fun() -> 0 end}],
+	test_with_mocked_functions([{ar_fork, height_2_9, fun() -> 0 end}],
 		fun test_reject_block_invalid_double_signing_proof/0).
 
+rejects_blocks_with_small_rsa_keys_test_() ->
+	{timeout, 60, fun test_rejects_blocks_with_small_rsa_keys/0}.
+
+test_rejects_blocks_with_small_rsa_keys() ->
+	[B0] = ar_weave:init(),
+	ar_test_node:start(B0),
+	ok = ar_events:subscribe(block),
+	ar_test_node:mine(main),
+	BI = ar_test_node:assert_wait_until_height(main, 1),
+	B1 = ar_storage:read_block(hd(BI)),
+	Key2 = ar_test_node:new_custom_size_rsa_wallet(512), % normal 512-byte key
+	B2 = sign_block(B1, B0, Key2),
+	post_block(B2, invalid_resigned_solution_hash), % because reward_addr changed
+	Key3 = ar_test_node:new_custom_size_rsa_wallet(66), % 66-byte key
+	B3 = sign_block(B1, B0, Key3),
+	post_block(B3, invalid_signature),
+	Key4 = ar_test_node:new_custom_size_rsa_wallet(511),
+	B4 = sign_block(B1, B0, Key4),
+	post_block(B4, invalid_signature).
+
 test_reject_block_invalid_double_signing_proof() ->
+	[test_reject_block_invalid_double_signing_proof(KeyType)
+		|| KeyType <- [?RSA_KEY_TYPE, ?ECDSA_KEY_TYPE]].
+
+test_reject_block_invalid_double_signing_proof(KeyType) ->
+	?debugFmt("KeyType: ~p~n", [KeyType]),
+	FullKey = ar_test_node:remote_call(peer1, ar_wallet, new_keyfile, [KeyType]),
+	MiningAddr = ar_wallet:to_address(FullKey),
 	Key0 = ar_wallet:new(),
 	Addr0 = ar_wallet:to_address(Key0),
 	[B0] = ar_weave:init([{Addr0, ?AR(1000), <<>>}], ar_retarget:switch_to_linear_diff(2)),
+	?debugFmt("Genesis address: ~s, initial balance: ~B AR.~n", [ar_util:encode(Addr0), 1000]),
 	ar_test_node:start(B0),
-	ar_test_node:start_peer(peer1, B0),
+	ar_test_node:start_peer(peer1, B0, MiningAddr),
 	ar_test_node:disconnect_from(peer1),
-	{ok, Config} = ar_test_node:remote_call(peer1, application, get_env, [arweave, config]),
 	ok = ar_events:subscribe(block),
-	{Key, _} = FullKey = ar_test_node:remote_call(peer1, ar_wallet, load_key, [Config#config.mining_addr]),
+	{Priv, _} = Key = ar_test_node:remote_call(peer1, ar_wallet, load_key, [MiningAddr]),
 	TX0 = ar_test_node:sign_tx(Key0, #{ target => ar_wallet:to_address(Key), quantity => ?AR(10) }),
 	ar_test_node:assert_post_tx_to_peer(peer1, TX0),
 	ar_test_node:assert_post_tx_to_peer(main, TX0),
@@ -501,11 +527,11 @@ test_reject_block_invalid_double_signing_proof() ->
 	SignedH = ar_block:generate_signed_hash(B1),
 	Preimage1 = << (B0#block.hash)/binary, SignedH/binary >>,
 	Preimage2 = << (B0#block.hash)/binary, (crypto:strong_rand_bytes(32))/binary >>,
-	SignaturePreimage = << (ar_serialize:encode_int(CDiff, 16))/binary,
-					(ar_serialize:encode_int(PrevCDiff, 16))/binary, Preimage2/binary >>,
-	Signature2 = ar_wallet:sign(Key, SignaturePreimage),
+	SignaturePreimage = ar_block:get_block_signature_preimage(CDiff, PrevCDiff,
+			Preimage2, 0),
+	Signature2 = ar_wallet:sign(Priv, SignaturePreimage),
 	%% We cannot ban ourselves.
-	InvalidProof2 = {element(3, Key), B1#block.signature, CDiff, PrevCDiff, Preimage1,
+	InvalidProof2 = {element(3, Priv), B1#block.signature, CDiff, PrevCDiff, Preimage1,
 			Signature2, CDiff, PrevCDiff, Preimage2},
 	B3 = sign_block(B1#block{ double_signing_proof = InvalidProof2 }, B0, Key),
 	post_block(B3, invalid_double_signing_proof_same_address),
@@ -515,22 +541,34 @@ test_reject_block_invalid_double_signing_proof() ->
 	Key2 = element(1, ar_wallet:load_key(MainConfig#config.mining_addr)),
 	Preimage3 = << (B0#block.hash)/binary, (crypto:strong_rand_bytes(32))/binary >>,
 	Preimage4 = << (B0#block.hash)/binary, (crypto:strong_rand_bytes(32))/binary >>,
-	SignaturePreimage3 = << (ar_serialize:encode_int(CDiff, 16))/binary,
-					(ar_serialize:encode_int(PrevCDiff, 16))/binary, Preimage3/binary >>,
-	SignaturePreimage4 = << (ar_serialize:encode_int(CDiff, 16))/binary,
-					(ar_serialize:encode_int(PrevCDiff, 16))/binary, Preimage4/binary >>,
-	Signature3 = ar_wallet:sign(Key, SignaturePreimage3),
-	Signature4 = ar_wallet:sign(Key, SignaturePreimage4),
+	SignaturePreimage3 = ar_block:get_block_signature_preimage(CDiff, PrevCDiff,
+			Preimage3, 0),
+	SignaturePreimage4 = ar_block:get_block_signature_preimage(CDiff, PrevCDiff,
+			Preimage4, 0),
+	Signature3 = ar_wallet:sign(Key2, SignaturePreimage3),
+	Signature4 = ar_wallet:sign(Key2, SignaturePreimage4),
 	%% The account address is not in the reward history.
 	InvalidProof3 = {element(3, Key2), Signature3, CDiff, PrevCDiff, Preimage3,
 			Signature4, CDiff, PrevCDiff, Preimage4},
 	B5 = sign_block(B1#block{ double_signing_proof = InvalidProof3 }, B0, Key),
 	post_block(B5, invalid_double_signing_proof_not_in_reward_history),
-	ar_test_node:connect_to_peer(peer1),
-	wait_until_height(2),
-	B6 = ar_test_node:remote_call(peer1, ar_storage, read_block, [hd(BI2)]),
-	B7 = sign_block(B6, B1, Key),
+	B6 = ar_test_node:remote_call(peer1, ar_storage, read_block, [lists:nth(2, BI2)]),
+	B7 = ar_test_node:remote_call(peer1, ar_storage, read_block, [hd(BI2)]),
+	%% ECDSA signatures are deterministic - we add a new tag to get a new signature here.
+	B7_2 = sign_block(B7#block{ tags = [<<"new_tag">>] }, B6, Key),
+	post_block(B6, valid),
 	post_block(B7, valid),
+	post_block(B7_2, valid),
+	%% Wait until the node records conflicting proofs.
+	true = ar_util:do_until(
+		fun() ->
+			map_size(maps:get(double_signing_proofs,
+					sys:get_state(ar_node_worker), #{})) > 0
+		end,
+		200,
+		5000
+	),
+	ar_test_node:connect_to_peer(peer1),
 	ar_test_node:mine(),
 	BI3 = assert_wait_until_height(peer1, 3),
 	B8 = ar_test_node:remote_call(peer1, ar_storage, read_block, [hd(BI3)]),
@@ -570,7 +608,7 @@ test_send_block2() ->
 	TXs = [ar_test_node:sign_tx(Wallet, #{ last_tx => ar_test_node:get_tx_anchor(peer1) }) || _ <- lists:seq(1, 10)],
 	lists:foreach(fun(TX) -> ar_test_node:assert_post_tx_to_peer(main, TX) end, TXs),
 	ar_test_node:mine(),
-	[{H, _, _}, _] = wait_until_height(1),
+	[{H, _, _}, _] = wait_until_height(main, 1),
 	B = ar_storage:read_block(H),
 	TXs2 = sort_txs_by_block_order(TXs, B),
 	EverySecondTX = element(2, lists:foldl(fun(TX, {N, Acc}) when N rem 2 /= 0 ->
@@ -612,7 +650,7 @@ test_send_block2() ->
 			data => crypto:strong_rand_bytes(10 * 1024) }) || _ <- lists:seq(1, 10)],
 	lists:foreach(fun(TX) -> ar_test_node:assert_post_tx_to_peer(main, TX) end, TXs3),
 	ar_test_node:mine(),
-	[{H2, _, _}, _, _] = wait_until_height(2),
+	[{H2, _, _}, _, _] = wait_until_height(main, 2),
 	{ok, {{<<"412">>, _}, _, <<>>, _, _}} = ar_http:req(#{ method => post,
 			peer => ar_test_node:peer_ip(peer1), path => "/block_announcement",
 			body => ar_serialize:block_announcement_to_binary(#block_announcement{
@@ -662,7 +700,7 @@ test_send_block2() ->
 					previous_block = B5#block.previous_block }) }),
 	ar_test_node:disconnect_from(peer1),
 	ar_test_node:mine(),
-	[_ | _] = wait_until_height(3 + ?SEARCH_SPACE_UPPER_BOUND_DEPTH + 1),
+	[_ | _] = wait_until_height(main, 3 + ?SEARCH_SPACE_UPPER_BOUND_DEPTH + 1),
 	B6 = ar_storage:read_block(ar_node:get_current_block_hash()),
 	{ok, {{<<"200">>, _}, _, Body5, _, _}} = ar_http:req(#{ method => post,
 			peer => ar_test_node:peer_ip(peer1), path => "/block_announcement",
@@ -695,12 +733,12 @@ test_resigned_solution() ->
 	ar_test_node:start_peer(peer1, B0),
 	ar_test_node:connect_to_peer(peer1),
 	ar_test_node:mine(peer1),
-	wait_until_height(1),
+	wait_until_height(main, 1),
 	ar_test_node:disconnect_from(peer1),
 	ar_test_node:mine(peer1),
 	B = ar_node:get_current_block(),
 	{ok, Config} = ar_test_node:remote_call(peer1, application, get_env, [arweave, config]),
-	Key = element(1, ar_test_node:remote_call(peer1, ar_wallet, load_key, [Config#config.mining_addr])),
+	Key = ar_test_node:remote_call(peer1, ar_wallet, load_key, [Config#config.mining_addr]),
 	ok = ar_events:subscribe(block),
 	B2 = sign_block(B#block{ tags = [<<"tag1">>] }, B0, Key),
 	post_block(B2, [valid]),
@@ -712,10 +750,10 @@ test_resigned_solution() ->
 	B2H = B2#block.indep_hash,
 	?assertNotEqual(B2#block.indep_hash, B4#block.previous_block),
 	PrevStepNumber = ar_block:vdf_step_number(B),
-	PrevInterval = PrevStepNumber div ?NONCE_LIMITER_RESET_FREQUENCY,
+	PrevInterval = PrevStepNumber div ar_nonce_limiter:get_reset_frequency(),
 	Info4 = B4#block.nonce_limiter_info,
 	StepNumber = Info4#nonce_limiter_info.global_step_number,
-	Interval = StepNumber div ?NONCE_LIMITER_RESET_FREQUENCY,
+	Interval = StepNumber div ar_nonce_limiter:get_reset_frequency(),
 	B5 =
 		case Interval == PrevInterval of
 			true ->
@@ -730,9 +768,9 @@ test_resigned_solution() ->
 		end,
 	B5H = B5#block.indep_hash,
 	post_block(B5, [valid]),
-	[{B5H, _, _}, {B2H, _, _}, _] = wait_until_height(2),
+	[{B5H, _, _}, {B2H, _, _}, _] = wait_until_height(main, 2),
 	ar_test_node:mine(),
-	[{B6H, _, _}, _, _, _] = wait_until_height(3),
+	[{B6H, _, _}, _, _, _] = wait_until_height(main, 3),
 	ar_test_node:connect_to_peer(peer1),
 	[{B6H, _, _}, {B5H, _, _}, {B2H, _, _}, _] = assert_wait_until_height(peer1, 3).
 

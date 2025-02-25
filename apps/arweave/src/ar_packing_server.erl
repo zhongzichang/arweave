@@ -2,11 +2,13 @@
 
 -behaviour(gen_server).
 
--export([start_link/0, packing_atom/1, get_packing_state/0, get_randomx_state_by_difficulty/2,
+-export([start_link/0, packing_atom/1, get_packing_state/0, get_randomx_state_for_h0/2,
 		request_unpack/2, request_unpack/3, request_repack/2, request_repack/3,
 		pack/4, unpack/5, repack/6, unpack_sub_chunk/5,
 		is_buffer_full/0, record_buffer_size_metric/0,
-		pad_chunk/1, unpad_chunk/3, unpad_chunk/4]).
+		pad_chunk/1, unpad_chunk/3, unpad_chunk/4,
+		encipher_replica_2_9_chunk/2, generate_replica_2_9_entropy/3,
+		pack_replica_2_9_chunk/3, request_entropy_generation/3]).
 
 -export([init/1, handle_cast/2, handle_call/3, handle_info/2, terminate/2]).
 
@@ -18,9 +20,6 @@
 -include_lib("arweave/include/ar_consensus.hrl").
 
 -include_lib("eunit/include/eunit.hrl").
-
-%% The packing latency as it is chosen for the protocol.
--define(PACKING_LATENCY_MS, 60).
 
 -record(state, {
 	workers,
@@ -36,7 +35,9 @@ packing_atom(Packing) when is_atom(Packing) ->
 packing_atom({spora_2_6, _Addr}) ->
 	spora_2_6;
 packing_atom({composite, _Addr, _Diff}) ->
-	composite.
+	composite;
+packing_atom({replica_2_9, _Addr}) ->
+	replica_2_9.
 
 request_unpack(Ref, Args) ->
 	request_unpack(Ref, self(), Args).
@@ -49,6 +50,9 @@ request_repack(Ref, Args) ->
 
 request_repack(Ref, ReplyTo, Args) ->
 	gen_server:cast(?MODULE, {repack_request, ReplyTo, Ref, Args}).
+
+request_entropy_generation(Ref, ReplyTo, Args) ->
+	gen_server:cast(?MODULE, {generate_entropy, ReplyTo, Ref, Args}).
 
 %% @doc Pack the chunk for mining. Packing ensures every mined chunk of data is globally
 %% unique and cannot be easily inferred during mining from any metadata stored in RAM.
@@ -76,10 +80,11 @@ unpack(Packing, ChunkOffset, TXRoot, Chunk, ChunkSize) ->
 			Reply
 	end.
 
-%% @doc Unpack the packed sub-chunk of a composite packing.
+%% @doc Unpack the packed sub-chunk of a composite packing or shared entropy replica.
 %%
 %% Return {ok, UnpackedSubChunk} or {error, invalid_packed_size}.
-unpack_sub_chunk(Packing, AbsoluteEndOffset, TXRoot, Chunk, SubChunkStartOffset) ->
+unpack_sub_chunk({composite, _, _} = Packing,
+		AbsoluteEndOffset, TXRoot, Chunk, SubChunkStartOffset) ->
 	case byte_size(Chunk) == ?COMPOSITE_PACKING_SUB_CHUNK_SIZE of
 		false ->
 			{error, invalid_packed_size};
@@ -92,6 +97,29 @@ unpack_sub_chunk(Packing, AbsoluteEndOffset, TXRoot, Chunk, SubChunkStartOffset)
 					[unpack_sub_chunk, PackingAtom, external], fun() ->
 						ar_mine_randomx:randomx_decrypt_sub_chunk(Packing, RandomXState,
 									Key, Chunk, SubChunkStartOffset) end) of
+				{ok, UnpackedSubChunk} ->
+					{ok, UnpackedSubChunk};
+				Error ->
+					Error
+			end
+	end;
+unpack_sub_chunk({replica_2_9, RewardAddr} = Packing,
+		AbsoluteEndOffset, _TXRoot, Chunk, SubChunkStartOffset) ->
+	case byte_size(Chunk) == ?COMPOSITE_PACKING_SUB_CHUNK_SIZE of
+		false ->
+			{error, invalid_packed_size};
+		true ->
+			PackingState = get_packing_state(),
+			record_packing_request(unpack_sub_chunk, not_set, Packing, get_caller()),
+			Key = ar_replica_2_9:get_entropy_key(RewardAddr,
+					AbsoluteEndOffset, SubChunkStartOffset),
+			RandomXState = get_randomx_state_by_packing(Packing, PackingState),
+			EntropySubChunkIndex = ar_replica_2_9:get_slice_index(
+					AbsoluteEndOffset),
+			case prometheus_histogram:observe_duration(packing_duration_milliseconds,
+					[unpack_sub_chunk, replica_2_9, external], fun() ->
+						ar_mine_randomx:randomx_decrypt_replica_2_9_sub_chunk({RandomXState,
+								Key, Chunk, EntropySubChunkIndex}) end) of
 				{ok, UnpackedSubChunk} ->
 					{ok, UnpackedSubChunk};
 				Error ->
@@ -141,7 +169,11 @@ unpad_chunk(spora_2_5, Unpacked, ChunkSize, _PackedSize) ->
 unpad_chunk({spora_2_6, _Addr}, Unpacked, ChunkSize, PackedSize) ->
 	unpad_chunk(Unpacked, ChunkSize, PackedSize);
 unpad_chunk({composite, _Addr, _PackingDifficulty}, Unpacked, ChunkSize, PackedSize) ->
-	unpad_chunk(Unpacked, ChunkSize, PackedSize).
+	unpad_chunk(Unpacked, ChunkSize, PackedSize);
+unpad_chunk({replica_2_9, _Addr}, Unpacked, ChunkSize, PackedSize) ->
+	unpad_chunk(Unpacked, ChunkSize, PackedSize);
+unpad_chunk(unpacked, Unpacked, ChunkSize, _PackedSize) ->
+	binary:part(Unpacked, 0, ChunkSize).
 
 unpad_chunk(Unpacked, ChunkSize, PackedSize) ->
 	Padding = binary:part(Unpacked, ChunkSize, PackedSize - ChunkSize),
@@ -151,6 +183,9 @@ unpad_chunk(Unpacked, ChunkSize, PackedSize) ->
 		_ ->
 			case is_zero(Padding) of
 				false ->
+					?LOG_WARNING([{event, unpad_chunk_error}, {packed_size, PackedSize},
+							{chunk_size, ChunkSize}, {padding, binary_part(Padding, 0, 64)},
+							{unpacked, binary_part(Unpacked, 0, 64)}]),
 					error;
 				true ->
 					binary:part(Unpacked, 0, ChunkSize)
@@ -171,14 +206,56 @@ get_packing_state() ->
 	[{_, PackingState}] = ets:lookup(?MODULE, randomx_packing_state),
 	PackingState.
 
-get_randomx_state_by_difficulty(PackingDifficulty, PackingState) ->
-	{RandomXState512, RandomXState4096} = PackingState,
+get_randomx_state_for_h0(PackingDifficulty, PackingState) ->
+	{RandomXState512, RandomXState4096, _} = PackingState,
 	case PackingDifficulty of
 		0 ->
 			RandomXState512;
 		_ ->
 			RandomXState4096
 	end.
+
+%% @doc Encipher the given chunk with the given 2.9 entropy assembled for this chunk.
+-spec encipher_replica_2_9_chunk(
+		Chunk :: binary(),
+		Entropy :: binary()
+) -> binary().
+encipher_replica_2_9_chunk(Chunk, Entropy) ->
+	iolist_to_binary(encipher_replica_2_9_sub_chunks(Chunk, Entropy)).
+
+%% @doc Generate the 2.9 entropy.
+-spec generate_replica_2_9_entropy(
+		RewardAddr :: binary(),
+		AbsoluteEndOffset :: non_neg_integer(),
+		SubChunkStartOffset :: non_neg_integer()
+) -> binary().
+generate_replica_2_9_entropy(RewardAddr, AbsoluteEndOffset, SubChunkStartOffset) ->
+	Key = ar_replica_2_9:get_entropy_key(RewardAddr, AbsoluteEndOffset, SubChunkStartOffset),
+	PackingState = get_packing_state(),
+	RandomXState = get_randomx_state_by_packing({replica_2_9, RewardAddr}, PackingState),
+	
+	Entropy = prometheus_histogram:observe_duration(
+		replica_2_9_entropy_duration_milliseconds, [1], 
+			fun() ->
+				ar_mine_randomx:randomx_generate_replica_2_9_entropy(RandomXState, Key)
+			end),
+	%% Primarily needed for testing where the entropy generated exceeds the entropy
+	%% needed for tests.
+	binary_part(Entropy, 0, ?REPLICA_2_9_ENTROPY_SIZE).
+
+%% @doc Pad (to ?DATA_CHUNK_SIZE) and pack the chunk according to the 2.9 replication format.
+%% Return the chunk and the combined entropy used on that chunk.
+-spec pack_replica_2_9_chunk(
+		RewardAddr :: binary(),
+		AbsoluteEndOffset :: non_neg_integer(),
+		Chunk :: binary()
+) -> {ok, binary(), binary()}.
+pack_replica_2_9_chunk(RewardAddr, AbsoluteEndOffset, Chunk) ->
+	PackingState = get_packing_state(),
+	RandomXState = get_randomx_state_by_packing({replica_2_9, RewardAddr}, PackingState),
+	PaddedChunk = pad_chunk(Chunk),
+	SubChunks = get_sub_chunks(PaddedChunk),
+	pack_replica_2_9_sub_chunks(RewardAddr, AbsoluteEndOffset, RandomXState, SubChunks).
 
 %%%===================================================================
 %%% Generic server callbacks.
@@ -187,51 +264,24 @@ get_randomx_state_by_difficulty(PackingDifficulty, PackingState) ->
 init([]) ->
 	{ok, Config} = application:get_env(arweave, config),
 	
-	ar:console("~nInitialising RandomX dataset for fast packing. Key: ~p. "
-			"The process may take several minutes.~n", [ar_util:encode(?RANDOMX_PACKING_KEY)]),
-	{RandomXState512, _RandomXState4096} = PackingState = init_packing_state(),
+	ar:console("~nInitialising RandomX datasets. Keys: ~p, ~p. "
+			"The process may take several minutes.~n",
+			[ar_util:encode(?RANDOMX_PACKING_KEY),
+				ar_util:encode(?RANDOMX_PACKING_KEY)]),
+	{RandomXState512, _RandomXState4096, _RandomXStateSharedEntropy}
+			= PackingState = init_packing_state(),
 	ar:console("RandomX dataset initialisation complete.~n", []),
 	{H0, H1} = ar_bench_hash:run_benchmark(RandomXState512),
 	H0String = io_lib:format("~.3f", [H0 / 1000]),
 	H1String = io_lib:format("~.3f", [H1 / 1000]),
 	ar:console("Hashing benchmark~nH0: ~s ms~nH1/H2: ~s ms~n", [H0String, H1String]),
 	?LOG_INFO([{event, hash_benchmark}, {h0_ms, H0String}, {h1_ms, H1String}]),
-	Schedulers = erlang:system_info(dirty_cpu_schedulers_online),
-	{ActualRatePack2_6, ActualRatePackComposite} = get_packing_latency(PackingState),
-	PackingLatency = ActualRatePackComposite,
-	MaxRate = Schedulers * 1000 / PackingLatency,
-	TheoreticalMaxRate = Schedulers * 1000 / (?PACKING_LATENCY_MS),
-	{PackingRate, SchedulersRequired} =
-		case Config#config.packing_rate of
-			undefined ->
-				ChosenRate = max(1, ceil(2 * MaxRate / 3)),
-				ChosenRate2 = ar_util:ceil_int(ChosenRate, 10),
-				log_packing_rate(ChosenRate2, MaxRate),
-				SchedulersRequired2 = ceil(ChosenRate2 / (1000 / (?PACKING_LATENCY_MS))),
-				{ChosenRate2, SchedulersRequired2};
-			ConfiguredRate ->
-				SchedulersRequired2 = ceil(ConfiguredRate / (1000 / PackingLatency)),
-				case SchedulersRequired2 > Schedulers of
-					true ->
-						log_insufficient_core_count(Schedulers, ConfiguredRate, MaxRate);
-					false ->
-						log_packing_rate(ConfiguredRate, MaxRate)
-				end,
-				{ConfiguredRate, SchedulersRequired2}
-		end,
-	
-	record_packing_benchmarks(TheoreticalMaxRate, PackingRate, Schedulers,
-		ActualRatePack2_6, ActualRatePackComposite),
-	SpawnSchedulers = min(SchedulersRequired, Schedulers),
-	ar:console("~nStarting ~B packing threads.~n", [SpawnSchedulers]),
-	%% Since the total rate of spawned processes might exceed the desired rate,
-	%% artificially throttle processes uniformly.
-	ThrottleDelay = calculate_throttle_delay(SpawnSchedulers, PackingRate),
+	NumWorkers = Config#config.packing_workers,
+	ar:console("~nStarting ~B packing threads.~n", [NumWorkers]),
+	?LOG_INFO([{event, starting_packing_threads}, {num_threads, NumWorkers}]),
 	Workers = queue:from_list(
-		[spawn_link(fun() -> worker(ThrottleDelay, PackingState) end)
-			|| _ <- lists:seq(1, SpawnSchedulers)]),
+		[spawn_link(fun() -> worker(PackingState) end) || _ <- lists:seq(1, NumWorkers)]),
 	ets:insert(?MODULE, {buffer_size, 0}),
-	{ok, Config} = application:get_env(arweave, config),
 	MaxSize =
 		case Config#config.packing_cache_size_limit of
 			undefined ->
@@ -247,7 +297,7 @@ init([]) ->
 	ets:insert(?MODULE, {buffer_size_limit, MaxSize}),
 	timer:apply_interval(200, ?MODULE, record_buffer_size_metric, []),
 	{ok, #state{
-		workers = Workers, num_workers = SpawnSchedulers }}.
+		workers = Workers, num_workers = NumWorkers }}.
 
 handle_call(Request, _From, State) ->
 	?LOG_WARNING([{event, unhandled_call}, {module, ?MODULE}, {request, Request}]),
@@ -290,6 +340,11 @@ handle_cast({repack_request, From, Ref, Args}, State) ->
 			},
 			{noreply, State#state{ workers = queue:in(Worker, Workers2) }}
 	end;
+handle_cast({generate_entropy, From, Ref, Args}, State) ->
+	#state{ workers = Workers } = State,
+	{{value, Worker}, Workers2} = queue:out(Workers),
+	Worker ! {generate_entropy, Ref, From, Args},
+	{noreply, State#state{ workers = queue:in(Worker, Workers2) }};
 handle_cast(Cast, State) ->
 	?LOG_WARNING([{event, unhandled_cast}, {module, ?MODULE}, {cast, Cast}]),
 	{noreply, State}.
@@ -304,66 +359,41 @@ terminate(_Reason, _State) ->
 %%%===================================================================
 %%% Private functions.
 %%%===================================================================
+
 init_packing_state() ->
 	Schedulers = erlang:system_info(dirty_cpu_schedulers_online),
 	RandomXState512 = ar_mine_randomx:init_fast(rx512, ?RANDOMX_PACKING_KEY, Schedulers),
 	RandomXState4096 = ar_mine_randomx:init_fast(rx4096, ?RANDOMX_PACKING_KEY, Schedulers),
-	PackingState = {RandomXState512, RandomXState4096},
+	RandomXStateSharedEntropy = ar_mine_randomx:init_fast(rxsquared,
+			?RANDOMX_PACKING_KEY, Schedulers),
+	PackingState = {RandomXState512, RandomXState4096, RandomXStateSharedEntropy},
 	ets:insert(?MODULE, {randomx_packing_state, PackingState}),
 	PackingState.
 
-get_randomx_state_by_packing({composite, _, _}, {_RandomXState512, RandomXState4096}) ->
-	RandomXState4096;
-get_randomx_state_by_packing(_Packing, {RandomXState512, _RandomXState4096}) ->
-	RandomXState512.
+get_randomx_state_by_packing({composite, _, _}, {_, RandomXState, _}) ->
+	RandomXState;
+get_randomx_state_by_packing({replica_2_9, _}, {_, _, RandomXState}) ->
+	RandomXState;
+get_randomx_state_by_packing({spora_2_6, _}, {RandomXState, _, _}) ->
+	RandomXState;
+get_randomx_state_by_packing(spora_2_5, {RandomXState, _, _}) ->
+	RandomXState.
 
-log_insufficient_core_count(Schedulers, PackingRate, Max) ->
-	ar:console("~nThe number of cores on your machine (~B) is not sufficient for "
-		"packing ~B chunks per second. Estimated maximum rate: ~.2f chunks/s.~n",
-		[Schedulers, PackingRate, Max]),
-	?LOG_WARNING([{event, insufficient_core_count_to_sustain_desired_packing_rate},
-			{cores, Schedulers}, {packing_rate, PackingRate}]).
-
-log_packing_rate(PackingRate, Max) ->
-	ar:console("~nThe node is configured to pack around ~B chunks per second. "
-			"To increase the packing rate, start with `packing_rate [number]`. "
-			"Estimated maximum rate: ~.2f chunks/s.~n",
-			[PackingRate, Max]).
-
-calculate_throttle_delay(0, _PackingRate) ->
-	0;
-calculate_throttle_delay(_SpawnSchedulers, 0) ->
-	0;
-calculate_throttle_delay(SpawnSchedulers, PackingRate) ->
-	Load = PackingRate / (SpawnSchedulers * (1000 / (?PACKING_LATENCY_MS))),
-	case Load >= 1 of
-		true ->
-			0;
-		false ->
-			trunc((1 - Load) * (?PACKING_LATENCY_MS))
-	end.
-
-worker(ThrottleDelay, PackingState) ->
+worker(PackingState) ->
 	receive
 		{unpack, Ref, From, Args} ->
 			{Packing, Chunk, AbsoluteOffset, TXRoot, ChunkSize} = Args,
 			case unpack(Packing, AbsoluteOffset, TXRoot, Chunk, ChunkSize,
 					PackingState, internal) of
-				{ok, U, AlreadyUnpacked} ->
+				{ok, U, _AlreadyUnpacked} ->
 					From ! {chunk, {unpacked, Ref, {Packing, U, AbsoluteOffset, TXRoot,
-							ChunkSize}}},
-					case AlreadyUnpacked of
-						already_unpacked ->
-							ok;
-						_ ->
-							timer:sleep(ThrottleDelay)
-					end;
+							ChunkSize}}};
 				{error, invalid_packed_size} ->
-					?LOG_WARNING([{event, got_packed_chunk_of_invalid_size}]);
+					?LOG_WARNING([{event, got_unpacked_chunk_of_invalid_size}]);
 				{error, invalid_chunk_size} ->
-					?LOG_WARNING([{event, got_packed_chunk_with_invalid_chunk_size}]);
+					?LOG_WARNING([{event, got_unpacked_chunk_with_invalid_chunk_size}]);
 				{error, invalid_padding} ->
-					?LOG_WARNING([{event, got_packed_chunk_with_invalid_padding},
+					?LOG_WARNING([{event, got_unpacked_chunk_with_invalid_padding},
 						{absolute_end_offset, AbsoluteOffset}]);
 				{exception, Error} ->
 					?LOG_ERROR([{event, failed_to_unpack_chunk},
@@ -371,19 +401,13 @@ worker(ThrottleDelay, PackingState) ->
 							{error, io_lib:format("~p", [Error])}])
 			end,
 			decrement_buffer_size(),
-			worker(ThrottleDelay, PackingState);
+			worker(PackingState);
 		{pack, Ref, From, Args} ->
 			{Packing, Chunk, AbsoluteOffset, TXRoot, ChunkSize} = Args,
 			case pack(Packing, AbsoluteOffset, TXRoot, Chunk, PackingState, internal) of
-				{ok, Packed, AlreadyPacked} ->
+				{ok, Packed, _AlreadyPacked} ->
 					From ! {chunk, {packed, Ref, {Packing, Packed, AbsoluteOffset, TXRoot,
-							ChunkSize}}},
-					case AlreadyPacked of
-						already_packed ->
-							ok;
-						_ ->
-							timer:sleep(ThrottleDelay)
-					end;
+							ChunkSize}}};
 				{error, invalid_unpacked_size} ->
 					?LOG_WARNING([{event, got_unpacked_chunk_of_invalid_size}]);
 				{exception, Error} ->
@@ -392,23 +416,14 @@ worker(ThrottleDelay, PackingState) ->
 							{error, io_lib:format("~p", [Error])}])
 			end,
 			decrement_buffer_size(),
-			worker(ThrottleDelay, PackingState);
+			worker(PackingState);
 		{repack, Ref, From, Args} ->
 			{RequestedPacking, Packing, Chunk, AbsoluteOffset, TXRoot, ChunkSize} = Args,
 			case repack(RequestedPacking, Packing,
 					AbsoluteOffset, TXRoot, Chunk, ChunkSize, PackingState, internal) of
 				{ok, Packed, _RepackInput} ->
 					From ! {chunk, {packed, Ref,
-							{RequestedPacking, Packed, AbsoluteOffset, TXRoot, ChunkSize}}},
-					case RequestedPacking == Packing of
-						true ->
-							%% When RequestdPacking and Packing are the same
-							%% the repack does no work and just returns
-							%% the original chunk. In this case we don't need a throttle.
-							ok;
-						_ ->
-							timer:sleep(ThrottleDelay)
-					end;
+							{RequestedPacking, Packed, AbsoluteOffset, TXRoot, ChunkSize}}};
 				{error, invalid_packed_size} ->
 					?LOG_WARNING([{event, got_packed_chunk_of_invalid_size}]);
 				{error, invalid_chunk_size} ->
@@ -424,7 +439,11 @@ worker(ThrottleDelay, PackingState) ->
 							{error, io_lib:format("~p", [Error])}])
 			end,
 			decrement_buffer_size(),
-			worker(ThrottleDelay, PackingState)
+			worker(PackingState);
+		{generate_entropy, Ref, From, {RewardAddr, PaddedEndOffset, SubChunkStart}} ->
+			Entropy = ar_packing_server:generate_replica_2_9_entropy(RewardAddr, PaddedEndOffset, SubChunkStart),
+			From ! {entropy_generated, Ref, Entropy},
+			worker(PackingState)
 	end.
 
 chunk_key(spora_2_5, ChunkOffset, TXRoot) ->
@@ -461,6 +480,26 @@ chunk_key({composite, RewardAddr, PackingDiff}, ChunkOffset, TXRoot) ->
 pack(unpacked, _ChunkOffset, _TXRoot, Chunk, _PackingState, _External) ->
 	%% Allows to reuse the same interface for unpacking and repacking.
 	{ok, Chunk, already_packed};
+pack(unpacked_padded, _ChunkOffset, _TXRoot, Chunk, _PackingState, _External) ->
+	%% Allows to reuse the same interface for unpacking and repacking.
+	{ok, pad_chunk(Chunk), was_not_already_packed};
+pack({replica_2_9, RewardAddr} = Packing, AbsoluteEndOffset, _TXRoot, Chunk, PackingState,
+		_External) ->
+	case byte_size(Chunk) > ?DATA_CHUNK_SIZE of
+		true ->
+			{error, invalid_unpacked_size};
+		false ->
+			RandomXState = get_randomx_state_by_packing(Packing, PackingState),
+			PaddedChunk = pad_chunk(Chunk),
+			SubChunks = get_sub_chunks(PaddedChunk),
+			case pack_replica_2_9_sub_chunks(RewardAddr, AbsoluteEndOffset,
+					RandomXState, SubChunks) of
+				{ok, Packed, _Entropy} ->
+					{ok, Packed, was_not_already_packed};
+				Error ->
+					Error
+			end
+	end;
 pack(Packing, ChunkOffset, TXRoot, Chunk, PackingState, External) ->
 	case byte_size(Chunk) > ?DATA_CHUNK_SIZE of
 		true ->
@@ -479,9 +518,91 @@ pack(Packing, ChunkOffset, TXRoot, Chunk, PackingState, External) ->
 			end
 	end.
 
+get_sub_chunks(<< SubChunk:(?COMPOSITE_PACKING_SUB_CHUNK_SIZE)/binary, Rest/binary >>) ->
+	[SubChunk | get_sub_chunks(Rest)];
+get_sub_chunks(<<>>) ->
+	[].
+
+pack_replica_2_9_sub_chunks(RewardAddr, AbsoluteEndOffset, RandomXState, SubChunks) ->
+	pack_replica_2_9_sub_chunks(RewardAddr, AbsoluteEndOffset, RandomXState,
+			0, SubChunks, [], []).
+
+pack_replica_2_9_sub_chunks(_RewardAddr, _AbsoluteEndOffset, _RandomXState,
+		_SubChunkStartOffset, [], PackedSubChunks, EntropyParts) ->
+	{ok, iolist_to_binary(lists:reverse(PackedSubChunks)),
+			iolist_to_binary(lists:reverse(EntropyParts))};
+pack_replica_2_9_sub_chunks(RewardAddr, AbsoluteEndOffset, RandomXState,
+		SubChunkStartOffset, [SubChunk | SubChunks], PackedSubChunks, EntropyParts) ->
+	EntropySubChunkIndex = ar_replica_2_9:get_slice_index(AbsoluteEndOffset),
+	Entropy = generate_replica_2_9_entropy(RewardAddr, AbsoluteEndOffset, SubChunkStartOffset),
+	case prometheus_histogram:observe_duration(packing_duration_milliseconds,
+			[pack_sub_chunk, replica_2_9, internal], fun() ->
+					ar_mine_randomx:randomx_encrypt_replica_2_9_sub_chunk({RandomXState,
+							Entropy, SubChunk, EntropySubChunkIndex}) end) of
+		{ok, PackedSubChunk} ->
+			SubChunkSize = ?COMPOSITE_PACKING_SUB_CHUNK_SIZE,
+			EntropyPart = binary:part(Entropy,
+					EntropySubChunkIndex * ?COMPOSITE_PACKING_SUB_CHUNK_SIZE,
+					?COMPOSITE_PACKING_SUB_CHUNK_SIZE),
+			pack_replica_2_9_sub_chunks(RewardAddr, AbsoluteEndOffset, RandomXState,
+				SubChunkStartOffset + SubChunkSize, SubChunks,
+				[PackedSubChunk | PackedSubChunks], [EntropyPart | EntropyParts]);
+		Error ->
+			Error
+	end.
+
+unpack_replica_2_9_sub_chunks(RewardAddr, AbsoluteEndOffset, RandomXState, SubChunks) ->
+	unpack_replica_2_9_sub_chunks(
+		RewardAddr, AbsoluteEndOffset, RandomXState, 0, SubChunks, []).
+
+unpack_replica_2_9_sub_chunks(_RewardAddr, _AbsoluteEndOffset, _RandomXState,
+		_SubChunkStartOffset, [], UnpackedSubChunks) ->
+	{ok, iolist_to_binary(lists:reverse(UnpackedSubChunks))};
+unpack_replica_2_9_sub_chunks(RewardAddr, AbsoluteEndOffset, RandomXState,
+		SubChunkStartOffset, [SubChunk | SubChunks], UnpackedSubChunks) ->
+	Key = ar_replica_2_9:get_entropy_key(RewardAddr, AbsoluteEndOffset, SubChunkStartOffset),
+	EntropySubChunkIndex = ar_replica_2_9:get_slice_index(AbsoluteEndOffset),
+	case prometheus_histogram:observe_duration(packing_duration_milliseconds,
+			[unpack_sub_chunk, replica_2_9, internal], fun() ->
+					ar_mine_randomx:randomx_decrypt_replica_2_9_sub_chunk({RandomXState,
+							Key, SubChunk, EntropySubChunkIndex}) end) of
+		{ok, UnpackedSubChunk} ->
+			SubChunkSize = ?COMPOSITE_PACKING_SUB_CHUNK_SIZE,
+			unpack_replica_2_9_sub_chunks(RewardAddr, AbsoluteEndOffset, RandomXState,
+					SubChunkStartOffset + SubChunkSize, SubChunks,
+					[UnpackedSubChunk | UnpackedSubChunks]);
+		Error ->
+			Error
+	end.
+
+unpack({replica_2_9, RewardAddr} = Packing, AbsoluteEndOffset,
+		_TXRoot, Chunk, ChunkSize, PackingState, _External) ->
+	case validate_chunk_size(Packing, Chunk, ChunkSize) of
+		{error, Reason} ->
+			{error, Reason};
+		{ok, PackedSize} ->
+			SubChunks = get_sub_chunks(Chunk),
+			RandomXState = get_randomx_state_by_packing(Packing, PackingState),
+			case unpack_replica_2_9_sub_chunks(RewardAddr, AbsoluteEndOffset,
+					RandomXState, SubChunks) of
+				{ok, Unpacked} ->
+					case ar_packing_server:unpad_chunk(Packing, Unpacked,
+							ChunkSize, PackedSize) of
+						error ->
+							{error, invalid_padding};
+						UnpackedChunk ->
+							{ok, UnpackedChunk, was_not_already_unpacked}
+					end;
+				Error ->
+					?LOG_ERROR([{event, unpack_replica_2_9_sub_chunks_error}, {error, Error}]),
+					Error
+			end
+	end;
 unpack(unpacked, _ChunkOffset, _TXRoot, Chunk, _ChunkSize, _PackingState, _External) ->
 	%% Allows to reuse the same interface for unpacking and repacking.
 	{ok, Chunk, already_unpacked};
+unpack(unpacked_padded, _ChunkOffset, _TXRoot, Chunk, ChunkSize, _PackingState, _External) ->
+	{ok, binary:part(Chunk, 0, ChunkSize), was_not_already_unpacked};
 unpack(Packing, ChunkOffset, TXRoot, Chunk, ChunkSize, PackingState, External) ->
 	case validate_chunk_size(Packing, Chunk, ChunkSize) of
 		{error, Reason} ->
@@ -502,8 +623,22 @@ unpack(Packing, ChunkOffset, TXRoot, Chunk, ChunkSize, PackingState, External) -
 
 repack(unpacked, unpacked,
 		_ChunkOffset, _TXRoot, Chunk, _ChunkSize, _PackingState, _External) ->
+	%% The difference with the next clause is that here we know the unpacked chunk
+	%% and can explicitly return it as unpacked.
 	{ok, Chunk, Chunk};
+repack(RequestedPacking, StoredPacking,
+		_ChunkOffset, _TXRoot, Chunk, _ChunkSize, _PackingState, _External)
+		when StoredPacking == RequestedPacking ->
+	%% StoredPacking and Packing are in the same format and neither is unpacked. To
+	%% avoid uneccessary unpacking we'll return none for the UnpackedChunk. If a caller
+	%% needs the UnpackedChunk they should call unpack explicity.
+	{ok, Chunk, none};
 
+repack(RequestedPacking, unpacked_padded,
+		ChunkOffset, TXRoot, Chunk, ChunkSize, PackingState, External) ->
+	Unpacked = binary:part(Chunk, 0, ChunkSize),
+	repack(RequestedPacking, unpacked,
+			ChunkOffset, TXRoot, Unpacked, ChunkSize, PackingState, External);
 repack(RequestedPacking, unpacked,
 		ChunkOffset, TXRoot, Chunk, _ChunkSize, PackingState, External) ->
 	case pack(RequestedPacking, ChunkOffset, TXRoot, Chunk, PackingState, External) of
@@ -513,6 +648,14 @@ repack(RequestedPacking, unpacked,
 			Error
 	end;
 
+repack(unpacked_padded, StoredPacking,
+		ChunkOffset, TXRoot, Chunk, ChunkSize, PackingState, External) ->
+	case unpack(StoredPacking, ChunkOffset, TXRoot, Chunk, ChunkSize, PackingState, External) of
+		{ok, Unpacked, _WasAlreadyUnpacked} ->
+			{ok, pad_chunk(Unpacked), Unpacked};
+		Error ->
+			Error
+	end;
 repack(unpacked, StoredPacking,
 		ChunkOffset, TXRoot, Chunk, ChunkSize, PackingState, External) ->
 	case unpack(StoredPacking, ChunkOffset, TXRoot, Chunk, ChunkSize, PackingState, External) of
@@ -522,13 +665,15 @@ repack(unpacked, StoredPacking,
 			Error
 	end;
 
-repack(RequestedPacking, StoredPacking,
-		_ChunkOffset, _TXRoot, Chunk, _ChunkSize, _PackingState, _External)
-		when StoredPacking == RequestedPacking ->
-	%% StoredPacking and Packing are in the same format and neither is unpacked. To
-	%% avoid uneccessary unpacking we'll return none for the UnpackedChunk. If a caller
-	%% needs the UnpackedChunk they should call unpack explicity.
-	{ok, Chunk, none};
+repack({replica_2_9, _} = RequestedPacking, StoredPacking,
+		ChunkOffset, TXRoot, Chunk, ChunkSize, PackingState, External) ->
+	repack_no_nif({RequestedPacking, StoredPacking, ChunkOffset, TXRoot, Chunk,
+			ChunkSize, PackingState, External});
+
+repack(RequestedPacking, {replica_2_9, _} = StoredPacking,
+		ChunkOffset, TXRoot, Chunk, ChunkSize, PackingState, External) ->
+	repack_no_nif({RequestedPacking, StoredPacking, ChunkOffset, TXRoot, Chunk,
+			ChunkSize, PackingState, External});
 
 repack({composite, RequestedAddr, RequestedPackingDifficulty} = RequestedPacking,
 		{composite, StoredAddr, StoredPackingDifficulty} = StoredPacking,
@@ -604,6 +749,8 @@ validate_chunk_size(spora_2_5, Chunk, ChunkSize) ->
 validate_chunk_size({spora_2_6, _Addr}, Chunk, ChunkSize) ->
 	validate_chunk_size(Chunk, ChunkSize);
 validate_chunk_size({composite, _Addr, _PackingDifficulty}, Chunk, ChunkSize) ->
+	validate_chunk_size(Chunk, ChunkSize);
+validate_chunk_size({replica_2_9, _Addr}, Chunk, ChunkSize) ->
 	validate_chunk_size(Chunk, ChunkSize).
 
 validate_chunk_size(Chunk, ChunkSize) ->
@@ -636,49 +783,6 @@ record_buffer_size_metric() ->
 		_ ->
 			ok
 	end.
-
-get_packing_latency(PackingState) ->
-	Chunk = crypto:strong_rand_bytes(?DATA_CHUNK_SIZE),
-	Key = crypto:hash(sha256, crypto:strong_rand_bytes(256)),
-	Addr = crypto:strong_rand_bytes(32),
-	Spora2_6Packing = {spora_2_6, Addr},
-	CompositePacking = {composite, Addr, 1},
-	Spora2_6RandomXState = get_randomx_state_by_packing(Spora2_6Packing, PackingState),
-	CompositeRandomXState = get_randomx_state_by_packing(CompositePacking, PackingState),
-	%% Run each randomx routine Repetitions times and return the minimum runtime. We use
-	%% minimum rather than average since it more closely approximates the fastest that this
-	%% machine can do the calculation.
-	Repetitions = 5,
-	{minimum_run_time(ar_mine_randomx, randomx_encrypt_chunk,
-			[Spora2_6Packing, Spora2_6RandomXState, Key, Chunk], Repetitions),
-		minimum_run_time(ar_mine_randomx, randomx_encrypt_chunk,
-			[CompositePacking, CompositeRandomXState, Key, Chunk], Repetitions)}.
-
-record_packing_benchmarks(TheoreticalMaxRate, ChosenRate, Schedulers,
-ActualRatePack2_6, ActualRatePackComposite) ->
-	prometheus_gauge:set(packing_latency_benchmark,
-		[protocol, pack, spora_2_6], ?PACKING_LATENCY_MS),
-	prometheus_gauge:set(packing_latency_benchmark,
-		[protocol, unpack, spora_2_6], ?PACKING_LATENCY_MS),
-	prometheus_gauge:set(packing_rate_benchmark,
-		[protocol], TheoreticalMaxRate),
-	prometheus_gauge:set(packing_rate_benchmark,
-		[configured], ChosenRate),
-	prometheus_gauge:set(packing_schedulers,
-		Schedulers),
-	prometheus_gauge:set(packing_latency_benchmark,
-		[init, pack, spora_2_6], ActualRatePack2_6),
-	prometheus_gauge:set(packing_latency_benchmark,
-		[init, pack, composite], ActualRatePackComposite).
-
-minimum_run_time(Module, Function, Args, Repetitions) ->
-	minimum_run_time(Module, Function, Args, Repetitions, infinity).
-minimum_run_time(_Module, _Function, _Args, 0, MinTime) ->
-	%% round microseconds to the nearest millisecond
-	max(1, (MinTime + 500) div 1000);
-minimum_run_time(Module, Function, Args, Repetitions, MinTime) ->
-	{RunTime, _} = timer:tc(Module, Function, Args),
-	minimum_run_time(Module, Function, Args, Repetitions-1, erlang:min(MinTime, RunTime)).
 
 %% @doc Walk up the stack trace to the parent of the current function. E.g.
 %% example() ->
@@ -713,6 +817,14 @@ record_packing_request(Type, RequestedPacking, _StoredPacking, From) ->
 	prometheus_counter:inc(
 		packing_requests,
 		[Type, packing_atom(RequestedPacking), From]).
+
+encipher_replica_2_9_sub_chunks(<<>>, <<>>) ->
+	[];
+encipher_replica_2_9_sub_chunks(
+		<< SubChunk:(?COMPOSITE_PACKING_SUB_CHUNK_SIZE)/binary, ChunkRest/binary >>,
+		<< EntropyPart:(?COMPOSITE_PACKING_SUB_CHUNK_SIZE)/binary, EntropyRest/binary >>) ->
+	[ar_mine_randomx:encipher_sub_chunk(SubChunk, EntropyPart)
+			| encipher_replica_2_9_sub_chunks(ChunkRest, EntropyRest)].
 
 %%%===================================================================
 %%% Tests.
@@ -792,18 +904,3 @@ pack_test() ->
 		Cases
 	)),
 	?assertEqual(length(PackedList), sets:size(sets:from_list(PackedList))).
-
-calculate_throttle_delay_test() ->
-	%% 1000 / ?PACKING_LATENCY_MS = 16.666666
-	?assertEqual(0, calculate_throttle_delay(1, 17),
-		"PackingRate > SpawnSchedulers capacity -> no throttle"),
-	?assertEqual(0, calculate_throttle_delay(8, 1000),
-		"PackingRate > SpawnSchedulers capacity -> no throttle"),
-	?assertEqual(2, calculate_throttle_delay(1, 16),
-		"PackingRate < SpawnSchedulers capacity -> throttle"),
-	?assertEqual(15, calculate_throttle_delay(8, 100),
-		"PackingRate < SpawnSchedulers capacity -> throttle"),
-	?assertEqual(0, calculate_throttle_delay(0, 100),
-		"0 schedulers -> no throttle"),
-	?assertEqual(0, calculate_throttle_delay(8, 0),
-		"no packing -> no throttle").

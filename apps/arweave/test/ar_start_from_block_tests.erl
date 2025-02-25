@@ -48,7 +48,7 @@ test_start_from_block() ->
 
     ar_test_node:wait_until_height(peer1, 6),
     ar_test_node:wait_until_height(peer2, 6),
-    ar_test_node:wait_until_height(6),
+    ar_test_node:wait_until_height(main, 6),
 
     ar_test_node:disconnect_from(peer1),
     ar_test_node:disconnect_from(peer2),
@@ -114,7 +114,8 @@ restart_from_block(Peer, BH) ->
     ok = ar_test_node:set_config(Peer, Config#config{
         start_from_latest_state = false,
         start_from_block = BH }),
-    ar_test_node:restart(Peer).
+    ar_test_node:restart(Peer),
+    ar_test_node:remote_call(Peer, ar_test_node, wait_until_syncs_genesis_data, []).
 
 assert_start_from(ExpectedPeer, Peer, Height) ->
     ?LOG_ERROR([{event, assert_start_from}, {expected_peer, ExpectedPeer}, {peer, Peer}, {height, Height}]),

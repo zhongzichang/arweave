@@ -4,7 +4,7 @@
 
 -export([start_link/0, start_link/1, set_largest_seen_upper_bound/1, 
 			get_packing/0, get_partitions/0, get_partitions/1, read_recall_range/4,
-			garbage_collect/0]).
+			garbage_collect/0, get_replica_format_from_packing_difficulty/1]).
 
 -export([init/1, handle_cast/2, handle_call/3, handle_info/2, terminate/2]).
 
@@ -94,7 +94,8 @@ garbage_collect() ->
 %%%===================================================================
 
 init(Mode) ->
-	{ok, start_io_threads(#state{ mode = Mode })}.
+	gen_server:cast(self(), initialize_state),
+	{ok, #state{ mode = Mode }}.
 
 handle_call({set_largest_seen_upper_bound, PartitionUpperBound}, _From, State) ->
 	#state{ partition_upper_bound = CurrentUpperBound } = State,
@@ -124,6 +125,22 @@ handle_call({read_recall_range, WhichChunk, Worker, Candidate, RecallRangeStart}
 handle_call(Request, _From, State) ->
 	?LOG_WARNING([{event, unhandled_call}, {module, ?MODULE}, {request, Request}]),
 	{reply, ok, State}.
+
+handle_cast(initialize_state, State) ->
+	State3 = case ar_device_lock:is_ready() of
+		false ->
+			ar_util:cast_after(1000, self(), initialize_state),
+			State;
+		true ->
+			case start_io_threads(State) of
+				{error, _} ->
+					ar_util:cast_after(1000, self(), initialize_state),
+					State;
+				State2 ->
+					State2
+			end
+	end,
+	{noreply, State3};
 
 handle_cast(garbage_collect, State) ->
 	erlang:garbage_collect(self(),
@@ -175,51 +192,41 @@ terminate(_Reason, _State) ->
 %%% Private functions.
 %%%===================================================================
 
-get_system_device(StorageModule) ->
-	{ok, Config} = application:get_env(arweave, config),
-	StoreID = ar_storage_module:id(StorageModule),
-	Path = ar_chunk_storage:get_chunk_storage_path(Config#config.data_dir, StoreID),
-	Command = "df -P " ++ Path ++ " | awk 'NR==2 {print $1}'",
-	Device = os:cmd(Command),
-	TrimmedDevice = string:trim(Device),
-	case TrimmedDevice of
-		"" -> StoreID;  % If the command fails or returns an empty string, return StoreID
-		_ -> TrimmedDevice
-	end.
-
 start_io_threads(State) ->
 	#state{ mode = Mode } = State,
 
     % Step 1: Group StoreIDs by their system device
-    DeviceToStoreIDs = map_device_to_store_ids(),
+	case ar_device_lock:get_store_id_to_device_map() of
+		{error, Reason} ->
+			?LOG_ERROR([{event, error_initializing_state}, {module, ?MODULE},
+				{reason, io_lib:format("~p", [Reason])}]),
+			{error, Reason};
+		StoreIDToDevice ->
+			DeviceToStoreIDs = ar_util:invert_map(StoreIDToDevice),
+			% Step 2: Start IO threads for each device and populate map indices
+			State2 = maps:fold(
+				fun(Device, StoreIDs, StateAcc) ->
+					#state{ io_threads = Threads, io_thread_monitor_refs = Refs,
+						partition_to_store_ids = PartitionToStoreIDs } = StateAcc,
 
-    % Step 2: Start IO threads for each device and populate map indices
-	maps:fold(
-		fun(Device, StoreIDs, StateAcc) ->
-			#state{ io_threads = Threads, io_thread_monitor_refs = Refs,
-				store_id_to_device = StoreIDToDevice,
-				partition_to_store_ids = PartitionToStoreIDs } = StateAcc,
-			
-			Thread = start_io_thread(Mode, StoreIDs),
-			ThreadRef = monitor(process, Thread),
+					StoreIDs2 = sets:to_list(StoreIDs),
+					
+					Thread = start_io_thread(Mode, StoreIDs2),
+					ThreadRef = monitor(process, Thread),
 
-			StoreIDToDevice2 = lists:foldl(
-				fun(StoreID, Acc) -> 
-					maps:put(StoreID, Device, Acc) 
+					PartitionToStoreIDs2 = map_partition_to_store_ids(StoreIDs2, PartitionToStoreIDs),
+					StateAcc#state{
+						io_threads = maps:put(Device, Thread, Threads),
+						io_thread_monitor_refs = maps:put(ThreadRef, Device, Refs),
+						partition_to_store_ids = PartitionToStoreIDs2
+					}
 				end,
-				StoreIDToDevice, StoreIDs),
+				State,
+				DeviceToStoreIDs
+			),
 
-			PartitionToStoreIDs2 = map_partition_to_store_ids(StoreIDs, PartitionToStoreIDs),
-			StateAcc#state{
-				io_threads = maps:put(Device, Thread, Threads),
-				io_thread_monitor_refs = maps:put(ThreadRef, Device, Refs),
-				store_id_to_device = StoreIDToDevice2,
-				partition_to_store_ids = PartitionToStoreIDs2
-			}
-		end,
-		State,
-		DeviceToStoreIDs
-	).
+			State2#state{ store_id_to_device = StoreIDToDevice }
+	end.
 
 start_io_thread(Mode, StoreIDs) ->
 	Now = os:system_time(millisecond),
@@ -233,41 +240,23 @@ start_io_thread(Mode, StoreIDs) ->
 map_partition_to_store_ids([], PartitionToStoreIDs) ->
 	PartitionToStoreIDs;
 map_partition_to_store_ids([StoreID | StoreIDs], PartitionToStoreIDs) ->
-	StorageModule = ar_storage_module:get_by_id(StoreID),
-	{Start, End} = ar_storage_module:module_range(StorageModule, 0),
-	Partitions = get_store_id_partitions({Start, End}, []),
-	PartitionToStoreIDs2 = lists:foldl(
-		fun(Partition, Acc) ->
-			maps:update_with(Partition,
-				fun(PartitionStoreIDs) -> [StoreID | PartitionStoreIDs] end,
-			[StoreID], Acc)
-		end,
-		PartitionToStoreIDs, Partitions),
-	map_partition_to_store_ids(StoreIDs, PartitionToStoreIDs2).
-
-map_device_to_store_ids() ->
-	{ok, Config} = application:get_env(arweave, config),
-	lists:foldl(
-        fun(Module, Acc) ->
-			StoreID = ar_storage_module:id(Module),
-            Device = get_system_device(Module),
-            maps:update_with(Device, fun(StoreIDs) -> [StoreID | StoreIDs] end, [StoreID], Acc)
-        end,
-        #{},
-        Config#config.storage_modules
-    ).
-
-get_store_ids_for_device(Device, #state{store_id_to_device = StoreIDToDevice}) ->
-	maps:fold(
-		fun(StoreID, MappedDevice, Acc) ->
-			case MappedDevice == Device of
-				true -> [StoreID | Acc];
-				false -> Acc
-			end
-		end,
-		[],
-		StoreIDToDevice
-	).
+	case ar_storage_module:get_by_id(StoreID) of
+		not_found ->
+			%% Occasionally happens in tests.
+			?LOG_ERROR([{event, mining_storage_module_not_found}, {store_id, StoreID}]),
+			map_partition_to_store_ids(StoreIDs, PartitionToStoreIDs);
+		StorageModule ->
+			{Start, End} = ar_storage_module:module_range(StorageModule, 0),
+			Partitions = get_store_id_partitions({Start, End}, []),
+			PartitionToStoreIDs2 = lists:foldl(
+				fun(Partition, Acc) ->
+					maps:update_with(Partition,
+						fun(PartitionStoreIDs) -> [StoreID | PartitionStoreIDs] end,
+						[StoreID], Acc)
+				end,
+				PartitionToStoreIDs, Partitions),
+			map_partition_to_store_ids(StoreIDs, PartitionToStoreIDs2)
+	end.
 
 get_store_id_partitions({Start, End}, Partitions) when Start >= End ->
 	Partitions;
@@ -287,15 +276,17 @@ open_files(StoreIDs) ->
 		end,
 		StoreIDs).
 
-handle_io_thread_down(Ref, Reason,
-		#state{ mode = Mode, io_threads = Threads, io_thread_monitor_refs = Refs } = State) ->
+handle_io_thread_down(Ref, Reason, State) ->
+	#state{ mode = Mode, io_threads = Threads, io_thread_monitor_refs = Refs,
+		store_id_to_device = StoreIDToDevice } = State,
 	?LOG_WARNING([{event, mining_io_thread_down}, {reason, io_lib:format("~p", [Reason])}]),
 	Device = maps:get(Ref, Refs),
 	Refs2 = maps:remove(Ref, Refs),
 	Threads2 = maps:remove(Device, Threads),
 
-	StoreIDs = get_store_ids_for_device(Device, State),
-	Thread = start_io_thread(Mode, StoreIDs),
+	DeviceToStoreIDs = ar_util:invert_map(StoreIDToDevice),
+	StoreIDs = maps:get(Device, DeviceToStoreIDs, sets:new()),
+	Thread = start_io_thread(Mode, sets:to_list(StoreIDs)),
 	ThreadRef = monitor(process, Thread),
 	State#state{ io_threads = maps:put(Device, Thread, Threads2),	
 		io_thread_monitor_refs = maps:put(ThreadRef, Device, Refs2) }.
@@ -317,7 +308,8 @@ chunks_read(standalone, Worker, WhichChunk, Candidate, RecallRangeStart, ChunkOf
 	Worker ! {chunks_read, WhichChunk, Candidate, RecallRangeStart, ChunkOffsets}.
 
 get_packed_intervals(Start, End, MiningAddress, PackingDifficulty, "default", Intervals) ->
-	Packing = ar_block:get_packing(PackingDifficulty, MiningAddress),
+	ReplicaFormat = get_replica_format_from_packing_difficulty(PackingDifficulty),
+	Packing = ar_block:get_packing(PackingDifficulty, MiningAddress, ReplicaFormat),
 	case ar_sync_record:get_next_synced_interval(Start, End, Packing, ar_data_sync, "default") of
 		not_found ->
 			Intervals;
@@ -327,6 +319,15 @@ get_packed_intervals(Start, End, MiningAddress, PackingDifficulty, "default", In
 	end;
 get_packed_intervals(_Start, _End, _MiningAddr, _PackingDifficulty, _StoreID, _Intervals) ->
 	no_interval_check_implemented_for_non_default_store.
+
+%% The protocol allows composite packing with the packing difficulty 25 for now,
+%% but it is not practical and it is convenient to exlude it from the range of
+%% supported storage module configurations and treat it as the 2.9 replication format
+%% in the mining process.
+get_replica_format_from_packing_difficulty(?REPLICA_2_9_PACKING_DIFFICULTY) ->
+	1;
+get_replica_format_from_packing_difficulty(_PackingDifficulty) ->
+	0.
 
 maybe_clear_cached_chunks(Cache, LastClearTime) ->
 	Now = os:system_time(millisecond),

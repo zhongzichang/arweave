@@ -1,9 +1,9 @@
 -module(ar_mempool).
 
--include_lib("arweave/include/ar.hrl").
+-include("../include/ar.hrl").
 
 -export([reset/0, load_from_disk/0, add_tx/2, drop_txs/1, drop_txs/3,
-		get_map/0, get_all_txids/0, take_chunk/2, get_tx/1, has_tx/1, 
+		get_map/0, get_all_txids/0, take_chunk/2, get_tx/1, is_known_tx/1, has_tx/1,
 		get_priority_set/0, get_last_tx_map/0, get_origin_tx_map/0,
 		get_propagation_queue/0, del_from_propagation_queue/2]).
 
@@ -24,8 +24,8 @@ load_from_disk() ->
 			{MempoolSize2, PrioritySet2, PropagationQueue2, LastTXMap2, OriginTXMap2} = 
 				maps:fold(
 					fun(TXID, {TX, Status}, {MempoolSize, PrioritySet, PropagationQueue, LastTXMap, OriginTXMap}) ->
-						MetaData = {_, _, Timestamp} = init_tx_metadata(TX, Status),
-						ets:insert(node_state, {{tx, TXID}, MetaData}),
+						Metadata = {_, _, Timestamp} = init_tx_metadata(TX, Status),
+						ets:insert(node_state, {{tx, TXID}, Metadata}),
 						ets:insert(tx_prefixes, {ar_node_worker:tx_id_prefix(TXID), TXID}),
 						Q = case Status of
 							ready_for_mining ->
@@ -66,7 +66,7 @@ load_from_disk() ->
 	end.
 
 add_tx(#tx{ id = TXID } = TX, Status) ->
-	{MetaData, MempoolSize, PrioritySet, PropagationQueue, LastTXMap, OriginTXMap} =
+	{Metadata, MempoolSize, PrioritySet, PropagationQueue, LastTXMap, OriginTXMap} =
 		case get_tx_metadata(TXID) of
 			not_found ->
 				{_, _, Timestamp} = init_tx_metadata(TX, Status),
@@ -79,11 +79,12 @@ add_tx(#tx{ id = TXID } = TX, Status) ->
 					add_to_last_tx_map(get_last_tx_map(), TX),
 					add_to_origin_tx_map(get_origin_tx_map(), TX)
 				};
-			{TX, PrevStatus, Timestamp} -> 
+			{KnownTX, PrevStatus, Timestamp} ->
+				TX2 = assert_same_tx(TX, KnownTX),
 				{
-					{TX, Status, Timestamp},
+					{TX2, Status, Timestamp},
 					get_mempool_size(),
-					add_to_priority_set(get_priority_set(),TX, PrevStatus, Status, Timestamp),
+					add_to_priority_set(get_priority_set(), TX2, PrevStatus, Status, Timestamp),
 					get_propagation_queue(),
 					get_last_tx_map(),
 					get_origin_tx_map()
@@ -91,7 +92,7 @@ add_tx(#tx{ id = TXID } = TX, Status) ->
 		end,
 	% Insert all data at the same time to ensure atomicity
 	ets:insert(node_state, [
-		{{tx, TXID}, MetaData},
+		{{tx, TXID}, Metadata},
 		{mempool_size, MempoolSize},
 		{tx_priority_set, PrioritySet},
 		{tx_propagation_queue, PropagationQueue},
@@ -115,6 +116,17 @@ add_tx(#tx{ id = TXID } = TX, Status) ->
 			noop
 	end,
 	ok.
+
+assert_same_tx(#tx{ format = 1 } = TX, #tx{ format = 1 } = TX) ->
+	TX;
+assert_same_tx(#tx{ format = 2, data = Data } = TX, #tx{ format = 2 } = TX2) ->
+	true = TX#tx{ data = <<>> } == TX2#tx{ data = <<>> },
+	case byte_size(Data) == 0 of
+		true ->
+			TX2;
+		false ->
+			TX
+	end.
 
 drop_txs(DroppedTXs) ->
 	drop_txs(DroppedTXs, true, true).
@@ -217,6 +229,14 @@ get_tx(TXID) ->
 			not_found;
 		{TX, _Status, _Timestamp} ->
 			TX
+	end.
+
+is_known_tx(TXID) ->
+	case ar_ignore_registry:member(TXID) of
+		true ->
+			true;
+		false ->
+			has_tx(TXID)
 	end.
 
 has_tx(TXID) ->

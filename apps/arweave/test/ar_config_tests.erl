@@ -46,7 +46,8 @@ test_parse_config() ->
 				{?PARTITION_SIZE, 2, {composite, ExpectedMiningAddr, 32}},
 				{?PARTITION_SIZE, 100, unpacked},
 				{1, 0, unpacked},
-				{1000000000000, 14, {spora_2_6, ExpectedMiningAddr}}],
+				{1000000000000, 14, {spora_2_6, ExpectedMiningAddr}},
+				{?PARTITION_SIZE, 0, {replica_2_9, ExpectedMiningAddr}}],
 		repack_in_place_storage_modules = [
 				{{?PARTITION_SIZE, 1, unpacked}, {spora_2_6, ExpectedMiningAddr}},
 				{{?PARTITION_SIZE, 1, unpacked}, {composite, ExpectedMiningAddr, 2}},
@@ -68,6 +69,8 @@ test_parse_config() ->
 		tx_validators = 3,
 		post_tx_timeout = 50,
 		max_emitters = 4,
+		replica_2_9_workers = 16,
+		packing_workers = 25,
 		tx_propagation_parallelization = undefined,
 		sync_jobs = 10,
 		header_sync_jobs = 1,
@@ -116,7 +119,6 @@ test_parse_config() ->
 			gateway_arql := 3,
 			get_sync_record := 10
 		},
-		packing_rate = 20,
 		max_nonce_limiter_validation_thread_count = 2,
 		max_nonce_limiter_last_step_validation_thread_count = 3,
 		nonce_limiter_server_trusted_peers = ["127.0.0.1", "2.3.4.5", "6.7.8.9:1982"],
@@ -155,12 +157,67 @@ test_validate_repack_in_place() ->
 		ar_config:validate_config(#config{
 			storage_modules = [{?PARTITION_SIZE, 0, {spora_2_6, Addr1}}],
 			repack_in_place_storage_modules = [
-				{{?PARTITION_SIZE, 1, {spora_2_6, Addr1}}, {spora_2_6, Addr2}}]})),
+				{{?PARTITION_SIZE, 1, {spora_2_6, Addr1}}, {replica_2_9, Addr2}}]})),
 	?assertEqual(false,
 		ar_config:validate_config(#config{
 			storage_modules = [{?PARTITION_SIZE, 0, {spora_2_6, Addr1}}],
 			repack_in_place_storage_modules = [
-				{{?PARTITION_SIZE, 0, {spora_2_6, Addr1}}, {spora_2_6, Addr2}}]})).
+				{{?PARTITION_SIZE, 0, {spora_2_6, Addr1}}, {replica_2_9, Addr2}}]})),
+	%% Repacking in place *from* replica_2_9 to any format is not currently supported.
+	?assertEqual(false,
+		ar_config:validate_config(#config{
+			storage_modules = [],
+			repack_in_place_storage_modules = [
+				{{?PARTITION_SIZE, 0, {replica_2_9, Addr1}}, {replica_2_9, Addr2}}]})),
+	?assertEqual(false,
+		ar_config:validate_config(#config{
+			storage_modules = [],
+			repack_in_place_storage_modules = [
+				{{?PARTITION_SIZE, 0, {replica_2_9, Addr1}}, {spora_2_6, Addr2}}]})),
+	?assertEqual(false,
+		ar_config:validate_config(#config{
+			storage_modules = [],
+			repack_in_place_storage_modules = [
+				{{?PARTITION_SIZE, 0, {replica_2_9, Addr2}}, unpacked}]})),
+	?assertEqual(false,
+		ar_config:validate_config(#config{
+			storage_modules = [],
+			repack_in_place_storage_modules = [
+				{{?PARTITION_SIZE, 0, {replica_2_9, Addr2}}, {composite, Addr1, 1}}]})),
+	%% Only repacking in place *to* replica_2_9 is supported.
+	?assertEqual(true,
+		ar_config:validate_config(#config{
+			storage_modules = [],
+			repack_in_place_storage_modules = [
+				{{?PARTITION_SIZE, 0, unpacked}, {replica_2_9, Addr2}}]})),
+	?assertEqual(true,
+		ar_config:validate_config(#config{
+			storage_modules = [],
+			repack_in_place_storage_modules = [
+				{{?PARTITION_SIZE, 0, {spora_2_6, Addr1}}, {replica_2_9, Addr2}}]})),
+	?assertEqual(true,
+		ar_config:validate_config(#config{
+			storage_modules = [],
+			repack_in_place_storage_modules = [
+				{{?PARTITION_SIZE, 0, {composite, Addr1, 1}}, {replica_2_9, Addr2}}]})),
+	?assertEqual(false,
+		ar_config:validate_config(#config{
+			storage_modules = [],
+			repack_in_place_storage_modules = [
+				{{?PARTITION_SIZE, 0, unpacked}, {spora_2_6, Addr2}}]})),
+	?assertEqual(false,
+		ar_config:validate_config(#config{
+			storage_modules = [],
+			repack_in_place_storage_modules = [
+				{{?PARTITION_SIZE, 0, {spora_2_6, Addr1}}, {composite, Addr1, 1}}]})),
+	?assertEqual(false,
+		ar_config:validate_config(#config{
+			storage_modules = [],
+			repack_in_place_storage_modules = [
+				{{?PARTITION_SIZE, 0, {composite, Addr1, 1}}, {spora_2_6, Addr2}}]})).
+
+		
+		
 	
 test_validate_cm_pool() ->
 	?assertEqual(false,

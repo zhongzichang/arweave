@@ -46,8 +46,17 @@ pre_validate(B, Peer, ReceiveTimestamp) ->
 		true ->
 			skipped;
 		false ->
+			Ref = make_ref(),
+			ar_ignore_registry:add_ref(H, Ref),
+			erlang:put(ignore_registry_ref, Ref),
 			B2 = B#block{ receive_timestamp = ReceiveTimestamp },
-			pre_validate_is_peer_banned(B2, Peer)
+			case pre_validate_is_peer_banned(B2, Peer) of
+				enqueued ->
+					enqueued;
+				Other ->
+					ar_ignore_registry:remove_ref(H, Ref),
+					Other
+			end
 	end.
 
 %%%===================================================================
@@ -72,11 +81,11 @@ handle_cast(pre_validate, #state{ pqueue = Q, size = Size, ip_timestamps = IPTim
 			ar_util:cast_after(50, ?MODULE, pre_validate),
 			{noreply, State};
 		false ->
-			{{_, {B, PrevB, SolutionResigned, Peer}},
-					Q2} = gb_sets:take_largest(Q),
+			{{_, {B, PrevB, SolutionResigned, Peer, Ref}}, Q2} = gb_sets:take_largest(Q),
 			BlockSize = byte_size(term_to_binary(B)),				
 			Size2 = Size - BlockSize,
-			case ar_ignore_registry:permanent_member(B#block.indep_hash) of
+			BH = B#block.indep_hash,
+			case ar_ignore_registry:permanent_member(BH) of
 				true ->
 					gen_server:cast(?MODULE, pre_validate),
 					{noreply, State#state{ pqueue = Q2, size = Size2 }};
@@ -86,6 +95,7 @@ handle_cast(pre_validate, #state{ pqueue = Q, size = Size, ip_timestamps = IPTim
 					{IPTimestamps3, HashTimestamps3} =
 						case ThrottleByIPResult of
 							false ->
+								ar_ignore_registry:remove_ref(BH, Ref),
 								{IPTimestamps, HashTimestamps};
 							{true, IPTimestamps2} ->
 								case throttle_by_solution_hash(B#block.hash, HashTimestamps,
@@ -106,21 +116,23 @@ handle_cast(pre_validate, #state{ pqueue = Q, size = Size, ip_timestamps = IPTim
 												B#block.receive_timestamp),
 										{IPTimestamps2, HashTimestamps2};
 									false ->
+										ar_ignore_registry:remove_ref(BH, Ref),
 										{IPTimestamps2, HashTimestamps}
 								end
 						end,
 					gen_server:cast(?MODULE, pre_validate),
 					{noreply, State#state{ pqueue = Q2, size = Size2,
-							ip_timestamps = IPTimestamps3, hash_timestamps = HashTimestamps3 }}
+							ip_timestamps = IPTimestamps3,
+							hash_timestamps = HashTimestamps3 }}
 			end
 	end;
 
-handle_cast({enqueue, {B, PrevB, SolutionResigned, Peer}}, State) ->
+handle_cast({enqueue, {B, PrevB, SolutionResigned, Peer, Ref}}, State) ->
 	#state{ pqueue = Q, size = Size } = State,
 	Priority = priority(B, Peer),
 	BlockSize = byte_size(term_to_binary(B)),
 	Size2 = Size + BlockSize,
-	Q2 = gb_sets:add_element({Priority, {B, PrevB, SolutionResigned, Peer}}, Q),
+	Q2 = gb_sets:add_element({Priority, {B, PrevB, SolutionResigned, Peer, Ref}}, Q),
 	{Q3, Size3} =
 		case Size2 > ?MAX_PRE_VALIDATION_QUEUE_SIZE of
 			true ->
@@ -319,7 +331,6 @@ pre_validate_indep_hash(#block{ indep_hash = H } = B, PrevB, Peer) ->
 				true ->
 					skipped;
 				false ->
-					ar_ignore_registry:add_temporary(H, 5000),
 					pre_validate_timestamp(B, PrevB, Peer)
 			end;
 		{error, invalid_signature} ->
@@ -341,11 +352,11 @@ pre_validate_timestamp(B, PrevB, Peer) ->
 			post_block_reject_warn(B, check_timestamp, Peer, [{block_time,
 					B#block.timestamp}, {current_time, os:system_time(seconds)}]),
 			ar_events:send(block, {rejected, invalid_timestamp, H, Peer}),
-			ar_ignore_registry:remove_temporary(B#block.indep_hash),
 			invalid
 	end.
 
 pre_validate_existing_solution_hash(B, PrevB, Peer) ->
+	Height = B#block.height,
 	SolutionH = B#block.hash,
 	#block{ hash = SolutionH, nonce = Nonce, reward_addr = RewardAddr,
 			hash_preimage = HashPreimage, recall_byte = RecallByte,
@@ -356,7 +367,9 @@ pre_validate_existing_solution_hash(B, PrevB, Peer) ->
 					last_step_checkpoints = LastStepCheckpoints },
 			chunk_hash = ChunkHash, chunk2_hash = Chunk2Hash,
 			unpacked_chunk_hash = UnpackedChunkHash,
-			unpacked_chunk2_hash = UnpackedChunk2Hash } = B,
+			unpacked_chunk2_hash = UnpackedChunk2Hash,
+			packing_difficulty = PackingDifficulty,
+			replica_format = ReplicaFormat } = B,
 	H = B#block.indep_hash,
 	CDiff = B#block.cumulative_diff,
 	PrevCDiff = PrevB#block.cumulative_diff,
@@ -376,11 +389,15 @@ pre_validate_existing_solution_hash(B, PrevB, Peer) ->
 					unpacked_chunk_hash = UnpackedChunkHash,
 					unpacked_chunk2_hash = UnpackedChunk2Hash,
 					poa = #poa{ chunk = Chunk }, poa2 = #poa{ chunk = Chunk2 },
-					recall_byte2 = RecallByte2 } = CacheB ->
+					recall_byte2 = RecallByte2,
+					packing_difficulty = PackingDifficulty2,
+					replica_format = ReplicaFormat } = CacheB ->
 				may_be_report_double_signing(B, CacheB),
 				LastStepPrevOutput = get_last_step_prev_output(B),
 				LastStepPrevOutput2 = get_last_step_prev_output(CacheB),
-				case LastStepPrevOutput == LastStepPrevOutput2 of
+				case LastStepPrevOutput == LastStepPrevOutput2
+						andalso (Height < ar_fork:height_2_9()
+							orelse PackingDifficulty == PackingDifficulty2) of
 					true ->
 						B2 = B#block{ poa = (B#block.poa)#poa{ chunk = Chunk },
 								poa2 = (B#block.poa2)#poa{ chunk = Chunk2 } },
@@ -510,7 +527,6 @@ pre_validate_nonce_limiter_global_step_number(B, PrevB, SolutionResigned, Peer) 
 			H = B#block.indep_hash,
 			ar_events:send(block,
 					{rejected, invalid_nonce_limiter_global_step_number, H, Peer}),
-			ar_ignore_registry:remove_temporary(B#block.indep_hash),
 			invalid;
 		true ->
 			prometheus_gauge:set(block_vdf_advance, StepNumber - CurrentStepNumber),
@@ -565,7 +581,8 @@ pre_validate_cumulative_difficulty(B, PrevB, SolutionResigned, Peer) ->
 	end.
 
 pre_validate_packing_difficulty(B, PrevB, SolutionResigned, Peer) ->
-	case ar_block:validate_packing_difficulty(B#block.height, B#block.packing_difficulty) of
+	case ar_block:validate_replica_format(B#block.height, B#block.packing_difficulty,
+			B#block.replica_format) of
 		false ->
 			post_block_reject_warn_and_error_dump(B, check_packing_difficulty, Peer),
 			ar_events:send(block, {rejected, invalid_packing_difficulty,
@@ -574,7 +591,8 @@ pre_validate_packing_difficulty(B, PrevB, SolutionResigned, Peer) ->
 		true ->
 			case SolutionResigned of
 				true ->
-					gen_server:cast(?MODULE, {enqueue, {B, PrevB, true, Peer}}),
+					Ref = erlang:get(ignore_registry_ref),
+					gen_server:cast(?MODULE, {enqueue, {B, PrevB, true, Peer, Ref}}),
 					enqueued;
 				false ->
 					pre_validate_quick_pow(B, PrevB, false, Peer)
@@ -592,7 +610,8 @@ pre_validate_quick_pow(B, PrevB, SolutionResigned, Peer) ->
 					B#block.indep_hash, Peer}),
 			invalid;
 		true ->
-			gen_server:cast(?MODULE, {enqueue, {B, PrevB, SolutionResigned, Peer}}),
+			Ref = erlang:get(ignore_registry_ref),
+			gen_server:cast(?MODULE, {enqueue, {B, PrevB, SolutionResigned, Peer, Ref}}),
 			enqueued
 	end.
 
@@ -682,7 +701,9 @@ pre_validate_poa(B, PrevB, PartitionUpperBound, H0, H1, Peer) ->
 	Nonce = B#block.nonce,
 	%% The packing difficulty >0 is only allowed after the 2.8 hard fork (validated earlier
 	%% here), and the composite packing is only possible for packing difficulty >= 1.
-	Packing = ar_block:get_packing(PackingDifficulty, B#block.reward_addr),
+	%% The new shared entropy format is supported starting from 2.9.
+	Packing = ar_block:get_packing(PackingDifficulty, B#block.reward_addr,
+			B#block.replica_format),
 	SubChunkIndex = ar_block:get_sub_chunk_index(PackingDifficulty, Nonce),
 	ArgCache = {BlockStart1, RecallByte1, TXRoot1, BlockSize1, Packing, SubChunkIndex},
 	case RecallByte1 == B#block.recall_byte andalso
@@ -740,7 +761,6 @@ pre_validate_nonce_limiter(B, PrevB, Peer) ->
 	PrevOutput = get_last_step_prev_output(B),
 	case ar_nonce_limiter:validate_last_step_checkpoints(B, PrevB, PrevOutput) of
 		{false, cache_mismatch} ->
-			ar_ignore_registry:add(B#block.indep_hash),
 			post_block_reject_warn_and_error_dump(B, check_nonce_limiter, Peer),
 			ar_events:send(block, {rejected, invalid_nonce_limiter_cache_mismatch,
 					B#block.indep_hash, Peer}),
@@ -814,7 +834,8 @@ get_peer_score(_Peer, [], N) ->
 drop_tail(Q, Size) when Size =< ?MAX_PRE_VALIDATION_QUEUE_SIZE ->
 	{Q, 0};
 drop_tail(Q, Size) ->
-	{{_Priority, {B, _PrevB, _SolutionResigned, _Peer}}, Q2} = gb_sets:take_smallest(Q),
+	{{_Priority, {B, _PrevB, _SolutionResigned, _Peer, Ref}}, Q2} = gb_sets:take_smallest(Q),
+	ar_ignore_registry:remove_ref(B#block.indep_hash, Ref),
 	BlockSize = byte_size(term_to_binary(B)),
 	drop_tail(Q2, Size - BlockSize).
 

@@ -10,10 +10,12 @@
         tx/2, tx/3, tx/4, wait_until_syncs_chunk/2,
         wait_until_syncs_chunks/1, wait_until_syncs_chunks/2, wait_until_syncs_chunks/3,
         get_tx_offset/2, get_tx_data/1,
-        post_random_blocks/1, get_records_with_proofs/3, post_proofs/4,
+        post_random_blocks/1, get_records_with_proofs/3, post_proofs/4, post_proofs/5,
         generate_random_split/1, generate_random_original_split/1,
         generate_random_standard_split/0, generate_random_original_v1_split/0]).
 
+-define(SYNC_CHUNKS_CHECK, 1000).
+-define(SYNC_CHUNKS_TIMEOUT, 300*1000).
 
 get_records_with_proofs(B, TX, Chunks) ->
 	[{B, TX, Chunks, Proof} || Proof <- build_proofs(B, TX, Chunks)].
@@ -27,18 +29,23 @@ setup_nodes(Options) ->
 			ar_test_node:remote_call(peer1, ar_wallet, new_keyfile, []))),
 	setup_nodes2(Options#{ addr => Addr, peer_addr => PeerAddr }).
 
-setup_nodes2(#{ addr := MainAddr, peer_addr := PeerAddr } = Options) ->
+setup_nodes2(#{ peer_addr := PeerAddr } = Options) ->
 	Wallet = {_, Pub} = ar_wallet:new(),
-	[B0] = ar_weave:init([{ar_wallet:to_address(Pub), ?AR(200000), <<>>}]),
+	{B0, Options2} =
+		case maps:get(b0, Options, not_set) of
+			not_set ->
+				[Genesis] = ar_weave:init([{ar_wallet:to_address(Pub), ?AR(200000), <<>>}]),
+				{Genesis, Options#{ b0 => Genesis }};
+			Value ->
+				{Value, Options}
+		end,
 	{ok, Config} = application:get_env(arweave, config),
-	case maps:get(storage_modules, Options, not_found) of
-		not_found ->
-			ar_test_node:start(B0, MainAddr, Config);
-		StorageModules ->
-			ar_test_node:start(B0, MainAddr, Config, StorageModules)
-	end,
+	Options3 = Options2#{ config => Config#config{ 
+		enable = Config#config.enable ++ [pack_served_chunks] } },
+	ar_test_node:start(Options3),
 	{ok, PeerConfig} = ar_test_node:remote_call(peer1, application, get_env, [arweave, config]),
-	ar_test_node:start_peer(peer1, B0, PeerAddr, PeerConfig),
+	ar_test_node:start_peer(peer1, B0, PeerAddr, PeerConfig#config{ 
+		enable = Config#config.enable ++ [pack_served_chunks] }),
 	ar_test_node:connect_to_peer(peer1),
 	Wallet.
 
@@ -311,10 +318,18 @@ post_blocks(Wallet, BlockMap) ->
 	).
 
 post_proofs(Peer, B, TX, Chunks) ->
+	post_proofs(Peer, B, TX, Chunks, false).
+post_proofs(Peer, B, TX, Chunks, IsTemporary) ->
 	Proofs = build_proofs(B, TX, Chunks),
+
+	HttpStatus = case IsTemporary of
+		true -> <<"303">>;
+		false -> <<"200">>
+	end,
+
 	lists:foreach(
 		fun({_, Proof}) ->
-			{ok, {{<<"200">>, _}, _, _, _, _}} =
+			{ok, {{HttpStatus, _}, _, _, _, _}} =
 				ar_test_node:post_chunk(Peer, ar_serialize:jsonify(Proof))
 		end,
 		Proofs
@@ -348,7 +363,7 @@ wait_until_syncs_chunk(Offset, ExpectedProof) ->
 			end
 		end,
 		100,
-		5000
+		20_000
 	).
 
 wait_until_syncs_chunks(Proofs) ->
@@ -382,8 +397,8 @@ wait_until_syncs_chunks(Node, Proofs, UpperBound) ->
 							end
 					end
 				end,
-				5 * 1000,
-				180 * 1000
+				?SYNC_CHUNKS_CHECK,
+				?SYNC_CHUNKS_TIMEOUT
 			)
 		end,
 		Proofs
@@ -392,6 +407,10 @@ wait_until_syncs_chunks(Node, Proofs, UpperBound) ->
 compare_proofs(#{ chunk := C, data_path := D, tx_path := T },
 		#{ chunk := C, data_path := D, tx_path := T }, _EndOffset) ->
 	true;
-compare_proofs(_, _, EndOffset) ->
-	?debugFmt("Proof mismatch for ~B.", [EndOffset]),
+compare_proofs(#{ chunk := C1, data_path := D1, tx_path := T1 } = FetchedProof,
+		#{ chunk := C2, data_path := D2, tx_path := T2 }, EndOffset) ->
+	?debugFmt("Proof mismatch for ~B data_path: ~p tx_path: ~p chunk: ~p "
+			"expected chunk size :~B chunk size: ~B fetched proof packing: ~p.~n",
+			[EndOffset, D1 == D2, T1 == T2, C1 == C2, byte_size(C2), byte_size(C1),
+				maps:get(packing, FetchedProof, not_set)]),
 	false.

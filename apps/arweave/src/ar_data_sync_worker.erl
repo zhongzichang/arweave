@@ -52,7 +52,7 @@ handle_cast({read_range, Args}, State) ->
 		recast ->
 			ok;
 		ReadResult ->
-			gen_server:cast(ar_data_sync_worker_master,
+			gen_server:cast(ar_chunk_copy,
 				{task_completed, {read_range, {State#state.name, ReadResult, Args}}})
 	end,
 	{noreply, State};
@@ -85,9 +85,10 @@ terminate(Reason, _State) ->
 %%% Private functions.
 %%%===================================================================
 
-read_range({Start, End, _OriginStoreID, _TargetStoreID, _SkipSmall}) when Start >= End ->
+read_range({Start, End, _OriginStoreID, _TargetStoreID})
+		when Start >= End ->
 	ok;
-read_range({Start, End, _OriginStoreID, TargetStoreID, _SkipSmall} = Args) ->
+read_range({Start, End, _OriginStoreID, TargetStoreID} = Args) ->
 	case ar_data_sync:is_chunk_cache_full() of
 		false ->
 			case ar_data_sync:is_disk_space_sufficient(TargetStoreID) of
@@ -107,99 +108,116 @@ read_range({Start, End, _OriginStoreID, TargetStoreID, _SkipSmall} = Args) ->
 read_range2(0, Args) ->
 	ar_util:cast_after(1000, self(), {read_range, Args}),
 	recast;
-read_range2(_MessagesRemaining, {Start, End, _OriginStoreID, _TargetStoreID, _SkipSmall}) when Start >= End ->
+read_range2(_MessagesRemaining,
+		{Start, End, _OriginStoreID, _TargetStoreID})
+		when Start >= End ->
 	ok;
-read_range2(MessagesRemaining, {Start, End, OriginStoreID, TargetStoreID, SkipSmall}) ->
-	ChunksIndex = {chunks_index, OriginStoreID},
-	ChunkDataDB = {chunk_data_db, OriginStoreID},
-	case {ar_sync_record:is_recorded(Start + 1, ar_data_sync, OriginStoreID),
-			ar_data_sync:get_chunk_by_byte(ChunksIndex, Start + 1)} of
+read_range2(MessagesRemaining, {Start, End, OriginStoreID, TargetStoreID}) ->
+	CheckIsRecordedAlready =
+		case ar_sync_record:is_recorded(Start + 1, ar_data_sync, TargetStoreID) of
+			{true, _} ->
+				case ar_sync_record:get_next_unsynced_interval(Start, End, ar_data_sync,
+						TargetStoreID) of
+					not_found ->
+						ok;
+					{_, Start2} ->
+						read_range2(MessagesRemaining,
+								{Start2, End, OriginStoreID, TargetStoreID})
+				end;
+			_ ->
+				false
+		end,
+	IsRecordedInTheSource =
+		case CheckIsRecordedAlready of
+			ok ->
+				ok;
+			recast ->
+				ok;
+			false ->
+				case ar_sync_record:is_recorded(Start + 1, ar_data_sync, OriginStoreID) of
+					{true, Packing} ->
+						{true, Packing};
+					SyncRecordReply ->
+						?LOG_ERROR([{event, cannot_read_requested_range},
+								{origin_store_id, OriginStoreID},
+								{missing_start_offset, Start + 1},
+								{end_offset, End},
+								{target_store_id, TargetStoreID},
+								{sync_record_reply, io_lib:format("~p", [SyncRecordReply])}])
+				end
+		end,
+	ReadChunkMetadata =
+		case IsRecordedInTheSource of
+			ok ->
+				ok;
+			{true, Packing2} ->
+				{Packing2, ar_data_sync:get_chunk_by_byte(Start + 1, OriginStoreID)}
+		end,
+	case ReadChunkMetadata of
+		ok ->
+			ok;
 		{_, {error, invalid_iterator}} ->
 			%% get_chunk_by_byte looks for a key with the same prefix or the next
 			%% prefix. Therefore, if there is no such key, it does not make sense to
 			%% look for any key smaller than the prefix + 2 in the next iteration.
 			PrefixSpaceSize = trunc(math:pow(2,
 					?OFFSET_KEY_BITSIZE - ?OFFSET_KEY_PREFIX_BITSIZE)),
-			Start2 = ((Start div PrefixSpaceSize) + 2) * PrefixSpaceSize,
-			read_range2(MessagesRemaining, {Start2, End, OriginStoreID, TargetStoreID, SkipSmall});
+			Start3 = ((Start div PrefixSpaceSize) + 2) * PrefixSpaceSize,
+			read_range2(MessagesRemaining,
+					{Start3, End, OriginStoreID, TargetStoreID});
 		{_, {error, Reason}} ->
 			?LOG_ERROR([{event, failed_to_query_chunk_metadata}, {offset, Start + 1},
 					{reason, io_lib:format("~p", [Reason])}]);
 		{_, {ok, _Key, {AbsoluteOffset, _, _, _, _, _, _}}} when AbsoluteOffset > End ->
 			ok;
-		{{true, Packing}, {ok, _Key, {AbsoluteOffset, ChunkDataKey, TXRoot, DataRoot, TXPath,
-					RelativeOffset, ChunkSize}}} ->
-			Skip = SkipSmall andalso AbsoluteOffset =< ?STRICT_DATA_SPLIT_THRESHOLD
-					andalso ChunkSize < ?DATA_CHUNK_SIZE,
-			ReadChunk =
-				case Skip of
-					true ->
-						skip;
-					false ->
-						ar_data_sync:read_chunk(AbsoluteOffset, ChunkDataDB, ChunkDataKey,
-								OriginStoreID)
-				end,
+		{Packing3, {ok, _Key, {AbsoluteOffset, ChunkDataKey, TXRoot, DataRoot, TXPath,
+				RelativeOffset, ChunkSize}}} ->
+			ReadChunk = ar_data_sync:read_chunk(AbsoluteOffset, ChunkDataKey, OriginStoreID),
 			case ReadChunk of
-				skip ->
-					read_range2(MessagesRemaining,
-							{Start + ChunkSize, End, OriginStoreID, TargetStoreID, SkipSmall});
 				not_found ->
 					ar_data_sync:invalidate_bad_data_record(
-						Start, AbsoluteOffset, OriginStoreID, 1),
+						AbsoluteOffset, ChunkSize, OriginStoreID, read_range_chunk_not_found),
 					read_range2(MessagesRemaining-1,
-							{Start + ChunkSize, End, OriginStoreID, TargetStoreID, SkipSmall});
+							{Start + ChunkSize, End, OriginStoreID, TargetStoreID});
 				{error, Error} ->
 					?LOG_ERROR([{event, failed_to_read_chunk},
 							{absolute_end_offset, AbsoluteOffset},
 							{chunk_data_key, ar_util:encode(ChunkDataKey)},
 							{reason, io_lib:format("~p", [Error])}]),
 					read_range2(MessagesRemaining,
-							{Start + ChunkSize, End, OriginStoreID, TargetStoreID, SkipSmall});
+							{Start + ChunkSize, End, OriginStoreID, TargetStoreID});
 				{ok, {Chunk, DataPath}} ->
 					case ar_sync_record:is_recorded(AbsoluteOffset, ar_data_sync,
 							OriginStoreID) of
-						{true, Packing} ->
+						{true, Packing3} ->
 							ar_data_sync:increment_chunk_cache_size(),
 							UnpackedChunk =
-								case Packing of
+								case Packing3 of
 									unpacked ->
 										Chunk;
 									_ ->
 										none
 								end,
 							Args = {DataRoot, AbsoluteOffset, TXPath, TXRoot, DataPath,
-									Packing, RelativeOffset, ChunkSize, Chunk,
+									Packing3, RelativeOffset, ChunkSize, Chunk,
 									UnpackedChunk, TargetStoreID, ChunkDataKey},
 							gen_server:cast(ar_data_sync:name(TargetStoreID),
 									{pack_and_store_chunk, Args}),
 							read_range2(MessagesRemaining-1,
-								{Start + ChunkSize, End, OriginStoreID, TargetStoreID,
-								 SkipSmall});
+								{Start + ChunkSize, End, OriginStoreID, TargetStoreID});
 						{true, _DifferentPacking} ->
 							%% Unlucky timing - the chunk should have been repacked
 							%% in the meantime.
 							read_range2(MessagesRemaining,
-									{Start, End, OriginStoreID, TargetStoreID, SkipSmall});
+									{Start, End, OriginStoreID, TargetStoreID});
 						Reply ->
 							?LOG_ERROR([{event, chunk_record_not_found},
 									{absolute_end_offset, AbsoluteOffset},
 									{ar_sync_record_reply, io_lib:format("~p", [Reply])}]),
 							read_range2(MessagesRemaining,
-									{Start + ChunkSize, End,
-										OriginStoreID, TargetStoreID, SkipSmall})
+									{Start + ChunkSize, End, OriginStoreID, TargetStoreID})
 					end
-			end;
-		{PackingResult, {ok, _Key, {AbsoluteOffset, ChunkDataKey, _TXRoot, DataRoot, _TXPath,
-					RelativeOffset, ChunkSize}}} ->
-			?LOG_ERROR([{event, fetched_chunk_metadata_but_failed_to_find_sync_record_entry},
-					{absolute_offset, AbsoluteOffset},
-					{data_root, ar_util:encode(DataRoot)},
-					{chunk_data_key, ar_util:encode(ChunkDataKey)},
-					{chunk_size, ChunkSize},
-					{relative_offset, RelativeOffset},
-					{packing_result, io_lib:format("~p", [PackingResult])}]),
-			read_range2(MessagesRemaining,
-					{Start + ChunkSize, End, OriginStoreID, TargetStoreID, SkipSmall})
+			end
 	end.
 
 sync_range({Start, End, _Peer, _TargetStoreID, _RetryCount}, _State) when Start >= End ->
@@ -240,16 +258,17 @@ sync_range({Start, End, Peer, TargetStoreID, RetryCount} = Args, State) ->
 				true ->
 					ok;
 				false ->
-					case ar_http_iface_client:get_chunk_binary(Peer, Start2, get_target_packing(TargetStoreID, State#state.request_packed_chunks)) of
+					Packing = get_target_packing(TargetStoreID,
+							State#state.request_packed_chunks),
+					case ar_http_iface_client:get_chunk_binary(Peer, Start2, Packing) of
 						{ok, #{ chunk := Chunk } = Proof, _Time, _TransferSize} ->
 							%% In case we fetched a packed small chunk,
 							%% we may potentially skip some chunks by
 							%% continuing with Start2 + byte_size(Chunk) - the skip
 							%% chunks will be then requested later.
-							Start3 = ar_data_sync:get_chunk_padded_offset(
+							Start3 = ar_block:get_chunk_padded_offset(
 									Start2 + byte_size(Chunk)) + 1,
-							Label = ar_storage_module:label_by_id(TargetStoreID),
-							gen_server:cast(list_to_atom("ar_data_sync_" ++ Label),
+							gen_server:cast(ar_data_sync:name(TargetStoreID),
 									{store_fetched_chunk, Peer, Start2 - 1, Proof}),
 							ar_data_sync:increment_chunk_cache_size(),
 							sync_range({Start3, End, Peer, TargetStoreID, RetryCount}, State);
@@ -270,5 +289,7 @@ sync_range({Start, End, Peer, TargetStoreID, RetryCount} = Args, State) ->
 			end
 	end.
 
-get_target_packing(StoreID, true) -> ar_storage_module:get_packing(StoreID);
-get_target_packing(_StoreID, false) -> any.
+get_target_packing(StoreID, true) ->
+	ar_storage_module:get_packing(StoreID);
+get_target_packing(_StoreID, false) ->
+	any.
