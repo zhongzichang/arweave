@@ -9,7 +9,7 @@
 -export([start_link/0, allow_request/1, reverse_charge/1, get_balance/3, get_rates_json/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
--ifdef(TEST).
+-ifdef(AR_TEST).
 -define(MAX_BLOCK_SCAN, 4).
 -else.
 -define(MAX_BLOCK_SCAN, 200).
@@ -20,6 +20,8 @@
 %%%===================================================================
 allow_request(Req) ->
 	case catch gen_server:call(?MODULE, {allow_request, Req}) of
+		{'EXIT', {noproc, {gen_server, call, _}}} ->
+			{false, noproc};
 		{'EXIT', {timeout, {gen_server, call, _}}} ->
 			{false, timeout};
 		{error, timeout} ->

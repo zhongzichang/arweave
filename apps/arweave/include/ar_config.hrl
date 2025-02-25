@@ -21,7 +21,7 @@
 
 %% The number of data sync jobs to run. Each job periodically picks a range
 %% and downloads it from peers.
--ifdef(DEBUG).
+-ifdef(AR_TEST).
 -define(DEFAULT_SYNC_JOBS, 10).
 -else.
 -define(DEFAULT_SYNC_JOBS, 100).
@@ -40,14 +40,14 @@
 -define(DEFAULT_DISK_POOL_DATA_ROOT_EXPIRATION_TIME_S, 30 * 60).
 
 %% The default size limit for unconfirmed and seeded chunks, per data root.
--ifdef(DEBUG).
+-ifdef(AR_TEST).
 -define(DEFAULT_MAX_DISK_POOL_DATA_ROOT_BUFFER_MB, 50).
 -else.
 -define(DEFAULT_MAX_DISK_POOL_DATA_ROOT_BUFFER_MB, 10000).
 -endif.
 
 %% The default total size limit for unconfirmed and seeded chunks.
--ifdef(DEBUG).
+-ifdef(AR_TEST).
 -define(DEFAULT_MAX_DISK_POOL_BUFFER_MB, 100).
 -else.
 -define(DEFAULT_MAX_DISK_POOL_BUFFER_MB, 100000).
@@ -86,14 +86,14 @@
 		max(1, (erlang:system_info(schedulers_online) - 1))).
 
 %% Accept a block from the given IP only once in so many milliseconds.
--ifdef(DEBUG).
+-ifdef(AR_TEST).
 -define(DEFAULT_BLOCK_THROTTLE_BY_IP_INTERVAL_MS, 10).
 -else.
 -define(DEFAULT_BLOCK_THROTTLE_BY_IP_INTERVAL_MS, 1000).
 -endif.
 
 %% Accept a block with the given solution hash only once in so many milliseconds.
--ifdef(DEBUG).
+-ifdef(AR_TEST).
 -define(DEFAULT_BLOCK_THROTTLE_BY_SOLUTION_INTERVAL_MS, 10).
 -else.
 -define(DEFAULT_BLOCK_THROTTLE_BY_SOLUTION_INTERVAL_MS, 2000).
@@ -105,7 +105,11 @@
 -define(CHUNK_GROUP_SIZE, (256 * 1024 * 8000)). % 2 GiB.
 
 %% The default number of chunks fetched from disk at a time during in-place repacking.
+-ifdef(AR_TEST).
+-define(DEFAULT_REPACK_BATCH_SIZE, 2).
+-else.
 -define(DEFAULT_REPACK_BATCH_SIZE, 100).
+-endif.
 
 %% default filtering value for the peer list (30days)
 -define(CURRENT_PEERS_LIST_FILTER, 30*60*60*24).
@@ -114,6 +118,16 @@
 -define(DEFAULT_ROCKSDB_FLUSH_INTERVAL_S, 1800).
 %% The default rocksdb WAL sync interval, 1 minute.
 -define(DEFAULT_ROCKSDB_WAL_SYNC_INTERVAL_S, 60).
+
+%% The number of 2.9 storage modules allowed to prepare the storage at a time.
+-ifdef(AR_TEST).
+-define(DEFAULT_REPLICA_2_9_WORKERS, 2).
+-else.
+-define(DEFAULT_REPLICA_2_9_WORKERS, 8).
+-endif.
+
+%% The number of packing workers.
+-define(DEFAULT_PACKING_WORKERS, erlang:system_info(dirty_cpu_schedulers_online)).
 
 %% @doc Startup options with default values.
 -record(config, {
@@ -184,7 +198,6 @@
 		get_tx => ?MAX_PARALLEL_GET_TX_REQUESTS
 	},
 	disk_cache_size = ?DISK_CACHE_SIZE,
-	packing_rate,
 	max_nonce_limiter_validation_thread_count
 			= ?DEFAULT_MAX_NONCE_LIMITER_VALIDATION_THREAD_COUNT,
 	max_nonce_limiter_last_step_validation_thread_count
@@ -211,6 +224,8 @@
 	pool_server_address = not_set,
 	pool_api_key = not_set,
 	pool_worker_name = not_set,
+	packing_workers = ?DEFAULT_PACKING_WORKERS,
+	replica_2_9_workers = ?DEFAULT_REPLICA_2_9_WORKERS,
 	%% Undocumented/unsupported options
 	chunk_storage_file_size = ?CHUNK_GROUP_SIZE,
 	rocksdb_flush_interval_s = ?DEFAULT_ROCKSDB_FLUSH_INTERVAL_S,

@@ -5,7 +5,7 @@
 		verify_cumulative_diff/2, verify_block_hash_list_merkle/2, compute_hash_list_merkle/1,
 		compute_h0/2, compute_h0/5, compute_h0/6,
 		compute_h1/3, compute_h2/3, compute_solution_h/2,
-		indep_hash/1, indep_hash/2, indep_hash2/2,
+		indep_hash/1, indep_hash/2, indep_hash2/2, get_block_signature_preimage/4,
 		generate_signed_hash/1, verify_signature/3,
 		generate_block_data_segment/1, generate_block_data_segment/2,
 		generate_block_data_segment_base/1, get_recall_range/3, verify_tx_root/1,
@@ -16,17 +16,18 @@
 		test_wallet_list_performance/2, test_wallet_list_performance/3,
 		poa_to_list/1, shift_packing_2_5_threshold/1,
 		get_packing_threshold/2, compute_next_vdf_difficulty/1,
-		validate_proof_size/1, vdf_step_number/1, get_packing/2,
-		validate_packing_difficulty/2, validate_packing_difficulty/1,
+		validate_proof_size/1, vdf_step_number/1, get_packing/3,
+		validate_replica_format/3,
 		get_max_nonce/1, get_recall_range_size/1, get_recall_byte/3,
 		get_sub_chunk_size/1, get_nonces_per_chunk/1, get_nonces_per_recall_range/1,
-		get_sub_chunk_index/2]).
+		get_sub_chunk_index/2,
+		get_chunk_padded_offset/1]).
 
--include_lib("arweave/include/ar.hrl").
--include_lib("arweave/include/ar_pricing.hrl").
--include_lib("arweave/include/ar_consensus.hrl").
--include_lib("arweave/include/ar_block.hrl").
--include_lib("arweave/include/ar_vdf.hrl").
+-include("../include/ar.hrl").
+-include("../include/ar_consensus.hrl").
+-include("../include/ar_block.hrl").
+-include("../include/ar_vdf.hrl").
+
 -include_lib("eunit/include/eunit.hrl").
 
 %%%===================================================================
@@ -189,8 +190,7 @@ compute_h0(NonceLimiterOutput, PartitionNumber, Seed, MiningAddr, PackingDifficu
 					PartitionNumber:256, Seed:32/binary, MiningAddr/binary,
 					PackingDifficulty:8 >>
 		end,
-	RandomXState = ar_packing_server:get_randomx_state_by_difficulty(
-		PackingDifficulty, PackingState),
+	RandomXState = ar_packing_server:get_randomx_state_for_h0(PackingDifficulty, PackingState),
 	ar_mine_randomx:hash(RandomXState, Preimage).
 
 %% @doc Compute "h1" - a cryptographic hash which is either the hash of a solution not
@@ -324,7 +324,8 @@ generate_signed_hash(#block{ previous_block = PrevH, timestamp = TS,
 		chunk_hash = ChunkHash, chunk2_hash = Chunk2Hash,
 		packing_difficulty = PackingDifficulty,
 		unpacked_chunk_hash = UnpackedChunkHash,
-		unpacked_chunk2_hash = UnpackedChunk2Hash }) ->
+		unpacked_chunk2_hash = UnpackedChunk2Hash,
+		replica_format = ReplicaFormat }) ->
 	GetTXID = fun(TXID) when is_binary(TXID) -> TXID; (TX) -> TX#tx.id end,
 	Nonce2 = binary:encode_unsigned(Nonce),
 	%% The only block where reward_address may be unclaimed
@@ -364,6 +365,13 @@ generate_signed_hash(#block{ previous_block = PrevH, timestamp = TS,
 			false ->
 				{<<>>, <<>>, <<>>}
 		end,
+	ReplicaFormatBin =
+		case Height >= ar_fork:height_2_9() of
+			true ->
+				<< ReplicaFormat:8 >>;
+			false ->
+				<<>>
+		end,
 	%% The elements must be either fixed-size or separated by the size separators (
 	%% the ar_serialize:encode_* functions).
 	Segment = << (encode_bin(PrevH, 8))/binary, (encode_int(TS, 8))/binary,
@@ -396,13 +404,13 @@ generate_signed_hash(#block{ previous_block = PrevH, timestamp = TS,
 			RewardHistoryHash:32/binary, (encode_int(DebtSupply, 8))/binary,
 			KryderPlusRateMultiplier:24, KryderPlusRateMultiplierLatch:8, Denomination:24,
 			(encode_int(RedenominationHeight, 8))/binary,
-			(ar_serialize:encode_double_signing_proof(DoubleSigningProof))/binary,
+			(ar_serialize:encode_double_signing_proof(DoubleSigningProof, Height))/binary,
 			(encode_int(PrevCDiff, 16))/binary, RebaseThresholdBin/binary,
 			DataPathBin/binary, TXPathBin/binary, DataPath2Bin/binary, TXPath2Bin/binary,
 			ChunkHashBin/binary, Chunk2HashBin/binary, BlockTimeHistoryHashBin/binary,
 			VDFDifficultyBin/binary, NextVDFDifficultyBin/binary,
 			PackingDifficultyBin/binary, UnpackedChunkHashBin/binary,
-			UnpackedChunk2HashBin/binary >>,
+			UnpackedChunk2HashBin/binary, ReplicaFormatBin/binary >>,
 	crypto:hash(sha256, Segment).
 
 %% @doc Compute the block identifier from the signed hash and block signature.
@@ -419,17 +427,44 @@ indep_hash(BDS, B) ->
 			ar_deep_hash:hash([BDS, B#block.hash, B#block.nonce])
 	end.
 
+%% @doc Return the signed block signature preimage.
+get_block_signature_preimage(CDiff, PrevCDiff, Preimage, Height) ->
+	EncodedCDiff = ar_serialize:encode_int(CDiff, 16),
+	EncodedPrevCDiff = ar_serialize:encode_int(PrevCDiff, 16),
+	SignaturePreimage = << EncodedCDiff/binary,
+			EncodedPrevCDiff/binary, Preimage/binary >>,
+	case Height >= ar_fork:height_2_9() of
+		false ->
+			SignaturePreimage;
+		true ->
+			<< 0:(32 * 8), SignaturePreimage/binary >>
+	end.
+
 %% @doc Verify the block signature.
 verify_signature(BlockPreimage, PrevCDiff,
-		#block{ signature = Signature, reward_key = {?DEFAULT_KEY_TYPE, Pub} = RewardKey,
+		#block{ signature = Signature, reward_key = {?RSA_KEY_TYPE, Pub} = RewardKey,
 				reward_addr = RewardAddr, previous_solution_hash = PrevSolutionH,
-				cumulative_diff = CDiff })
-		when byte_size(Signature) == 512, byte_size(Pub) == 512 ->
-	SignaturePreimage = << (ar_serialize:encode_int(CDiff, 16))/binary,
-			(ar_serialize:encode_int(PrevCDiff, 16))/binary, PrevSolutionH/binary,
-			BlockPreimage/binary >>,
+				cumulative_diff = CDiff, height = Height })
+		when byte_size(Signature) == ?RSA_BLOCK_SIG_SIZE,
+				byte_size(Pub) == ?RSA_BLOCK_SIG_SIZE ->
+	SignaturePreimage = get_block_signature_preimage(CDiff, PrevCDiff,
+			<< PrevSolutionH/binary, BlockPreimage/binary >>, Height),
 	ar_wallet:to_address(RewardKey) == RewardAddr andalso
 			ar_wallet:verify(RewardKey, SignaturePreimage, Signature);
+verify_signature(BlockPreimage, PrevCDiff,
+		#block{ signature = Signature, reward_key = {?ECDSA_KEY_TYPE, Pub} = RewardKey,
+				reward_addr = RewardAddr, previous_solution_hash = PrevSolutionH,
+				cumulative_diff = CDiff, height = Height })
+		when byte_size(Signature) == ?ECDSA_SIG_SIZE, byte_size(Pub) == ?ECDSA_PUB_KEY_SIZE ->
+	SignaturePreimage = get_block_signature_preimage(CDiff, PrevCDiff,
+			<< PrevSolutionH/binary, BlockPreimage/binary >>, Height),
+	case Height >= ar_fork:height_2_9() of
+		true ->
+			ar_wallet:to_address(RewardKey) == RewardAddr andalso
+					ar_wallet:verify(RewardKey, SignaturePreimage, Signature);
+		false ->
+			false
+	end;
 verify_signature(_BlockPreimage, _PrevCDiff, _B) ->
 	false.
 
@@ -491,7 +526,7 @@ generate_block_data_segment_base(B) ->
 							integer_to_binary(ScheduledRateDividend),
 							integer_to_binary(ScheduledRateDivisor),
 							integer_to_binary(B#block.packing_2_5_threshold),
-							integer_to_binary(B#block.strict_data_split_threshold)
+integer_to_binary(B#block.strict_data_split_threshold)
 							| Props
 						];
 					false ->
@@ -529,29 +564,33 @@ get_recall_range(H0, PartitionNumber, PartitionUpperBound) ->
 vdf_step_number(#block{ nonce_limiter_info = Info }) ->
 	Info#nonce_limiter_info.global_step_number.
 
-get_packing(PackingDifficulty, MiningAddress) ->
+get_packing(PackingDifficulty, MiningAddress, 0) ->
 	case PackingDifficulty >= 1 of
 		true ->
 			{composite, MiningAddress, PackingDifficulty};
 		false ->
 			{spora_2_6, MiningAddress}
-	end.
+	end;
+get_packing(_PackingDifficulty, MiningAddress, 1) ->
+	{replica_2_9, MiningAddress}.
 
-validate_packing_difficulty(Height, PackingDifficulty) ->
-	case Height - ?LEGACY_PACKING_EXPIRATION_PERIOD_BLOCKS >= ar_fork:height_2_8() of
+validate_replica_format(Height, PackingDifficulty, 1) ->
+	Height >= ar_fork:height_2_9()
+			andalso PackingDifficulty == ?REPLICA_2_9_PACKING_DIFFICULTY;
+validate_replica_format(Height, 0, 0) ->
+	%% Support for spora_2_6 discontinued at
+	%% ar_fork:height_2_8() + ?SPORA_PACKING_EXPIRATION_PERIOD_BLOCKS.
+	Height - ?SPORA_PACKING_EXPIRATION_PERIOD_BLOCKS < ar_fork:height_2_8();
+validate_replica_format(Height, CompositePackingDifficulty, 0) ->
+	case Height - ?COMPOSITE_PACKING_EXPIRATION_PERIOD_BLOCKS < ar_fork:height_2_9() of
 		true ->
-			PackingDifficulty >= 1 andalso PackingDifficulty =< ?MAX_PACKING_DIFFICULTY;
+			%% Composite is still supported - difficulty 1 through 32
+			Height >= ar_fork:height_2_8()
+				andalso CompositePackingDifficulty =< ?MAX_PACKING_DIFFICULTY;
 		false ->
-			case Height >= ar_fork:height_2_8() of
-				true ->
-					validate_packing_difficulty(PackingDifficulty);
-				false ->
-					PackingDifficulty == 0
-			end
+			%% Composite packing is no longer supported.
+			false
 	end.
-
-validate_packing_difficulty(PackingDifficulty) ->
-	PackingDifficulty >= 0 andalso PackingDifficulty =< ?MAX_PACKING_DIFFICULTY.
 
 get_recall_range_size(0) ->
 	?LEGACY_RECALL_RANGE_SIZE;
@@ -582,7 +621,8 @@ get_nonces_per_recall_range(PackingDifficulty) ->
 
 %% @doc For packing difficulty 0 (aka spora_2_6 packing), there is one nonce per chunk, so
 %% the max nonce is the same as the max chunk number. For packing difficulty >= 1 (aka
-%% composite packing), there are ?COMPOSITE_PACKING_SUB_CHUNK_COUNT nonces per chunk.
+%% composite packing and the 2.9 replication), there are ?COMPOSITE_PACKING_SUB_CHUNK_COUNT
+%% nonces per chunk.
 get_max_nonce(PackingDifficulty) ->
 	%% The max(...) is included mostly for testing, where the recall range can be less than
 	%% a chunk.
@@ -594,6 +634,19 @@ get_sub_chunk_index(0, _Nonce) ->
 	-1;
 get_sub_chunk_index(_PackingDifficulty, Nonce) ->
 	Nonce rem ?COMPOSITE_PACKING_SUB_CHUNK_COUNT.
+
+%% @doc Return Offset if it is smaller than or equal to ?STRICT_DATA_SPLIT_THRESHOLD.
+%% Otherwise, return the offset of the last byte of the chunk + the size of the padding.
+-spec get_chunk_padded_offset(Offset :: non_neg_integer()) -> non_neg_integer().
+get_chunk_padded_offset(Offset) ->
+	case Offset > ?STRICT_DATA_SPLIT_THRESHOLD of
+		true ->
+			ar_poa:get_padded_offset(Offset, ?STRICT_DATA_SPLIT_THRESHOLD);
+		false ->
+			Offset
+	end.
+
+
 
 %%%===================================================================
 %%% Private functions.
@@ -768,10 +821,10 @@ test_hash_list_gen() ->
 	[B0] = ar_weave:init([]),
 	ar_test_node:start(B0),
 	ar_test_node:mine(),
-	BI1 = ar_test_node:wait_until_height(1),
+	BI1 = ar_test_node:wait_until_height(main, 1),
 	B1 = ar_storage:read_block(hd(BI1)),
 	ar_test_node:mine(),
-	BI2 = ar_test_node:wait_until_height(2),
+	BI2 = ar_test_node:wait_until_height(main, 2),
 	B2 = ar_storage:read_block(hd(BI2)),
 	?assertEqual([B0#block.indep_hash], generate_hash_list_for_block(B1, BI2)),
 	?assertEqual([H || {H, _, _} <- BI1],
@@ -950,3 +1003,60 @@ random_wallet() ->
 		rand:uniform(1000000000000000000),
 		crypto:strong_rand_bytes(32)
 	}.
+
+validate_replica_format_test_() ->
+	[
+		ar_test_node:test_with_mocked_functions([
+				{ar_fork, height_2_8, fun() -> 10 end},
+				{ar_fork, height_2_9, fun() -> 20 end}
+			],
+			fun test_validate_replica_format/0, 30)
+	].
+test_validate_replica_format() ->
+	%% pre 2.8, only spora_2_6 is supported
+	?assertEqual(true, validate_replica_format(0, 0, 0)),
+	?assertEqual(false, validate_replica_format(0, 1, 0)),
+	?assertEqual(false, validate_replica_format(0, 33, 0)),
+	?assertEqual(false, validate_replica_format(0, 25, 0)),
+	?assertEqual(false, validate_replica_format(0, 0, 1)),
+	?assertEqual(false, validate_replica_format(0, 1, 1)),
+	?assertEqual(false, validate_replica_format(0, 33, 1)),
+	?assertEqual(false, validate_replica_format(0, 25, 1)),
+	%% post-2.8, pre-2.9, spora_2_6 and composite are supported
+	?assertEqual(true, validate_replica_format(15, 0, 0)),
+	?assertEqual(true, validate_replica_format(15, 1, 0)),
+	?assertEqual(false, validate_replica_format(15, 33, 0)),
+	?assertEqual(false, validate_replica_format(15, 100, 0)),
+	?assertEqual(false, validate_replica_format(15, 0, 1)),
+	?assertEqual(false, validate_replica_format(15, 1, 1)),
+	?assertEqual(false, validate_replica_format(15, 33, 1)),
+	?assertEqual(false, validate_replica_format(15, 25, 1)),
+	%% post-2.9, pre-composite expiration
+	?assertEqual(true, validate_replica_format(25, 0, 0)),
+	?assertEqual(true, validate_replica_format(25, 1, 0)),
+	?assertEqual(false, validate_replica_format(25, 33, 0)),
+	?assertEqual(false, validate_replica_format(25, 100, 0)),
+	?assertEqual(false, validate_replica_format(25, 0, 1)),
+	?assertEqual(false, validate_replica_format(25, 1, 1)),
+	?assertEqual(false, validate_replica_format(25, 33, 1)),
+	?assertEqual(true, validate_replica_format(25, 2, 1)), %% 2 in tests.
+	%% post-2.9, post-composite expiration
+	CompositeExpiration = ar_fork:height_2_9() + ?COMPOSITE_PACKING_EXPIRATION_PERIOD_BLOCKS,
+	?assertEqual(true, validate_replica_format(CompositeExpiration, 0, 0)),
+	?assertEqual(false, validate_replica_format(CompositeExpiration, 1, 0)),
+	?assertEqual(false, validate_replica_format(CompositeExpiration, 33, 0)),
+	?assertEqual(false, validate_replica_format(CompositeExpiration, 25, 0)),
+	?assertEqual(false, validate_replica_format(CompositeExpiration, 0, 1)),
+	?assertEqual(false, validate_replica_format(CompositeExpiration, 1, 1)),
+	?assertEqual(false, validate_replica_format(CompositeExpiration, 33, 1)),
+	?assertEqual(true, validate_replica_format(CompositeExpiration, 2, 1)),
+	%% post-2.9, post-spora expiration
+	SporaExpiration = ar_fork:height_2_8() + ?SPORA_PACKING_EXPIRATION_PERIOD_BLOCKS,
+	?assertEqual(false, validate_replica_format(SporaExpiration, 0, 0)),
+	?assertEqual(false, validate_replica_format(SporaExpiration, 1, 0)),
+	?assertEqual(false, validate_replica_format(SporaExpiration, 33, 0)),
+	?assertEqual(false, validate_replica_format(SporaExpiration, 25, 0)),
+	?assertEqual(false, validate_replica_format(SporaExpiration, 0, 1)),
+	?assertEqual(false, validate_replica_format(SporaExpiration, 1, 1)),
+	?assertEqual(false, validate_replica_format(SporaExpiration, 33, 1)),
+	?assertEqual(true, validate_replica_format(SporaExpiration, 2, 1)).

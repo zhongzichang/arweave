@@ -19,7 +19,7 @@ validate_config(Config) ->
 	validate_storage_modules(Config) andalso
 	validate_repack_in_place(Config) andalso
 	validate_cm_pool(Config) andalso
-	validate_packing_difficulty(Config) andalso
+	validate_unique_replication_type(Config) andalso
 	validate_verify(Config).
 
 -spec set_dependent_flags(Config :: #config{}) -> #config{}.
@@ -249,6 +249,16 @@ parse_options([{<<"join_workers">>, N} | Rest], Config) when is_integer(N)->
 	parse_options(Rest, Config#config{ join_workers = N });
 parse_options([{<<"join_workers">>, Opt} | _], _) ->
 	{error, {bad_type, join_workers, number}, Opt};
+
+parse_options([{<<"packing_workers">>, N} | Rest], Config) when is_integer(N)->
+	parse_options(Rest, Config#config{ packing_workers = N });
+parse_options([{<<"packing_workers">>, Opt} | _], _) ->
+	{error, {bad_type, packing_workers, number}, Opt};
+
+parse_options([{<<"replica_2_9_workers">>, N} | Rest], Config) when is_integer(N)->
+	parse_options(Rest, Config#config{ replica_2_9_workers = N });
+parse_options([{<<"replica_2_9_workers">>, Opt} | _], _) ->
+	{error, {bad_type, replica_2_9_workers, number}, Opt};
 
 parse_options([{<<"diff">>, Diff} | Rest], Config) when is_integer(Diff) ->
 	parse_options(Rest, Config#config{ diff = Diff });
@@ -518,7 +528,9 @@ parse_options([{<<"disk_cache_size_mb">>, D} | Rest], Config) when is_integer(D)
 	parse_options(Rest, Config#config{ disk_cache_size = D });
 
 parse_options([{<<"packing_rate">>, D} | Rest], Config) when is_integer(D) ->
-	parse_options(Rest, Config#config{ packing_rate = D });
+	?LOG_WARNING("Deprecated option found 'packing_rate': "
+			" this option has been removed and is a no-op.", []),
+	parse_options(Rest, Config);
 
 parse_options([{<<"max_nonce_limiter_validation_thread_count">>, D} | Rest], Config)
 		when is_integer(D) ->
@@ -679,9 +691,10 @@ parse_options([{<<"rocksdb_wal_sync_interval">>, IntervalS} | Rest], Config)
 parse_options([{<<"rocksdb_wal_sync_interval">>, IntervalS} | _], _) ->
 	{error, {bad_type, rocksdb_wal_sync_interval, number}, IntervalS};
 
-parse_options([{<<"data_sync_request_packed_chunks">>, Bool} | Rest], Config) when is_boolean(Bool) ->
+parse_options([{<<"data_sync_request_packed_chunks">>, Bool} | Rest], Config)
+		when is_boolean(Bool) ->
 	parse_options(Rest, Config#config{ data_sync_request_packed_chunks = Bool });
-parse_options([{<<"data_sync_request_packed_chunks">>, InvalidValue} | Rest], Config) ->
+parse_options([{<<"data_sync_request_packed_chunks">>, InvalidValue} | _Rest], _Config) ->
 	{error, {bad_type, data_sync_request_packed_chunks, boolean}, InvalidValue};
 
 parse_options([Opt | _], _) ->
@@ -694,10 +707,13 @@ parse_storage_module(RangeNumber, RangeSize, PackingBin) ->
 		case PackingBin of
 			<<"unpacked">> ->
 				unpacked;
+			<< MiningAddr:43/binary, ".replica.2.9" >> ->
+				{replica_2_9, ar_util:decode(MiningAddr)};
 			<< MiningAddr:43/binary, ".", PackingDifficultyBin/binary >> ->
 				PackingDifficulty = binary_to_integer(PackingDifficultyBin),
 				true = PackingDifficulty >= 1
-						andalso PackingDifficulty =< ?MAX_PACKING_DIFFICULTY,
+						andalso PackingDifficulty =< ?MAX_PACKING_DIFFICULTY
+						andalso PackingDifficulty /= ?REPLICA_2_9_PACKING_DIFFICULTY,
 				{composite, ar_util:decode(MiningAddr), PackingDifficulty};
 			MiningAddr when byte_size(MiningAddr) == 43 ->
 				{spora_2_6, ar_util:decode(MiningAddr)}
@@ -705,6 +721,7 @@ parse_storage_module(RangeNumber, RangeSize, PackingBin) ->
 	{ok, {RangeSize, RangeNumber, Packing}}.
 
 parse_storage_module(RangeNumber, RangeSize, PackingBin, ToPackingBin) ->
+	%% We do not support repacking in place from the 2.9 replication format.
 	Packing =
 		case PackingBin of
 			<<"unpacked">> ->
@@ -721,6 +738,8 @@ parse_storage_module(RangeNumber, RangeSize, PackingBin, ToPackingBin) ->
 		case ToPackingBin of
 			<<"unpacked">> ->
 				unpacked;
+			<< ToMiningAddr:43/binary, ".replica.2.9" >> ->
+				{replica_2_9, ar_util:decode(ToMiningAddr)};
 			<< ToMiningAddr:43/binary, ".", ToPackingDifficultyBin/binary >> ->
 				ToPackingDifficulty = binary_to_integer(ToPackingDifficultyBin),
 				true = ToPackingDifficulty >= 1
@@ -866,7 +885,8 @@ log_config_value(start_from_block, FieldValue) ->
 log_config_value(storage_modules, FieldValue) ->
 	[format_storage_module(StorageModule) || StorageModule <- FieldValue];
 log_config_value(repack_in_place_storage_modules, FieldValue) ->
-	[format_storage_module(StorageModule) || {StorageModule, _} <- FieldValue];
+	[{format_storage_module(StorageModule), ar_serialize:encode_packing(ToPacking, false)}
+			|| {StorageModule, ToPacking} <- FieldValue];
 log_config_value(_, FieldValue) ->
 	FieldValue.
 
@@ -878,6 +898,8 @@ format_storage_module({RangeSize, RangeNumber, {spora_2_6, MiningAddress}}) ->
 	{RangeSize, RangeNumber, {spora_2_6, format_binary(MiningAddress)}};
 format_storage_module({RangeSize, RangeNumber, {composite, MiningAddress, PackingDiff}}) ->
 	{RangeSize, RangeNumber, {composite, format_binary(MiningAddress), PackingDiff}};
+format_storage_module({RangeSize, RangeNumber, {replica_2_9, MiningAddress}}) ->
+	{RangeSize, RangeNumber, {replica_2_9, format_binary(MiningAddress)}};
 format_storage_module(StorageModule) ->
 	StorageModule.
 
@@ -915,15 +937,25 @@ validate_repack_in_place(Config) ->
 
 validate_repack_in_place([], _Modules) ->
 	true;
-validate_repack_in_place([{Module, _ToPacking} | L], Modules) ->
+validate_repack_in_place([{Module, ToPacking} | L], Modules) ->
+	{_BucketSize, _Bucket, Packing} = Module,
 	ID = ar_storage_module:id(Module),
-	case lists:member(ID, Modules) of
-		true ->
+	ModuleInUse = lists:member(ID, Modules),
+	FromPackingType = ar_mining_server:get_packing_type(Packing),
+	ToPackingType = ar_mining_server:get_packing_type(ToPacking),
+	case {ModuleInUse, FromPackingType, ToPackingType} of
+		{true, _, _} ->
 			io:format("~nCannot use the storage module ~s "
 					"while it is being repacked in place.~n~n", [ID]),
 			false;
-		false ->
-			validate_repack_in_place(L, Modules)
+		{_, replica_2_9, _} ->
+			io:format("~nCannot repack in place from replica_2_9 to any format.~n~n"),
+			false;
+		{_, _, replica_2_9} ->
+			validate_repack_in_place(L, Modules);
+		_ ->
+			io:format("~nCan only repack in place to replica_2_9.~n~n"),
+			false
 	end.
 
 validate_cm_pool(Config) ->
@@ -952,15 +984,17 @@ validate_cm_pool(Config) ->
 	end,
 	A andalso B andalso C.
 
-validate_packing_difficulty(#config{ mine = false }) ->
+validate_unique_replication_type(#config{ mine = false }) ->
 	true;
-validate_packing_difficulty(Config) ->
+validate_unique_replication_type(Config) ->
 	MiningAddr = Config#config.mining_addr,
 	UniquePackingDifficulties = lists:foldl(
 		fun({_, _, {composite, Addr, Difficulty}}, Acc) when Addr =:= MiningAddr ->
-			sets:add_element(Difficulty, Acc);
+			sets:add_element({composite, Difficulty}, Acc);
 		({_, _, {spora_2_6, Addr}}, Acc) when Addr =:= MiningAddr ->
-			sets:add_element(0, Acc);
+			sets:add_element(spora_2_6, Acc);
+		({_, _, {replica_2_9, Addr}}, Acc) when Addr =:= MiningAddr ->
+			sets:add_element(replica_2_9, Acc);
 		(_, Acc) ->
 			Acc
 		end,
@@ -971,11 +1005,10 @@ validate_packing_difficulty(Config) ->
 		true ->
 			true;
 		false ->
-			io:format("~nThe node cannot mine multiple packing difficulties "
+			io:format("~nThe node cannot mine multiple replication types "
 					"for the same mining address.~n~n"),
 			false
 	end.
-
 
 validate_verify(#config{ verify = false }) ->
 	true;

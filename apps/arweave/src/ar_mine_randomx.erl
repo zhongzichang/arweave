@@ -4,9 +4,15 @@
 		randomx_encrypt_chunk/4,
 		randomx_decrypt_chunk/5,
 		randomx_decrypt_sub_chunk/5,
-		randomx_reencrypt_chunk/7]).
+		randomx_reencrypt_chunk/7,
 
-%% These exports are required for the DEBUG mode, where these functions are unused.
+		randomx_generate_replica_2_9_entropy/2,
+		randomx_encrypt_replica_2_9_sub_chunk/1,
+		randomx_decrypt_replica_2_9_sub_chunk/1,
+		randomx_decrypt_replica_2_9_sub_chunk2/1,
+		encipher_sub_chunk/2]).
+
+%% These exports are required for the STUB mode, where these functions are unused.
 %% Also, some of these functions are used in ar_mine_randomx_tests.
 -export([jit/0, large_pages/0, hardware_aes/0, init_fast2/5, init_light2/4]).
 
@@ -18,11 +24,11 @@
 %%% Public interface.
 %%%===================================================================
 
--ifdef(DEBUG).
+-ifdef(STUB_RANDOMX).
 init_fast(RxMode, Key, _Threads) ->
-	{RxMode, {debug_state, Key}}.
+	{RxMode, {stub_state, Key}}.
 init_light(RxMode, Key) ->
-	{RxMode, {debug_state, Key}}.
+	{RxMode, {stub_state, Key}}.
 -else.
 init_fast(RxMode, Key, Threads) ->
 	init_fast2(RxMode, Key, jit(), large_pages(), Threads).
@@ -97,10 +103,70 @@ randomx_reencrypt_chunk(SourcePacking, TargetPacking,
 	randomx_reencrypt_chunk2(SourcePacking, TargetPacking, 
 		RandomxState, UnpackKey, PackKey, Chunk, ChunkSize).
 
+%%% AR_TEST implementation
+randomx_generate_replica_2_9_entropy({_, {stub_state, _}}, Key) ->
+	%% Make it fast, deterministic, and scoped by Key.
+	%% Note that ?REPLICA_2_9_ENTROPY_SIZE is
+	%% reduced significantly in the AR_TEST mode.
+	SubChunkCount = ?REPLICA_2_9_ENTROPY_SIZE div ?COMPOSITE_PACKING_SUB_CHUNK_SIZE,
+	lists:foldl(
+		fun(N1, Acc) ->
+			lists:foldl(
+				fun(N2, Acc2) ->
+					<< (crypto:hash(sha256, << N1:16, N2:16, Key/binary >>))/binary,
+						Acc2/binary >>
+				end,
+				Acc,
+				lists:seq(1, ?COMPOSITE_PACKING_SUB_CHUNK_SIZE div 32)
+			)
+		end,
+		<<>>,
+		lists:seq(1, SubChunkCount)
+	);
+
+%% Non-AR_TEST implementation
+randomx_generate_replica_2_9_entropy({rxsquared, RandomxState}, Key) ->
+	{ok, EntropyFused} = ar_rxsquared_nif:rsp_fused_entropy_nif(
+		RandomxState,
+		?COMPOSITE_PACKING_SUB_CHUNK_COUNT,
+		?COMPOSITE_PACKING_SUB_CHUNK_SIZE,
+		?REPLICA_2_9_RANDOMX_LANE_COUNT,
+		?REPLICA_2_9_RANDOMX_DEPTH,
+		jit(),
+		large_pages(),
+		hardware_aes(),
+		?REPLICA_2_9_RANDOMX_PROGRAM_COUNT,
+		Key
+	),
+	EntropyFused.
+
+randomx_decrypt_replica_2_9_sub_chunk({PackingState, Key, SubChunk,
+		EntropySubChunkIndex}) ->
+	Entropy = randomx_generate_replica_2_9_entropy(PackingState, Key),
+	randomx_decrypt_replica_2_9_sub_chunk2({Entropy, SubChunk, EntropySubChunkIndex}).
+
+randomx_decrypt_replica_2_9_sub_chunk2({Entropy, SubChunk, EntropySubChunkIndex}) ->
+	SubChunkSize = ?COMPOSITE_PACKING_SUB_CHUNK_SIZE,
+	EntropyPart = binary:part(Entropy, EntropySubChunkIndex * SubChunkSize, SubChunkSize),
+	{ok, crypto:exor(SubChunk, EntropyPart)}.
+
+randomx_encrypt_replica_2_9_sub_chunk(
+		{_PackingState, Entropy, SubChunk, EntropySubChunkIndex}) ->
+	SubChunkSize = ?COMPOSITE_PACKING_SUB_CHUNK_SIZE,
+	EntropyPart = binary:part(Entropy, EntropySubChunkIndex * SubChunkSize, SubChunkSize),
+	{ok, encipher_sub_chunk(SubChunk, EntropyPart)}.
+
+%% @doc Encipher the given sub-chunk using the given 2.9 entropy.
+-spec encipher_sub_chunk(
+		SubChunk :: binary(),
+		EntropyPart :: binary()
+) -> binary().
+encipher_sub_chunk(SubChunk, EntropyPart) ->
+	crypto:exor(SubChunk, EntropyPart).
+
 %%%===================================================================
 %%% Private functions.
 %%%===================================================================
-
 
 %% -------------------------------------------------------------------------------------------
 %% Helper functions
@@ -152,6 +218,9 @@ init_fast2(rx512, Key, JIT, LargePages, Threads) ->
 init_fast2(rx4096, Key, JIT, LargePages, Threads) ->
 	{ok, FastState} = ar_rx4096_nif:rx4096_init_nif(Key, ?RANDOMX_HASHING_MODE_FAST, JIT, LargePages, Threads),
 	{rx4096, FastState};
+init_fast2(rxsquared, Key, JIT, LargePages, Threads) ->
+	{ok, FastState} = ar_rxsquared_nif:rxsquared_init_nif(Key, ?RANDOMX_HASHING_MODE_FAST, JIT, LargePages, Threads),
+	{rxsquared, FastState};
 init_fast2(RxMode, _Key, _JIT, _LargePages, _Threads) ->
 	?LOG_ERROR([{event, invalid_randomx_mode}, {mode, RxMode}]),
 	{error, invalid_randomx_mode}.
@@ -161,6 +230,9 @@ init_light2(rx512, Key, JIT, LargePages) ->
 init_light2(rx4096, Key, JIT, LargePages) ->
 	{ok, LightState} = ar_rx4096_nif:rx4096_init_nif(Key, ?RANDOMX_HASHING_MODE_LIGHT, JIT, LargePages, 0),
 	{rx4096, LightState};
+init_light2(rxsquared, Key, JIT, LargePages) ->
+	{ok, LightState} = ar_rxsquared_nif:rxsquared_init_nif(Key, ?RANDOMX_HASHING_MODE_LIGHT, JIT, LargePages, 0),
+	{rxsquared, LightState};
 init_light2(RxMode, _Key, _JIT, _LargePages) ->
 	?LOG_ERROR([{event, invalid_randomx_mode}, {mode, RxMode}]),
 	{exceperrortion, invalid_randomx_mode}.
@@ -169,30 +241,35 @@ info2({rx512, State}) ->
 	ar_rx512_nif:rx512_info_nif(State);
 info2({rx4096, State}) ->
 	ar_rx4096_nif:rx4096_info_nif(State);
+info2({rxsquared, State}) ->
+	ar_rxsquared_nif:rxsquared_info_nif(State);
 info2(_) ->
 	{error, invalid_randomx_mode}.
 
 %% -------------------------------------------------------------------------------------------
 %% hash2 and randomx_[encrypt|decrypt|reencrypt]_chunk2
-%% DEBUG implementation, used in tests, is called when State is {debug_state, Key}
+%% STUB implementation, used in tests, is called when State is {stub_state, Key}
 %% Otherwise, NIF implementation is used
 %% We set it up this way so that we can have some tests trigger the NIF implementation
 %% -------------------------------------------------------------------------------------------
-%% DEBUG implementation
-hash2({_, {debug_state, Key}}, Data, _JIT, _LargePages, _HardwareAES) ->
+%% STUB implementation
+hash2({_, {stub_state, Key}}, Data, _JIT, _LargePages, _HardwareAES) ->
 	crypto:hash(sha256, << Key/binary, Data/binary >>);
-%% Non-DEBUG implementation
+%% Non-STUB implementation
 hash2({rx512, State}, Data, JIT, LargePages, HardwareAES) ->
 	{ok, Hash} = ar_rx512_nif:rx512_hash_nif(State, Data, JIT, LargePages, HardwareAES),
 	Hash;
 hash2({rx4096, State}, Data, JIT, LargePages, HardwareAES) ->
 	{ok, Hash} = ar_rx4096_nif:rx4096_hash_nif(State, Data, JIT, LargePages, HardwareAES),
 	Hash;
+hash2({rxsquared, State}, Data, JIT, LargePages, HardwareAES) ->
+	{ok, Hash} = ar_rxsquared_nif:rxsquared_hash_nif(State, Data, JIT, LargePages, HardwareAES),
+	Hash;
 hash2(_BadState, _Data, _JIT, _LargePages, _HardwareAES) ->
 	{error, invalid_randomx_mode}.
 
-%% DEBUG implementation
-randomx_decrypt_chunk2({_, {debug_state, _}}, Key, Chunk, _ChunkSize,
+%% STUB implementation
+randomx_decrypt_chunk2({_, {stub_state, _}}, Key, Chunk, _ChunkSize,
 		{composite, _, PackingDifficulty} = _Packing) ->
 	Options = [{encrypt, false}],
 	IV = binary:part(Key, {0, 16}),
@@ -209,11 +286,11 @@ randomx_decrypt_chunk2({_, {debug_state, _}}, Key, Chunk, _ChunkSize,
 			)
 		end,
 		SubChunks))};
-randomx_decrypt_chunk2({_, {debug_state, _}}, Key, Chunk, _ChunkSize, _Packing) ->
+randomx_decrypt_chunk2({_, {stub_state, _}}, Key, Chunk, _ChunkSize, _Packing) ->
 	Options = [{encrypt, false}],
 	IV = binary:part(Key, {0, 16}),
 	{ok, crypto:crypto_one_time(aes_256_cbc, Key, IV, Chunk, Options)};
-%% Non-DEBUG implementation
+%% Non-STUB implementation
 randomx_decrypt_chunk2({rx512, RandomxState}, Key, Chunk, ChunkSize, spora_2_5) ->
 	ar_rx512_nif:rx512_decrypt_chunk_nif(RandomxState, Key, Chunk, ChunkSize, ?RANDOMX_PACKING_ROUNDS,
 			jit(), large_pages(), hardware_aes());
@@ -228,8 +305,8 @@ randomx_decrypt_chunk2({rx4096, RandomxState}, Key, Chunk, ChunkSize,
 randomx_decrypt_chunk2(_BadState, _Key, _Chunk, _ChunkSize, _Packing) ->
 	{error, invalid_randomx_mode}.
 
-%% DEBUG implementation
-randomx_decrypt_sub_chunk2(Packing, {_, {debug_state, _}}, Key, Chunk, SubChunkStartOffset) ->
+%% STUB implementation
+randomx_decrypt_sub_chunk2(Packing, {_, {stub_state, _}}, Key, Chunk, SubChunkStartOffset) ->
 	{_, _, Iterations} = Packing,
 	Options = [{encrypt, false}],
 	Key2 = crypto:hash(sha256, << Key/binary, SubChunkStartOffset:24 >>),
@@ -237,7 +314,7 @@ randomx_decrypt_sub_chunk2(Packing, {_, {debug_state, _}}, Key, Chunk, SubChunkS
 	{ok, lists:foldl(fun(_, Acc) ->
 			crypto:crypto_one_time(aes_256_cbc, Key2, IV, Acc, Options)
 		end, Chunk, lists:seq(1, Iterations))};
-%% Non-DEBUG implementation
+%% Non-STUB implementation
 randomx_decrypt_sub_chunk2(Packing, {rx4096, RandomxState}, Key, Chunk, SubChunkStartOffset) ->
 	{_, _, IterationCount} = Packing,
 	RoundCount = ?COMPOSITE_PACKING_ROUND_COUNT,
@@ -247,8 +324,8 @@ randomx_decrypt_sub_chunk2(Packing, {rx4096, RandomxState}, Key, Chunk, SubChunk
 randomx_decrypt_sub_chunk2(_Packing, _BadState, _Key, _Chunk, _SubChunkStartOffset) ->
 	{error, invalid_randomx_mode}.
 
-%% DEBUG implementation
-randomx_encrypt_chunk2({composite, _, PackingDifficulty} = _Packing, {_, {debug_state, _}}, Key, Chunk) ->
+%% STUB implementation
+randomx_encrypt_chunk2({composite, _, PackingDifficulty} = _Packing, {_, {stub_state, _}}, Key, Chunk) ->
 	Options = [{encrypt, true}, {padding, zero}],
 	IV = binary:part(Key, {0, 16}),
 	SubChunks = split_into_sub_chunks(ar_packing_server:pad_chunk(Chunk)),
@@ -264,12 +341,12 @@ randomx_encrypt_chunk2({composite, _, PackingDifficulty} = _Packing, {_, {debug_
 				)
 			end,
 			SubChunks))};
-randomx_encrypt_chunk2(_Packing, {_, {debug_state, _}}, Key, Chunk) ->
+randomx_encrypt_chunk2(_Packing, {_, {stub_state, _}}, Key, Chunk) ->
 	Options = [{encrypt, true}, {padding, zero}],
 	IV = binary:part(Key, {0, 16}),
 	{ok, crypto:crypto_one_time(aes_256_cbc, Key, IV,
 			ar_packing_server:pad_chunk(Chunk), Options)};
-%% Non-DEBUG implementation
+%% Non-STUB implementation
 randomx_encrypt_chunk2(spora_2_5, {rx512, RandomxState}, Key, Chunk) ->
 	ar_rx512_nif:rx512_encrypt_chunk_nif(RandomxState, Key, Chunk, ?RANDOMX_PACKING_ROUNDS,
 			jit(), large_pages(), hardware_aes());
@@ -283,16 +360,16 @@ randomx_encrypt_chunk2({composite, _Addr, PackingDifficulty}, {rx4096, RandomxSt
 randomx_encrypt_chunk2(_Packing, _BadState, _Key, _Chunk) ->
 	{error, invalid_randomx_mode}.
 
-%% DEBUG implementation
+%% STUB implementation
 randomx_reencrypt_chunk2(SourcePacking, TargetPacking,
-		{_, {debug_state, _}} = State, UnpackKey, PackKey, Chunk, ChunkSize) ->
+		{_, {stub_state, _}} = State, UnpackKey, PackKey, Chunk, ChunkSize) ->
 	case randomx_decrypt_chunk(SourcePacking, State, UnpackKey, Chunk, ChunkSize) of
 		{ok, UnpackedChunk} ->
 			{ok, RepackedChunk} = randomx_encrypt_chunk2(TargetPacking, State, PackKey,
 					ar_packing_server:pad_chunk(UnpackedChunk)),
 			case {SourcePacking, TargetPacking} of
 				{{composite, Addr, _}, {composite, Addr, _}} ->
-					%% See the same function defined for the no-DEBUG mode.
+					%% See the same function defined for the non-STUB mode.
 					{ok, RepackedChunk, none};
 				_ ->
 					{ok, RepackedChunk, UnpackedChunk}
@@ -300,7 +377,7 @@ randomx_reencrypt_chunk2(SourcePacking, TargetPacking,
 		Error ->
 			Error
 	end;
-%% Non-DEBUG implementation
+%% Non-STUB implementation
 randomx_reencrypt_chunk2({composite, Addr1, PackingDifficulty1},
 		{composite, Addr2, PackingDifficulty2},
 		{rx4096, RandomxState}, UnpackKey, PackKey, Chunk, ChunkSize) ->

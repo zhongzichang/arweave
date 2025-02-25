@@ -6,10 +6,10 @@
 	block_passes_diff_check/1, block_passes_diff_check/2, passes_diff_check/4,
 	update_account/6, is_account_banned/2]).
 
--include_lib("arweave/include/ar.hrl").
--include_lib("arweave/include/ar_pricing.hrl").
--include_lib("arweave/include/ar_consensus.hrl").
--include_lib("arweave/include/ar_mining.hrl").
+-include("../include/ar.hrl").
+-include("../include/ar_pricing.hrl").
+-include("../include/ar_consensus.hrl").
+-include("../include/ar_mining.hrl").
 
 -include_lib("eunit/include/eunit.hrl").
 
@@ -248,10 +248,23 @@ may_be_apply_double_signing_proof(B, PrevB, Accounts) ->
 			may_be_apply_double_signing_proof2(B, PrevB, Accounts)
 	end.
 
+get_reward_key(Pub, Height) ->
+	case Height >= ar_fork:height_2_9() of
+		false ->
+			{?DEFAULT_KEY_TYPE, Pub};
+		true ->
+			case byte_size(Pub) of
+				?ECDSA_PUB_KEY_SIZE ->
+					{?ECDSA_KEY_TYPE, Pub};
+				_ ->
+					{?RSA_KEY_TYPE, Pub}
+			end
+	end.
+
 may_be_apply_double_signing_proof2(B, PrevB, Accounts) ->
 	{Pub, _Signature1, _CDiff1, _PrevCDiff1, _Preimage1, _Signature2, _CDiff2, _PrevCDiff2,
 			_Preimage2} = B#block.double_signing_proof,
-	Key = {?DEFAULT_KEY_TYPE, Pub},
+	Key = get_reward_key(Pub, B#block.height),
 	case B#block.reward_key == Key of
 		true ->
 			{error, invalid_double_signing_proof_same_address};
@@ -272,22 +285,19 @@ may_be_apply_double_signing_proof2(B, PrevB, Accounts) ->
 	end.
 
 may_be_apply_double_signing_proof3(B, PrevB, Accounts) ->
+	#block{ height = Height } = B,
 	{Pub, Signature1, CDiff1, PrevCDiff1, Preimage1, Signature2, CDiff2, PrevCDiff2,
 			Preimage2} = B#block.double_signing_proof,
-	EncodedCDiff1 = ar_serialize:encode_int(CDiff1, 16),
-	EncodedPrevCDiff1 = ar_serialize:encode_int(PrevCDiff1, 16),
-	SignaturePreimage1 = << EncodedCDiff1/binary, EncodedPrevCDiff1/binary,
-			Preimage1/binary >>,
-	Key = {?DEFAULT_KEY_TYPE, Pub},
+	SignaturePreimage1 = ar_block:get_block_signature_preimage(CDiff1, PrevCDiff1,
+			Preimage1, Height),
+	Key = get_reward_key(Pub, B#block.height),
 	Addr = ar_wallet:to_address(Key),
 	case ar_wallet:verify(Key, SignaturePreimage1, Signature1) of
 		false ->
 			{error, invalid_double_signing_proof_invalid_signature};
 		true ->
-			EncodedCDiff2 = ar_serialize:encode_int(CDiff2, 16),
-			EncodedPrevCDiff2 = ar_serialize:encode_int(PrevCDiff2, 16),
-			SignaturePreimage2 = << EncodedCDiff2/binary,
-					EncodedPrevCDiff2/binary, Preimage2/binary >>,
+			SignaturePreimage2 = ar_block:get_block_signature_preimage(CDiff2, PrevCDiff2,
+					Preimage2, Height),
 			case ar_wallet:verify(Key, SignaturePreimage2, Signature2) of
 				false ->
 					{error, invalid_double_signing_proof_invalid_signature};
@@ -295,7 +305,7 @@ may_be_apply_double_signing_proof3(B, PrevB, Accounts) ->
 					?LOG_INFO([{event, banning_account},
 							{address, ar_util:encode(Addr)},
 							{previous_block, ar_util:encode(B#block.previous_block)},
-							{height, B#block.height}]),
+							{height, Height}]),
 					{ok, ban_account(Addr, Accounts, PrevB#block.denomination)}
 			end
 	end.
@@ -320,7 +330,7 @@ update_accounts4(B, PrevB, Accounts, Args) ->
 			update_accounts5(B, Accounts, Args);
 		Proof ->
 			Denomination = PrevB#block.denomination,
-			BannedAddr = ar_wallet:to_address({?DEFAULT_KEY_TYPE, element(1, Proof)}),
+			BannedAddr = ar_wallet:hash_pub_key(element(1, Proof)),
 			Sum = ar_rewards:get_total_reward_for_address(BannedAddr, PrevB) - 1,
 			{Dividend, Divisor} = ?DOUBLE_SIGNING_PROVER_REWARD_SHARE,
 			LockedRewards = ar_rewards:get_locked_rewards(PrevB),
@@ -635,7 +645,7 @@ validate_block(merkle_rebase_support_threshold, {NewB, OldB}) ->
 			end
 	end.
 
--ifdef(DEBUG).
+-ifdef(AR_TEST).
 is_wallet_invalid(#tx{ signature = <<>> }, _Wallets) ->
 	false;
 is_wallet_invalid(#tx{ owner = Owner, signature_type = SigType }, Wallets) ->
@@ -698,9 +708,9 @@ test_block_validation() ->
 			data => crypto:strong_rand_bytes(10 * 1024 * 1024) }),
 	ar_test_node:assert_post_tx_to_peer(main, PrevTX),
 	ar_test_node:mine(),
-	[_ | _] = ar_test_node:wait_until_height(1),
+	[_ | _] = ar_test_node:wait_until_height(main, 1),
 	ar_test_node:mine(),
-	[{PrevH, _, _} | _ ] = ar_test_node:wait_until_height(2),
+	[{PrevH, _, _} | _ ] = ar_test_node:wait_until_height(main, 2),
 	PrevB = ar_node:get_block_shadow_from_cache(PrevH),
 	BI = ar_node:get_block_index(),
 	PartitionUpperBound = ar_node:get_partition_upper_bound(BI),
@@ -710,7 +720,7 @@ test_block_validation() ->
 			data => crypto:strong_rand_bytes(7 * 1024 * 1024), last_tx => PrevH }),
 	ar_test_node:assert_post_tx_to_peer(main, TX),
 	ar_test_node:mine(),
-	[{H, _, _} | _] = ar_test_node:wait_until_height(3),
+	[{H, _, _} | _] = ar_test_node:wait_until_height(main, 3),
 	B = ar_node:get_block_shadow_from_cache(H),
 	Wallets = #{ ar_wallet:to_address(Pub) => {?AR(200), <<>>} },
 	?assertEqual(valid, validate(B, PrevB, Wallets, BlockAnchors, RecentTXMap,
@@ -769,7 +779,7 @@ test_block_validation() ->
 	BlockAnchors2 = ar_node:get_block_anchors(),
 	RecentTXMap2 = ar_node:get_recent_txs_map(),
 	ar_test_node:mine(),
-	[{H2, _, _} | _ ] = ar_test_node:wait_until_height(4),
+	[{H2, _, _} | _ ] = ar_test_node:wait_until_height(main, 4),
 	B2 = ar_node:get_block_shadow_from_cache(H2),
 	?assertEqual(valid, validate(B2, B, Wallets, BlockAnchors2, RecentTXMap2,
 			PartitionUpperBound2)).
@@ -824,7 +834,7 @@ test_update_accounts_receives_released_reward_and_prover_reward() ->
 	Key = ar_wallet:new(),
 	Pub = element(2, element(2, Key)),
 	Random = crypto:strong_rand_bytes(64),
-	Preimage = << (ar_serialize:encode_int(1, 16))/binary,
+	Preimage = << 0:256, (ar_serialize:encode_int(1, 16))/binary,
 			(ar_serialize:encode_int(1, 16))/binary, Random/binary >>,
 	Sig1 = ar_wallet:sign(element(1, Key), Preimage),
 	Sig2 = ar_wallet:sign(element(1, Key), Preimage),
@@ -856,7 +866,7 @@ test_update_accounts_does_not_let_banned_account_take_reward() ->
 	Key = ar_wallet:new(),
 	Pub = element(2, element(2, Key)),
 	Random = crypto:strong_rand_bytes(64),
-	Preimage = << (ar_serialize:encode_int(1, 16))/binary,
+	Preimage = << 0:256, (ar_serialize:encode_int(1, 16))/binary,
 			(ar_serialize:encode_int(1, 16))/binary, Random/binary >>,
 	Sig1 = ar_wallet:sign(element(1, Key), Preimage),
 	Sig2 = ar_wallet:sign(element(1, Key), Preimage),

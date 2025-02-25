@@ -9,7 +9,7 @@
 
 %% The mainnet name. Does not change at the hard forks.
 -ifndef(NETWORK_NAME).
-	-ifdef(DEBUG).
+	-ifdef(AR_TEST).
 		-define(NETWORK_NAME, "arweave.localtest").
 	-else.
 		-define(NETWORK_NAME, "arweave.N.1").
@@ -27,7 +27,7 @@
 -define(CLIENT_VERSION, 5).
 
 %% The current build number -- incremented for every release.
--define(RELEASE_NUMBER, 75).
+-define(RELEASE_NUMBER, 80).
 
 -define(DEFAULT_REQUEST_HEADERS,
 	[
@@ -66,6 +66,13 @@
 %% The default key type used by transactions that do not specify a signature type.
 -define(DEFAULT_KEY_TYPE, {?RSA_SIGN_ALG, 65537}).
 
+-define(RSA_KEY_TYPE, {?RSA_SIGN_ALG, 65537}).
+-define(ECDSA_KEY_TYPE, {?ECDSA_SIGN_ALG, secp256k1}).
+
+-define(RSA_BLOCK_SIG_SIZE, 512).
+-define(ECDSA_PUB_KEY_SIZE, 33).
+-define(ECDSA_SIG_SIZE, 65).
+
 %% The difficulty a new weave is started with.
 -define(DEFAULT_DIFF, 6).
 
@@ -101,14 +108,14 @@
 
 %% How far into the past or future the block can be in order to be accepted for
 %% processing.
--ifdef(DEBUG).
+-ifdef(AR_TEST).
 -define(STORE_BLOCKS_BEHIND_CURRENT, 10).
 -else.
 -define(STORE_BLOCKS_BEHIND_CURRENT, 50).
 -endif.
 
 %% The maximum lag when fork recovery (chain reorganisation) is performed.
--ifdef(DEBUG).
+-ifdef(AR_TEST).
 -define(CHECKPOINT_DEPTH, 4).
 -else.
 -define(CHECKPOINT_DEPTH, 18).
@@ -116,21 +123,23 @@
 
 %% The recommended depth of the block to use as an anchor for transactions.
 %% The corresponding block hash is returned by the GET /tx_anchor endpoint.
--ifdef(DEBUG).
+-ifdef(AR_TEST).
 -define(SUGGESTED_TX_ANCHOR_DEPTH, 5).
 -else.
 -define(SUGGESTED_TX_ANCHOR_DEPTH, 6).
 -endif.
 
 %% The number of blocks returned in the /info 'recent' field
--ifdef(DEBUG).
+-ifdef(AR_TEST).
 -define(RECENT_BLOCKS_WITHOUT_TIMESTAMP, 2).
 -else.
 -define(RECENT_BLOCKS_WITHOUT_TIMESTAMP, 5).
 -endif.
 
-%% How long to wait before giving up on test(s).
--define(TEST_TIMEOUT, 90 * 60).
+%% How long to wait before giving up on unit test(s).
+-define(TEST_TIMEOUT, 90 * 60). %% 90 minutes
+%% How long to wait before giving up on e2e test(s).
+-define(E2E_TEST_TIMEOUT, 6 * 60 * 60). %% 6 hours
 
 %% The maximum byte size of a single POST body.
 -define(MAX_BODY_SIZE, 15 * 1024 * 1024).
@@ -145,7 +154,7 @@
 -define(BLOCK_TX_DATA_SIZE_LIMIT, ?TX_DATA_SIZE_LIMIT).
 
 %% The maximum number of transactions (both format=1 and format=2) in a block.
--ifdef(DEBUG).
+-ifdef(AR_TEST).
 -define(BLOCK_TX_COUNT_LIMIT, 10).
 -else.
 -define(BLOCK_TX_COUNT_LIMIT, 1000).
@@ -169,7 +178,7 @@
 %% The maximum allowed size of transaction headers stored in mempool.
 %% The data field of a format=1 transaction is considered to belong to
 %% its headers.
--ifdef(DEBUG).
+-ifdef(AR_TEST).
 -define(MEMPOOL_HEADER_SIZE_LIMIT, 50 * 1024 * 1024).
 -else.
 -define(MEMPOOL_HEADER_SIZE_LIMIT, 250 * 1024 * 1024).
@@ -178,7 +187,7 @@
 %% The maximum allowed size of transaction data stored in mempool.
 %% The format=1 transactions are not counted as their data is considered
 %% to be part of the header.
--ifdef(DEBUG).
+-ifdef(AR_TEST).
 -define(MEMPOOL_DATA_SIZE_LIMIT, 50 * 1024 * 1024).
 -else.
 -define(MEMPOOL_DATA_SIZE_LIMIT, 500 * 1024 * 1024).
@@ -209,7 +218,7 @@
 -define(BAD_BLOCK_BAN_TIME, 24 * 60 * 60).
 
 %% A part of transaction propagation delay independent from the size, in seconds.
--ifdef(DEBUG).
+-ifdef(AR_TEST).
 -define(BASE_TX_PROPAGATION_DELAY, 0).
 -else.
 -ifndef(BASE_TX_PROPAGATION_DELAY).
@@ -221,7 +230,7 @@
 %% estimate the transaction propagation delay. It does not include
 %% the base delay, the time the transaction spends in the priority
 %% queue, and the time it takes to propagate the transaction to peers.
--ifdef(DEBUG).
+-ifdef(AR_TEST).
 -define(TX_PROPAGATION_BITS_PER_SECOND, 1000000000).
 -else.
 -define(TX_PROPAGATION_BITS_PER_SECOND, 3000000). % 3 mbps
@@ -256,9 +265,6 @@
 %% Transaction headers directory, relative to the disk cache directory.
 -define(DISK_CACHE_TX_DIR, "txs").
 
-%% Directory with files indicating completed storage migrations, relative to the data dir.
--define(STORAGE_MIGRATIONS_DIR, "data/storage_migrations").
-
 %% Backup block hash list storage directory, relative to the data dir.
 -define(HASH_LIST_DIR, "hash_lists").
 
@@ -291,7 +297,7 @@
 
 %% The adjustment of difficutly going from SHA-384 to RandomX.
 -define(RANDOMX_DIFF_ADJUSTMENT, (-14)).
--ifdef(DEBUG).
+-ifdef(AR_TEST).
 -define(RANDOMX_KEY_SWAP_FREQ, (?STORE_BLOCKS_BEHIND_CURRENT + 1)).
 -define(RANDOMX_MIN_KEY_GEN_AHEAD, 1).
 -define(RANDOMX_MAX_KEY_GEN_AHEAD, 4).
@@ -335,7 +341,7 @@
 -define(NOTE_SIZE, 32).
 
 %% Disk cache size in MB
--ifdef(DEBUG).
+-ifdef(AR_TEST).
 -define(DISK_CACHE_SIZE, 1).
 -define(DISK_CACHE_CLEAN_PERCENT_MAX, 20).
 -else.
@@ -344,7 +350,7 @@
 -endif.
 
 %% The speed in chunks/s of moving the fork 2.5 packing threshold.
--ifdef(DEBUG).
+-ifdef(AR_TEST).
 -define(PACKING_2_5_THRESHOLD_CHUNKS_PER_SECOND, 1).
 -else.
 -define(PACKING_2_5_THRESHOLD_CHUNKS_PER_SECOND, 10).
@@ -357,10 +363,14 @@
 %% picked as recall chunks and therefore equally incentivize the storage.
 -define(PADDING_NODE_DATA_ROOT, <<>>).
 
--ifdef(DEBUG).
--define(INITIAL_VDF_DIFFICULTY, 2).
--else.
+-ifndef(INITIAL_VDF_DIFFICULTY).
 -define(INITIAL_VDF_DIFFICULTY, 600_000).
+-endif.
+
+%% By default we prevent syncing replica 2.9 chunks since they are too expensive to unpack.
+%% This flag will also enable the global sync record filtering.
+-ifndef(BLOCK_2_9_SYNCING).
+-define(BLOCK_2_9_SYNCING, true).
 -endif.
 
 %% @doc A chunk with the proofs of its presence in the weave at a particular offset.
@@ -655,6 +665,11 @@
 	%%
 	%% When packing_difficulty >= 1, both poa1 and poa2 contain the unpacked chunks.
 	%% The values of the "chunk" fields are now 8192-byte packed sub-chunks.
+	%%
+	%% If the block is associated with the new replication format (replica_format=1,)
+	%% the packing difficulty is constant and determines the number of nonces
+	%% (also, sub-chunks) in the recall range and their mining difficulty, in line with
+	%% the chosen computational difficulty of the entropy computation.
 	packing_difficulty = 0,
 	%% The SHA2-256 of the unpacked 0-padded (if less than 256 KiB) chunk.
 	%% undefined when packing_difficulty == 0, has a value otherwise.
@@ -663,6 +678,10 @@
 	%% undefined when packing_difficulty == 0 or recall_byte2 == undefined,
 	%% has a value otherwise.
 	unpacked_chunk2_hash,
+
+	%% The replica format 0 is the inefficient "packing" where every chunk is packed
+	%% independently. The replica format 1 is new the blazing fast replication format.
+	replica_format = 0,
 
 	%% Used internally, not gossiped. Convenient for validating potentially non-unique
 	%% merkle proofs assigned to the different signatures of the same solution

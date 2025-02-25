@@ -4,13 +4,13 @@
 
 -export([execute/2, read_body_chunk/4]).
 
--include_lib("arweave/include/ar.hrl").
--include_lib("arweave/include/ar_config.hrl").
--include_lib("arweave/include/ar_mining.hrl").
--include_lib("arweave/include/ar_data_sync.hrl").
--include_lib("arweave/include/ar_data_discovery.hrl").
+-include("../include/ar.hrl").
+-include("../include/ar_config.hrl").
+-include("../include/ar_mining.hrl").
+-include("../include/ar_data_sync.hrl").
+-include("../include/ar_data_discovery.hrl").
 
--include_lib("arweave/include/ar_pool.hrl").
+-include("../include/ar_pool.hrl").
 
 
 -define(HANDLER_TIMEOUT, 55000).
@@ -292,7 +292,7 @@ handle(<<"GET">>, [<<"tx">>, Hash, << "data.", _/binary >>], Req, _Pid) ->
 				{ok, ID} ->
 					case ar_storage:read_tx(ID) of
 						unavailable ->
-							{404, #{ <<"content-type">> => <<"text/html; charset=utf-8">> }, sendfile("data/not_found.html"), Req};
+							{404, #{ <<"content-type">> => <<"text/html; charset=utf-8">> }, sendfile("genesis_data/not_found.html"), Req};
 						#tx{} = TX ->
 							serve_tx_html_data(Req, TX)
 					end
@@ -559,12 +559,18 @@ handle(<<"POST">>, [<<"wallet">>], Req, _Pid) ->
 	case check_internal_api_secret(Req) of
 		pass ->
 			WalletAccessCode = ar_util:encode(crypto:strong_rand_bytes(32)),
-			{_, Pub} = ar_wallet:new_keyfile(?DEFAULT_KEY_TYPE, WalletAccessCode),
-			ResponseProps = [
-				{<<"wallet_address">>, ar_util:encode(ar_wallet:to_address(Pub))},
-				{<<"wallet_access_code">>, WalletAccessCode}
-			],
-			{200, #{}, ar_serialize:jsonify({ResponseProps}), Req};
+			case ar_wallet:new_keyfile(?DEFAULT_KEY_TYPE, WalletAccessCode) of
+				{error, Reason} ->
+					?LOG_ERROR([{event, failed_to_create_new_wallet},
+							{reason, io_lib:format("~p", [Reason])}]),
+					{500, #{}, <<>>, Req};
+				{_, Pub} ->
+					ResponseProps = [
+						{<<"wallet_address">>, ar_util:encode(ar_wallet:to_address(Pub))},
+						{<<"wallet_access_code">>, WalletAccessCode}
+					],
+					{200, #{}, ar_serialize:jsonify({ResponseProps}), Req}
+			end;
 		{reject, {Status, Headers, Body}} ->
 			{Status, Headers, Body, Req}
 	end;
@@ -1660,7 +1666,7 @@ serve_tx_data(Req, #tx{ format = 2, id = ID, data_size = DataSize } = TX) ->
 				{error, not_found} when DataSize == 0 ->
         	{200, #{}, <<>>, Req};
 				{error, not_found} ->
-					{404, #{ <<"content-type">> => <<"text/html; charset=utf-8">> }, sendfile("data/not_found.html"), Req};
+					{404, #{ <<"content-type">> => <<"text/html; charset=utf-8">> }, sendfile("genesis_data/not_found.html"), Req};
 				{error, timeout} ->
 					{503, #{}, jiffy:encode(#{ error => timeout }), Req}
 			end
@@ -1694,7 +1700,7 @@ serve_format_2_html_data(Req, ContentType, TX) ->
 				{error, not_found} when TX#tx.data_size == 0 ->
         	{200, #{ <<"content-type">> => ContentType }, <<>>, Req};
 				{error, not_found} ->
-					{404, #{ <<"content-type">> => <<"text/html; charset=utf-8">> }, sendfile("data/not_found.html"), Req};
+					{404, #{ <<"content-type">> => <<"text/html; charset=utf-8">> }, sendfile("genesis_data/not_found.html"), Req};
 				{error, timeout} ->
 					{503, #{}, jiffy:encode(#{ error => timeout }), Req}
 			end
@@ -1940,7 +1946,7 @@ handle_post_tx_accepted(Req, TX, Peer) ->
 	ar_peers:rate_gossiped_data(Peer, tx,
 		erlang:convert_time_unit(BodyReadTime, native, microsecond),
 		byte_size(term_to_binary(TX))),
-	ar_events:send(tx, {new, TX, Peer}),
+	ar_events:send(tx, {new, TX, {pushed, Peer}}),
 	TXID = TX#tx.id,
 	ar_ignore_registry:remove_temporary(TXID),
 	ar_ignore_registry:add_temporary(TXID, 10 * 60 * 1000),
@@ -2001,9 +2007,16 @@ handle_get_chunk(OffsetBinary, Req, Encoding) ->
 						case ar_sync_record:is_recorded(Offset, ar_data_sync) of
 							false ->
 								{none, {reply, {404, #{}, <<>>, Req}}};
+							{true, _} ->
+								%% Chunk is recorded but packing is unknown.
+								{none, {reply, {404, #{}, <<>>, Req}}};
 							{{true, RequestedPacking}, _StoreID} ->
 								ok = ar_semaphore:acquire(get_chunk, infinity),
 								{RequestedPacking, ok};
+							{{true, {replica_2_9, _}}, _StoreID} when ?BLOCK_2_9_SYNCING ->
+								%% Don't serve replica 2.9 chunks as they are expensive to
+								%% unpack.
+								{none, {reply, {404, #{}, <<>>, Req}}};
 							{{true, Packing}, _StoreID} when RequestedPacking == any ->
 								ok = ar_semaphore:acquire(get_chunk, infinity),
 								{Packing, ok};
@@ -2023,7 +2036,8 @@ handle_get_chunk(OffsetBinary, Req, Encoding) ->
 							Reply;
 						ok ->
 							Args = #{ packing => ReadPacking,
-									bucket_based_offset => IsBucketBasedOffset },
+									bucket_based_offset => IsBucketBasedOffset,
+									origin => http },
 							case ar_data_sync:get_chunk(Offset, Args) of
 								{ok, Proof} ->
 									Proof2 = maps:remove(unpacked_chunk,
@@ -2040,13 +2054,21 @@ handle_get_chunk(OffsetBinary, Req, Encoding) ->
 									{200, #{}, Reply, Req};
 								{error, chunk_not_found} ->
 									{404, #{}, <<>>, Req};
+								{error, invalid_padding} ->
+									{404, #{}, <<>>, Req};
 								{error, chunk_failed_validation} ->
 									{404, #{}, <<>>, Req};
 								{error, chunk_stored_in_different_packing_only} ->
 									{404, #{}, <<>>, Req};
 								{error, not_joined} ->
 									not_joined(Req);
-								{error, failed_to_read_chunk} ->
+								{error, Error} ->
+									?LOG_ERROR([{event, get_chunk_error}, {offset, Offset},
+										{requested_packing, 
+											ar_serialize:encode_packing(RequestedPacking, false)},
+										{read_packing, 
+											ar_serialize:encode_packing(ReadPacking, false)},
+										{error, Error}]),
 									{500, #{}, <<>>, Req}
 							end
 					end;
@@ -2910,14 +2932,6 @@ find_block(<<"hash">>, ID) ->
 			unavailable
 	end.
 
-is_tx_already_processed(TXID) ->
-	case ar_ignore_registry:member(TXID) of
-		true ->
-			true;
-		false ->
-			ar_mempool:has_tx(TXID)
-	end.
-
 post_tx_parse_id({Req, Pid, Encoding}) ->
 	post_tx_parse_id(check_header, {Req, Pid, Encoding}).
 
@@ -2934,7 +2948,7 @@ post_tx_parse_id(check_header, {Req, Pid, Encoding}) ->
 			end
 	end;
 post_tx_parse_id(check_ignore_list, {TXID, Req, Pid, Encoding}) ->
-	case is_tx_already_processed(TXID) of
+	case ar_mempool:is_known_tx(TXID) of
 		true ->
 			{error, tx_already_processed, TXID, Req};
 		false ->
@@ -3022,7 +3036,7 @@ post_tx_parse_id(verify_id_match, {MaybeTXID, Req, TX}) ->
 				true ->
 					{error, invalid_hash, Req};
 				false ->
-					case is_tx_already_processed(TXID) of
+					case ar_mempool:is_known_tx(TXID) of
 						true ->
 							{error, tx_already_processed, TXID, Req};
 						false ->

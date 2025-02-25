@@ -9,21 +9,22 @@
 -module(ar_node_worker).
 
 -export([start_link/0, calculate_delay/1, is_mempool_or_block_cache_tx/1,
-		tx_id_prefix/1]).
+		tx_id_prefix/1, found_solution/4]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 -export([set_reward_addr/1]).
 
--include_lib("arweave/include/ar.hrl").
--include_lib("arweave/include/ar_consensus.hrl").
--include_lib("arweave/include/ar_config.hrl").
--include_lib("arweave/include/ar_pricing.hrl").
--include_lib("arweave/include/ar_data_sync.hrl").
--include_lib("arweave/include/ar_vdf.hrl").
--include_lib("arweave/include/ar_mining.hrl").
+-include("../include/ar.hrl").
+-include("../include/ar_consensus.hrl").
+-include("../include/ar_config.hrl").
+-include("../include/ar_pricing.hrl").
+-include("../include/ar_data_sync.hrl").
+-include("../include/ar_vdf.hrl").
+-include("../include/ar_mining.hrl").
+
 -include_lib("eunit/include/eunit.hrl").
 
--ifdef(DEBUG).
+-ifdef(AR_TEST).
 -define(PROCESS_TASK_QUEUE_FREQUENCY_MS, 10).
 -else.
 -define(PROCESS_TASK_QUEUE_FREQUENCY_MS, 200).
@@ -31,7 +32,7 @@
 
 -define(FILTER_MEMPOOL_CHUNK_SIZE, 100).
 
--ifdef(DEBUG).
+-ifdef(AR_TEST).
 -define(BLOCK_INDEX_HEAD_LEN, (?STORE_BLOCKS_BEHIND_CURRENT * 2)).
 -else.
 -define(BLOCK_INDEX_HEAD_LEN, 10000).
@@ -47,7 +48,7 @@
 -endif.
 
 %% How frequently (in seconds) to recompute the mining difficulty at the retarget blocks.
--ifdef(DEBUG).
+-ifdef(AR_TEST).
 -define(COMPUTE_MINING_DIFFICULTY_INTERVAL, 1).
 -else.
 -define(COMPUTE_MINING_DIFFICULTY_INTERVAL, 10).
@@ -78,6 +79,9 @@ is_mempool_or_block_cache_tx(TXID) ->
 set_reward_addr(Addr) ->
 	gen_server:call(?MODULE, {set_reward_addr, Addr}).
 
+found_solution(Source, Solution, PoACache, PoA2Cache) ->
+	gen_server:cast(?MODULE, {found_solution, Source, Solution, PoACache, PoA2Cache}).
+
 %%%===================================================================
 %%% Generic server callbacks.
 %%%===================================================================
@@ -85,7 +89,7 @@ set_reward_addr(Addr) ->
 init([]) ->
 	%% Trap exit to avoid corrupting any open files on quit.
 	process_flag(trap_exit, true),
-	[ok, ok, ok, ok, ok] = ar_events:subscribe([tx, block, nonce_limiter, miner, node_state]),
+	[ok, ok, ok, ok] = ar_events:subscribe([tx, block, nonce_limiter, node_state]),
 	%% Read persisted mempool.
 	ar_mempool:load_from_disk(),
 	%% Join the network.
@@ -317,6 +321,16 @@ calculate_delay(Bytes) ->
 handle_call({set_reward_addr, Addr}, _From, State) ->
 	{reply, ok, State#{ reward_addr => Addr }}.
 
+
+handle_cast({found_solution, miner, _Solution, _PoACache, _PoA2Cache},
+		#{ automine := false, miner_2_6 := undefined } = State) ->
+	{noreply, State};
+handle_cast({found_solution, Source, Solution, PoACache, PoA2Cache}, State) ->
+	[{_, PrevH}] = ets:lookup(node_state, current),
+	PrevB = ar_block_cache:get(block_cache, PrevH),
+	handle_found_solution({Source, Solution, PoACache, PoA2Cache}, PrevB, State);
+
+
 handle_cast(process_task_queue, #{ task_queue := TaskQueue } = State) ->
 	RunTask =
 		case gb_sets:is_empty(TaskQueue) of
@@ -474,17 +488,6 @@ handle_info({event, nonce_limiter, {refuse_validation, H}}, State) ->
 handle_info({event, nonce_limiter, _}, State) ->
 	{noreply, State};
 
-handle_info({event, miner, {found_solution, miner, _Solution, _PoACache, _PoA2Cache}},
-		#{ automine := false, miner_2_6 := undefined } = State) ->
-	{noreply, State};
-handle_info({event, miner, {found_solution, Source, Solution, PoACache, PoA2Cache}}, State) ->
-	[{_, PrevH}] = ets:lookup(node_state, current),
-	PrevB = ar_block_cache:get(block_cache, PrevH),
-	handle_found_solution({Source, Solution, PoACache, PoA2Cache}, PrevB, State);
-
-handle_info({event, miner, _}, State) ->
-	{noreply, State};
-
 handle_info({tx_ready_for_mining, TX}, State) ->
 	ar_mempool:add_tx(TX, ready_for_mining),
 	ar_events:send(tx, {ready_for_mining, TX}),
@@ -493,7 +496,7 @@ handle_info({tx_ready_for_mining, TX}, State) ->
 handle_info({event, block, {double_signing, Proof}}, State) ->
 	Map = maps:get(double_signing_proofs, State, #{}),
 	Key = element(1, Proof),
-	Addr = ar_wallet:to_address({?DEFAULT_KEY_TYPE, Key}),
+	Addr = ar_wallet:hash_pub_key(Key),
 	case is_map_key(Addr, Map) of
 		true ->
 			{noreply, State};
@@ -942,6 +945,8 @@ apply_block3(B, [PrevB | _] = PrevBlocks, Timestamp, State) ->
 			case validate_wallet_list(B, PrevB) of
 				error ->
 					BH = B#block.indep_hash,
+					?LOG_WARNING([{event, failed_to_validate_wallet_list},
+							{h, ar_util:encode(BH)}]),
 					ar_block_cache:remove(block_cache, BH),
 					ar_ignore_registry:add(BH),
 					gen_server:cast(?MODULE, apply_block),
@@ -1010,21 +1015,50 @@ may_be_get_double_signing_proof(PrevB, State) ->
 	LockedRewards = ar_rewards:get_locked_rewards(PrevB),
 	Proofs = maps:get(double_signing_proofs, State, #{}),
 	RootHash = PrevB#block.wallet_list,
-	may_be_get_double_signing_proof2(maps:iterator(Proofs), RootHash, LockedRewards).
+	Height = PrevB#block.height + 1,
+	may_be_get_double_signing_proof2(maps:iterator(Proofs), RootHash, LockedRewards, Height).
 
-may_be_get_double_signing_proof2(Iterator, RootHash, LockedRewards) ->
+may_be_get_double_signing_proof2(Iterator, RootHash, LockedRewards, Height) ->
 	case maps:next(Iterator) of
 		none ->
 			undefined;
 		{Addr, {_Timestamp, Proof2}, Iterator2} ->
-			case ar_rewards:has_locked_reward(Addr, LockedRewards) of
+			{Key, Sig1, _CDiff1, _PrevCDiff1, _Preimage1,
+					Sig2, _CDiff2, _PrevCDiff2, _Preimage2} = Proof2,
+			?LOG_INFO([{event, evaluating_double_signing_proof},
+				{key_size, byte_size(Key)},
+				{sig1_size, byte_size(Sig1)},
+				{sig2_size, byte_size(Sig2)},
+				{height, Height}]),
+			CheckKeyType =
+				case {byte_size(Key) == ?ECDSA_PUB_KEY_SIZE, Height >= ar_fork:height_2_9()} of
+					{true, false} ->
+						false;
+					{true, true} ->
+						byte_size(Sig1) == ?ECDSA_SIG_SIZE
+							andalso byte_size(Sig2) == ?ECDSA_SIG_SIZE;
+					_ ->
+						byte_size(Key) == ?RSA_BLOCK_SIG_SIZE
+							andalso byte_size(Sig1) == ?RSA_BLOCK_SIG_SIZE
+							andalso byte_size(Sig2) == ?RSA_BLOCK_SIG_SIZE
+				end,
+			HasLockedReward =
+				case CheckKeyType of
+					false ->
+						false;
+					true ->
+						ar_rewards:has_locked_reward(Addr, LockedRewards)
+				end,
+			case HasLockedReward of
 				false ->
-					may_be_get_double_signing_proof2(Iterator2, RootHash, LockedRewards);
+					may_be_get_double_signing_proof2(Iterator2,
+							RootHash, LockedRewards, Height);
 				true ->
 					Accounts = ar_wallets:get(RootHash, [Addr]),
 					case ar_node_utils:is_account_banned(Addr, Accounts) of
 						true ->
-							may_be_get_double_signing_proof2(Iterator2, RootHash, LockedRewards);
+							may_be_get_double_signing_proof2(Iterator2,
+									RootHash, LockedRewards, Height);
 						false ->
 							Proof2
 					end
@@ -1075,7 +1109,7 @@ pack_block_with_transactions(B, PrevB) ->
 			undefined ->
 				Addresses2;
 			Proof ->
-				[ar_wallet:to_address({?DEFAULT_KEY_TYPE, element(1, Proof)}) | Addresses2]
+				[ar_wallet:hash_pub_key(element(1, Proof)) | Addresses2]
 		end,
 	Accounts = ar_wallets:get(PrevB#block.wallet_list, Addresses3),
 	[{block_txs_pairs, BlockTXPairs}] = ets:lookup(node_state, block_txs_pairs),
@@ -1254,7 +1288,7 @@ get_missing_txs_and_retry(#block{ txs = TXIDs }, _Worker)
 	ok;
 get_missing_txs_and_retry(BShadow, Worker) ->
 	get_missing_txs_and_retry(BShadow#block.indep_hash, BShadow#block.txs,
-			Worker, ar_peers:get_peers(lifetime), [], 0).
+			Worker, ar_peers:get_peers(current), [], 0).
 
 get_missing_txs_and_retry(_H, _TXIDs, _Worker, _Peers, _TXs, TotalSize)
 		when TotalSize > ?BLOCK_TX_DATA_SIZE_LIMIT ->
@@ -1449,7 +1483,8 @@ log_applied_block(B) ->
 
 log_tip(B) ->
 	?LOG_INFO([{event, new_tip_block}, {indep_hash, ar_util:encode(B#block.indep_hash)},
-			{height, B#block.height}]).
+			{height, B#block.height}, {weave_size, B#block.weave_size},
+			{reward_addr, ar_util:encode(B#block.reward_addr)}]).
 
 maybe_report_n_confirmations(B, BI) ->
 	N = 10,
@@ -1656,7 +1691,7 @@ read_hash_list_2_0_for_1_0_blocks() ->
 	Fork_2_0 = ar_fork:height_2_0(),
 	case Fork_2_0 > 0 of
 		true ->
-			File = filename:join(["data", "hash_list_1_0"]),
+			File = filename:join(["genesis_data", "hash_list_1_0"]),
 			{ok, Binary} = file:read_file(File),
 			HL = lists:map(fun ar_util:decode/1, jiffy:decode(Binary)),
 			Fork_2_0 = length(HL),
@@ -1786,10 +1821,11 @@ set_poa_cache(B) ->
 	PoA2 = B#block.poa2,
 	MiningAddress = B#block.reward_addr,
 	PackingDifficulty = B#block.packing_difficulty,
+	ReplicaFormat = B#block.replica_format,
 	Nonce = B#block.nonce,
 	RecallByte1 = B#block.recall_byte,
 	RecallByte2 = B#block.recall_byte2,
-	Packing = ar_block:get_packing(PackingDifficulty, MiningAddress),
+	Packing = ar_block:get_packing(PackingDifficulty, MiningAddress, ReplicaFormat),
 	PoACache = compute_poa_cache(B, PoA1, RecallByte1, Nonce, Packing),
 	B2 = B#block{ poa_cache = PoACache },
 	%% Compute PoA2 cache if PoA2 is present.
@@ -1837,8 +1873,10 @@ handle_found_solution(Args, PrevB, State) ->
 		start_interval_number = IntervalNumber,
 		step_number = StepNumber,
 		steps = SuppliedSteps,
-		packing_difficulty = PackingDifficulty
+		packing_difficulty = PackingDifficulty,
+		replica_format = ReplicaFormat
 	} = Solution,
+	?LOG_INFO([{event, handle_found_solution}, {solution, ar_util:encode(SolutionH)}]),
 	MerkleRebaseThreshold = ?MERKLE_REBASE_SUPPORT_THRESHOLD,
 
 	#block{ indep_hash = PrevH, timestamp = PrevTimestamp,
@@ -1876,7 +1914,7 @@ handle_found_solution(Args, PrevB, State) ->
 						mining_address_banned, []),
 				{false, address_banned};
 			false ->
-				case ar_block:validate_packing_difficulty(Height, PackingDifficulty) of
+				case ar_block:validate_replica_format(Height, PackingDifficulty, ReplicaFormat) of
 					false ->
 						ar_events:send(solution, {rejected,
 								#{ reason => invalid_packing_difficulty, source => Source }}),
@@ -1908,7 +1946,7 @@ handle_found_solution(Args, PrevB, State) ->
 	#nonce_limiter_info{ next_seed = PrevNextSeed,
 			next_vdf_difficulty = PrevNextVDFDifficulty,
 			global_step_number = PrevStepNumber } = PrevNonceLimiterInfo,
-	PrevIntervalNumber = PrevStepNumber div ?NONCE_LIMITER_RESET_FREQUENCY,
+	PrevIntervalNumber = PrevStepNumber div ar_nonce_limiter:get_reset_frequency(),
 	PassesSeedCheck =
 		case PassesTimelineCheck of
 			{false, Reason} ->
@@ -1919,7 +1957,14 @@ handle_found_solution(Args, PrevB, State) ->
 					false ->
 						ar_events:send(solution, {stale, #{ source => Source }}),
 						ar_mining_server:log_prepare_solution_failure(Solution,
-								vdf_seed_data_does_not_match_current_block, []),
+							vdf_seed_data_does_not_match_current_block, [
+								{interval_number, IntervalNumber},
+								{prev_interval_number, PrevIntervalNumber},
+								{nonce_limiter_next_seed, ar_util:encode(NonceLimiterNextSeed)},
+								{prev_nonce_limiter_next_seed, ar_util:encode(PrevNextSeed)},
+								{nonce_limiter_next_vdf_difficulty, NonceLimiterNextVDFDifficulty},
+								{prev_nonce_limiter_next_vdf_difficulty, PrevNextVDFDifficulty}
+							]),
 						{false, seed_data};
 					true ->
 						true
@@ -2102,6 +2147,7 @@ handle_found_solution(Args, PrevB, State) ->
 				chunk_hash = get_chunk_hash(PoA1, Height),
 				chunk2_hash = get_chunk_hash(PoA2, Height),
 				packing_difficulty = PackingDifficulty,
+				replica_format = ReplicaFormat,
 				unpacked_chunk_hash = get_unpacked_chunk_hash(
 						PoA1, PackingDifficulty, RecallByte1),
 				unpacked_chunk2_hash = get_unpacked_chunk_hash(
@@ -2117,9 +2163,9 @@ handle_found_solution(Args, PrevB, State) ->
 			},
 			SignedH = ar_block:generate_signed_hash(UnsignedB2),
 			PrevCDiff = PrevB#block.cumulative_diff,
-			SignaturePreimage = << (ar_serialize:encode_int(CDiff, 16))/binary,
-					(ar_serialize:encode_int(PrevCDiff, 16))/binary, (PrevB#block.hash)/binary,
-					SignedH/binary >>,
+			SignaturePreimage = ar_block:get_block_signature_preimage(CDiff, PrevCDiff,
+					<< (PrevB#block.hash)/binary, SignedH/binary >>, Height),
+			assert_key_type(RewardKey, Height),
 			Signature = ar_wallet:sign(element(1, RewardKey), SignaturePreimage),
 			H = ar_block:indep_hash2(SignedH, Signature),
 			B = UnsignedB2#block{ indep_hash = H, signature = Signature },
@@ -2128,6 +2174,8 @@ handle_found_solution(Args, PrevB, State) ->
 					{solution, ar_util:encode(SolutionH)}, {height, Height},
 					{step_number, StepNumber}, {steps, length(Steps)},
 					{txs, length(B#block.txs)},
+					{recall_byte1, B#block.recall_byte},
+					{recall_byte2, B#block.recall_byte2},
 					{chunks,
 						case B#block.recall_byte2 of
 							undefined -> 1;
@@ -2146,6 +2194,29 @@ handle_found_solution(Args, PrevB, State) ->
 					{prev_next_seed, ar_util:encode(PrevNextSeed)},
 					{output, ar_util:encode(NonceLimiterOutput)}]),
 			{noreply, State}
+	end.
+
+assert_key_type(RewardKey, Height) ->
+	case Height >= ar_fork:height_2_9() of
+		false ->
+			case RewardKey of
+				{{?RSA_KEY_TYPE, _, _}, {?RSA_KEY_TYPE, Pub}} ->
+					true = byte_size(Pub) == 512,
+					ok;
+				_ ->
+					exit(invalid_reward_key)
+			end;
+		true ->
+			case RewardKey of
+				{{?RSA_KEY_TYPE, _, _}, {?RSA_KEY_TYPE, Pub}} ->
+					true = byte_size(Pub) == 512,
+					ok;
+				{{?ECDSA_KEY_TYPE, _, _}, {?ECDSA_KEY_TYPE, Pub}} ->
+					true = byte_size(Pub) == ?ECDSA_PUB_KEY_SIZE,
+					ok;
+				_ ->
+					exit(invalid_reward_key)
+			end
 	end.
 
 update_solution_cache(H, Args, State) ->

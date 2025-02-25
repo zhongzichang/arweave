@@ -21,7 +21,7 @@
 -include_lib("arweave/include/ar_config.hrl").
 
 %% The frequency of choosing the peers to poll.
--ifdef(DEBUG).
+-ifdef(AR_TEST).
 -define(COLLECT_PEERS_FREQUENCY_MS, 2000).
 -else.
 -define(COLLECT_PEERS_FREQUENCY_MS, 1000 * 15).
@@ -88,9 +88,9 @@ handle_cast(collect_peers, #state{ pause = true } = State) ->
 handle_cast(collect_peers, State) ->
 	#state{ worker_count = N, workers = Workers } = State,
 	TrustedPeers = ar_util:pick_random(ar_peers:get_trusted_peers(), N div 3),
-	Peers = ar_peers:get_peers(lifetime),
-	PickedPeers = TrustedPeers ++ lists:sublist((Peers -- TrustedPeers),
-			N - length(TrustedPeers)),
+	Peers = ar_peers:get_peers(current),
+	OtherPeers =  ar_data_discovery:pick_peers(Peers -- TrustedPeers, N - length(TrustedPeers)),
+	PickedPeers = TrustedPeers ++ OtherPeers,
 	start_polling_peers(Workers, PickedPeers),
 	ar_util:cast_after(?COLLECT_PEERS_FREQUENCY_MS, ?MODULE, collect_peers),
 	{noreply, State};

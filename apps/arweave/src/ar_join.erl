@@ -11,7 +11,7 @@
 
 %% The number of block index elements to fetch per request.
 %% Must not exceed ?MAX_BLOCK_INDEX_RANGE_SIZE defined in ar_http_iface_middleware.erl.
--ifdef(DEBUG).
+-ifdef(AR_TEST).
 -define(REQUEST_BLOCK_INDEX_RANGE_SIZE, 2).
 -else.
 -define(REQUEST_BLOCK_INDEX_RANGE_SIZE, 10000).
@@ -501,9 +501,9 @@ basic_node_join_test() ->
 		[B0] = ar_weave:init([]),
 		ar_test_node:start(B0),
 		ar_test_node:mine(),
-		ar_test_node:wait_until_height(1),
+		ar_test_node:wait_until_height(main, 1),
 		ar_test_node:mine(),
-		ar_test_node:wait_until_height(2),
+		ar_test_node:wait_until_height(main, 2),
 		ar_test_node:join_on(#{ node => peer1, join_on => main }),
 		ar_test_node:assert_wait_until_height(peer1, 2)
 	end}.
@@ -514,11 +514,11 @@ node_join_test() ->
 		[B0] = ar_weave:init([]),
 		ar_test_node:start(B0),
 		ar_test_node:mine(),
-		ar_test_node:wait_until_height(1),
+		ar_test_node:wait_until_height(main, 1),
 		ar_test_node:mine(),
-		ar_test_node:wait_until_height(2),
+		ar_test_node:wait_until_height(main, 2),
 		ar_test_node:join_on(#{ node => peer1, join_on => main }),
 		ar_test_node:assert_wait_until_height(peer1, 2),
 		ar_test_node:mine(peer1),
-		ar_test_node:wait_until_height(3)
+		ar_test_node:wait_until_height(main, 3)
 	end}.

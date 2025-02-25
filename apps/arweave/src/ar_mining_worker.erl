@@ -457,8 +457,12 @@ handle_task({computed_h1, Candidate, _ExtraArgs}, State) ->
 	State2 = hash_computed(h1, Candidate, State),
 	case h1_passes_diff_checks(H1, Candidate, State2) of
 		true ->
-			?LOG_INFO([{event, found_h1_solution}, {worker, State2#state.name},
-				{h1, ar_util:encode(H1)}, {difficulty, get_difficulty(State2, Candidate)}]),
+			?LOG_INFO([{event, found_h1_solution},
+				{step, Candidate#mining_candidate.step_number},
+				{worker, State2#state.name},
+				{h1, ar_util:encode(H1)}, 
+				{p1, Candidate#mining_candidate.partition_number},
+				{difficulty, get_difficulty(State2, Candidate)}]),
 			ar_mining_stats:h1_solution(),
 			%% Decrement 1 for chunk1:
 			%% Since we found a solution we won't need chunk2 (and it will be evicted if
@@ -519,14 +523,20 @@ handle_task({computed_h2, Candidate, _ExtraArgs}, State) ->
 		true ->
 			?LOG_INFO([{event, found_h2_solution},
 					{worker, State#state.name},
+					{step, Candidate#mining_candidate.step_number},
 					{h2, ar_util:encode(H2)},
+					{p1, Candidate#mining_candidate.partition_number},
+					{p2, Candidate#mining_candidate.partition_number2},
 					{difficulty, get_difficulty(State2, Candidate)},
 					{partial_difficulty, get_partial_difficulty(State2, Candidate)}]),
 			ar_mining_stats:h2_solution();
 		partial ->
 			?LOG_INFO([{event, found_h2_partial_solution},
 					{worker, State2#state.name},
+					{step, Candidate#mining_candidate.step_number},
 					{h2, ar_util:encode(H2)},
+					{p1, Candidate#mining_candidate.partition_number},
+					{p2, Candidate#mining_candidate.partition_number2},
 					{partial_difficulty, get_partial_difficulty(State2, Candidate)}])
 	end,
 	case {PassesDiffChecks, Peer} of

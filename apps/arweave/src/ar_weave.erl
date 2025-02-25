@@ -1,6 +1,6 @@
 -module(ar_weave).
 
--export([init/0, init/1, init/2, init/3, create_mainnet_genesis_txs/0,
+-export([init/0, init/1, init/2, init/3, create_mainnet_genesis_txs/0, generate_data/3,
 		add_mainnet_v1_genesis_txs/0]).
 
 -include_lib("arweave/include/ar.hrl").
@@ -29,9 +29,12 @@ init(WalletList, Diff) ->
 	Size = 262144 * 3, % Matches ?STRICT_DATA_SPLIT_THRESHOLD in tests.
 	init(WalletList, Diff, Size).
 
+init(_WalletList, _Diff, GenesisDataSize) when GenesisDataSize > (4 * ?GiB) ->
+	erlang:error({size_exceeds_limit, "GenesisDataSize exceeds 4 GiB"});
+
 %% @doc Create a genesis block with the given accounts and difficulty.
 init(WalletList, Diff, GenesisDataSize) ->
-	Key = ar_wallet:new_keyfile(),
+	{{_, _, _}, {_, _}} = Key = ar_wallet:new_keyfile(),
 	TX = create_genesis_tx(Key, GenesisDataSize),
 	WalletList2 = WalletList ++ [{ar_wallet:to_address(Key), 0, TX#tx.id}],
 	TXs = [TX],
@@ -106,7 +109,7 @@ init(WalletList, Diff, GenesisDataSize) ->
 		end,
 	[B2#block{ indep_hash = ar_block:indep_hash(B2) }].
 
--ifdef(DEBUG).
+-ifdef(AR_TEST).
 get_initial_block_time_history() ->
 	[{1, 1, 1}].
 -else.
@@ -114,13 +117,15 @@ get_initial_block_time_history() ->
 	[{120, 1, 1}].
 -endif.
 
+%% @doc: create a genesis transaction with the given key and data size. This is only used
+%% in tests and when launching a localnet node.
 create_genesis_tx(Key, Size) ->
 	{_, {_, Pk}} = Key,
 	UnsignedTX =
 		(ar_tx:new())#tx{
 			owner = Pk,
 			reward = 0,
-			data = crypto:strong_rand_bytes(Size),
+			data = generate_genesis_data(Size),
 			data_size = Size,
 			target = <<>>,
 			quantity = 0,
@@ -130,14 +135,37 @@ create_genesis_tx(Key, Size) ->
 		},
 	ar_tx:sign_v1(UnsignedTX, Key).
 
+%% @doc: generate binary data to be used as genesis data in tests. That data is incrementing
+%% integer data in 4 byte chunks. e.g.
+%% <<0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 2, ...>>
+%% This makes it easier to assert correct chunk data in tests.
+-spec generate_genesis_data(integer()) -> binary().
+generate_genesis_data(DataSize) ->
+    FullChunks = DataSize div 4,
+    LeftoverBytes = DataSize rem 4,
+    IncrementingData = generate_data(0, FullChunks * 4, <<>>),
+    add_padding(IncrementingData, LeftoverBytes).
+
+generate_data(CurrentValue, RemainingBytes, Acc) when RemainingBytes >= 4 ->
+	Chunk = <<CurrentValue:32/integer>>,
+	generate_data(CurrentValue + 1, RemainingBytes - 4, <<Acc/binary, Chunk/binary>>);
+generate_data(_, RemainingBytes, Acc) ->
+	add_padding(Acc, RemainingBytes).
+
+add_padding(Data, 0) ->
+    Data;
+add_padding(Data, LeftoverBytes) ->
+    Padding = <<16#FF:8, 16#FF:8, 16#FF:8, 16#FF:8>>,
+    <<Data/binary, Padding:LeftoverBytes/unit:8>>.
+
 add_mainnet_v1_genesis_txs() ->
-	case filelib:is_dir("data/genesis_txs") of
+	case filelib:is_dir("genesis_data/genesis_txs") of
 		true ->
-			{ok, Files} = file:list_dir("data/genesis_txs"),
+			{ok, Files} = file:list_dir("genesis_data/genesis_txs"),
 			{ok, Config} = application:get_env(arweave, config),
 			lists:foldl(
 				fun(F, Acc) ->
-					SourcePath = "data/genesis_txs/" ++ F,
+					SourcePath = "genesis_data/genesis_txs/" ++ F,
 					TargetPath = Config#config.data_dir ++ "/" ++ ?TX_DIR ++ "/" ++ F,
 					file:copy(SourcePath, TargetPath),
 					[ar_util:decode(hd(string:split(F, ".")))|Acc]
@@ -146,7 +174,7 @@ add_mainnet_v1_genesis_txs() ->
 				Files
 			);
 		false ->
-			?LOG_WARNING("data/genesis_txs directory not found. Node might not index the genesis "
+			?LOG_WARNING("genesis_data/genesis_txs directory not found. Node might not index the genesis "
 						 "block transactions."),
 			[]
 	end.
