@@ -395,6 +395,7 @@ handle_info({event, node_state, _Event}, State) ->
 	{noreply, State};
 
 handle_info({event, nonce_limiter, initialized}, State) ->
+	{ok, Config} = application:get_env(arweave, config),
 	[{_, {Height, Blocks, BI}}] = ets:lookup(node_state, join_state),
 	ar_storage:store_block_index(BI),
 	RecentBI = lists:sublist(BI, ?BLOCK_INDEX_HEAD_LEN),
@@ -434,6 +435,7 @@ handle_info({event, nonce_limiter, initialized}, State) ->
 		{hash,					B#block.hash},
 		{reward_pool,			B#block.reward_pool},
 		{diff_pair,				ar_difficulty:diff_pair(B)},
+		{pool_diff_pair,		ar_difficulty:diff_pair(B, Config#config.pool_diff_factor)},
 		{cumulative_diff,		B#block.cumulative_diff},
 		{last_retarget,			B#block.last_retarget},
 		{weave_size,			B#block.weave_size},
@@ -1345,6 +1347,7 @@ apply_validated_block(State, B, PrevBlocks, Orphans, RecentBI, BlockTXPairs) ->
 	end.
 
 apply_validated_block2(State, B, PrevBlocks, Orphans, RecentBI, BlockTXPairs) ->
+	{ok, Config} = application:get_env(arweave, config),
 	[{current, CurrentH}] = ets:lookup(node_state, current),
 	BH = B#block.indep_hash,
 	%% Overwrite the block to store computed size tagged txs - they
@@ -1424,6 +1427,7 @@ apply_validated_block2(State, B, PrevBlocks, Orphans, RecentBI, BlockTXPairs) ->
 		{hash,					B#block.hash},
 		{reward_pool,			B#block.reward_pool},
 		{diff_pair,				ar_difficulty:diff_pair(B)},
+		{pool_diff_pair,		ar_difficulty:diff_pair(B, Config#config.pool_diff_factor)},
 		{cumulative_diff,		B#block.cumulative_diff},
 		{last_retarget,			B#block.last_retarget},
 		{weave_size,			B#block.weave_size},

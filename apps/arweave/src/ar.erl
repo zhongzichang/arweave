@@ -346,6 +346,7 @@ show_help() ->
 			{"pool_worker_name", "(optional) The pool worker name. "
 					"Useful if you have multiple machines (or replicas) "
 					"and you want to monitor them separately on pool"},
+			{"pool_diff_factor", "The pool diff factor."},
 			{"rocksdb_flush_interval", "RocksDB flush interval in seconds"},
 			{"rocksdb_wal_sync_interval", "RocksDB WAL sync interval in seconds"},
 			{"verify", "Run in verify mode. The node will run several checks on all listed "
@@ -659,6 +660,8 @@ parse_cli_args(["pool_server_address", Host | Rest], C) ->
 	parse_cli_args(Rest, C#config{ pool_server_address = list_to_binary(Host) });
 parse_cli_args(["pool_worker_name", Host | Rest], C) ->
 	parse_cli_args(Rest, C#config{ pool_worker_name = list_to_binary(Host) });
+parse_cli_args(["pool_diff_factor", Num | Rest], C) ->
+	parse_cli_args(Rest, C#config{ pool_diff_factor = list_to_integer(Num) });
 parse_cli_args(["rocksdb_flush_interval", Seconds | Rest], C) ->
 	parse_cli_args(Rest, C#config{ rocksdb_flush_interval_s = list_to_integer(Seconds) });
 parse_cli_args(["rocksdb_wal_sync_interval", Seconds | Rest], C) ->

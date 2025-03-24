@@ -61,6 +61,11 @@ next_cumulative_diff(OldCDiff, NewDiff, Height) ->
 multiply_diff_pre_fork_2_5(Diff, Multiplier) ->
 	?MAX_DIFF - erlang:trunc(1 / Multiplier * (?MAX_DIFF - Diff)).
 
+diff_pair(Block, DiffFactor) ->
+	Diff = Block#block.diff div DiffFactor,
+	Height = Block#block.height,
+	{poa1_diff(Diff, Height), Diff}.
+
 diff_pair(Block) ->
 	Diff = Block#block.diff,
 	Height = Block#block.height,

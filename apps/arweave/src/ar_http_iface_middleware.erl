@@ -2573,10 +2573,10 @@ handle_get_jobs_pool_server(PrevOutput, Req) ->
 			node_state,
 			[{{'$1', '$2'},
 				[{'or',
-					{'==', '$1', diff_pair},
+					{'==', '$1', pool_diff_pair},
 					{'==', '$1', nonce_limiter_info}}], ['$_']}]
 		),
-	DiffPair = proplists:get_value(diff_pair, Props),
+	DiffPair = proplists:get_value(pool_diff_pair, Props),
 	Info = proplists:get_value(nonce_limiter_info, Props),
 	Result = ar_util:do_until(
 		fun() ->
