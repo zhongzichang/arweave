@@ -3,7 +3,8 @@
 -behaviour(gen_server).
 
 -export([name/1, acquire_semaphore/1, release_semaphore/1, is_ready/1,
-	is_entropy_recorded/2, delete_record/2, store_entropy/7, record_chunk/7]).
+	is_entropy_recorded/2, delete_record/2, store_entropy/7, record_chunk/7,
+	generate_missing_entropy/2]).
 
 -export([start_link/2, init/1, handle_cast/2, handle_call/3, handle_info/2, terminate/2]).
 
@@ -39,7 +40,7 @@ store_entropy(
 		Entropies, BucketEndOffset2, RangeStart, RangeEnd, Keys, RewardAddr}).
 
 is_ready(StoreID) ->
-	case catch gen_server:call(name(StoreID), is_ready, infinity) of
+	case catch gen_server:call(name(StoreID), is_ready, ?DEFAULT_CALL_TIMEOUT) of
 		{'EXIT', {Reason, {gen_server, call, _}}} ->
 			?LOG_WARNING([{event, is_ready_error}, {module, ?MODULE},
 				{name, name(StoreID)}, {store_id, StoreID}, {reason, Reason}]),
@@ -378,7 +379,7 @@ reset_entropy_offset(BucketEndOffset) ->
 	%% End sanity checks
 	SliceIndex = ar_replica_2_9:get_slice_index(BucketEndOffset),
 	shift_entropy_offset(BucketEndOffset, -SliceIndex).
-	
+
 %% @doc Take the first slice of each entropy and combine into a single binary. This binary
 %% can be used to encipher a single chunk.
 -spec take_and_combine_entropy_slices(Entropies :: [binary()]) ->
@@ -561,7 +562,7 @@ test_replica_2_9() ->
 	after
 		ok = application:set_env(arweave, config, Config)
 	end.
-	
+
 
 assert_get(Expected, Offset) ->
 	assert_get(Expected, Offset, "default").

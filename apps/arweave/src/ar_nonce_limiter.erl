@@ -3,11 +3,11 @@
 -behaviour(gen_server).
 
 -export([start_link/0, account_tree_initialized/1, encode_session_key/1, session_key/1,
-		is_ahead_on_the_timeline/2, 
+		is_ahead_on_the_timeline/2,
 		get_current_step_number/0, get_current_step_number/1, get_step_triplets/3,
 		get_seed_data/2, get_step_checkpoints/2, get_step_checkpoints/4, get_steps/4,
 		get_seed/1, get_active_partition_upper_bound/2,
-		get_reset_frequency/0,
+		get_reset_frequency/0, get_entropy_reset_point/2,
 		validate_last_step_checkpoints/3, request_validation/3,
 		get_or_init_nonce_limiter_info/1, get_or_init_nonce_limiter_info/2,
 		apply_external_update/2, get_session/1, get_current_session/0,
@@ -17,10 +17,11 @@
 
 -export([init/1, handle_cast/2, handle_call/3, handle_info/2, terminate/2]).
 
--include_lib("arweave/include/ar.hrl").
--include_lib("arweave/include/ar_vdf.hrl").
--include_lib("arweave/include/ar_config.hrl").
--include_lib("arweave/include/ar_consensus.hrl").
+-include("../include/ar.hrl").
+-include("../include/ar_vdf.hrl").
+-include("../include/ar_config.hrl").
+-include("../include/ar_consensus.hrl").
+
 -include_lib("eunit/include/eunit.hrl").
 
 -record(state, {
@@ -60,34 +61,34 @@ is_ahead_on_the_timeline(NonceLimiterInfo1, NonceLimiterInfo2) ->
 
 %% @doc Return the nonce limiter session with the given key.
 get_session(SessionKey) ->
-	gen_server:call(?MODULE, {get_session, SessionKey}, infinity).
+	gen_server:call(?MODULE, {get_session, SessionKey}, ?DEFAULT_CALL_TIMEOUT).
 
 %% @doc Return {SessionKey, Session} for the current VDF session.
 get_current_session() ->
-	gen_server:call(?MODULE, get_current_session, infinity).
+	gen_server:call(?MODULE, get_current_session, ?DEFAULT_CALL_TIMEOUT).
 
 %% @doc Return a list of up to two {SessionKey, Session} pairs
 %% where the first pair corresponds to the current VDF session
 %% and the second pair is its previous session, if any.
 get_current_sessions() ->
-	gen_server:call(?MODULE, get_current_sessions, infinity).
+	gen_server:call(?MODULE, get_current_sessions, ?DEFAULT_CALL_TIMEOUT).
 
 %% @doc Return the latest known step number.
 get_current_step_number() ->
-	gen_server:call(?MODULE, get_current_step_number, infinity).
+	gen_server:call(?MODULE, get_current_step_number, ?DEFAULT_CALL_TIMEOUT).
 
 %% @doc Return the latest known step number in the session of the given (previous) block.
 %% Return not_found if the session is not found.
 get_current_step_number(B) ->
 	SessionKey = session_key(B#block.nonce_limiter_info),
-	gen_server:call(?MODULE, {get_current_step_number, SessionKey}, infinity).
+	gen_server:call(?MODULE, {get_current_step_number, SessionKey}, ?DEFAULT_CALL_TIMEOUT).
 
 %% @doc Return {Output, StepNumber, PartitionUpperBound} for up to N latest steps
 %% from the VDF session of Info, if any. If PrevOutput is among the N latest steps,
 %% return only the steps strictly above PrevOutput.
 get_step_triplets(Info, PrevOutput, N) ->
 	SessionKey = session_key(Info),
-	Steps = gen_server:call(?MODULE, {get_latest_step_triplets, SessionKey, N}, infinity),
+	Steps = gen_server:call(?MODULE, {get_latest_step_triplets, SessionKey, N}, ?DEFAULT_CALL_TIMEOUT),
 	filter_step_triplets(Steps, [PrevOutput, Info#nonce_limiter_info.output]).
 
 %% @doc Return {Seed, NextSeed, PartitionUpperBound, NextPartitionUpperBound, VDFDifficulty}
@@ -106,9 +107,9 @@ get_seed_data(StepNumber, PrevB) ->
 		partition_upper_bound = PartitionUpperBound,
 		next_partition_upper_bound = NextPartitionUpperBound,
 		%% VDF difficulty in use at the previous block
-		vdf_difficulty = VDFDifficulty, 
+		vdf_difficulty = VDFDifficulty,
 		%% Next VDF difficulty scheduled at the previous block
-		next_vdf_difficulty = PrevNextVDFDifficulty 
+		next_vdf_difficulty = PrevNextVDFDifficulty
 	} = NonceLimiterInfo,
 	true = StepNumber > PrevStepNumber,
 	case get_entropy_reset_point(PrevStepNumber, StepNumber) of
@@ -133,12 +134,12 @@ get_step_checkpoints(StepNumber, NextSeed, StartIntervalNumber, NextVDFDifficult
 	SessionKey = {NextSeed, StartIntervalNumber, NextVDFDifficulty},
 	get_step_checkpoints(StepNumber, SessionKey).
 get_step_checkpoints(StepNumber, SessionKey) ->
-	gen_server:call(?MODULE, {get_step_checkpoints, StepNumber, SessionKey}, infinity).
+	gen_server:call(?MODULE, {get_step_checkpoints, StepNumber, SessionKey}, ?DEFAULT_CALL_TIMEOUT).
 
 %% @doc Return the entropy seed of the given session.
 %% Return not_found if the VDF session is not found.
 get_seed(SessionKey) ->
-	gen_server:call(?MODULE, {get_seed, SessionKey}, infinity).
+	gen_server:call(?MODULE, {get_seed, SessionKey}, ?DEFAULT_CALL_TIMEOUT).
 
 %% @doc Return the active partition upper bound for the given step (chosen among
 %% session's upper_bound and next_upper_bound depending on whether the step number has
@@ -146,7 +147,7 @@ get_seed(SessionKey) ->
 %% Return not_found if the VDF session is not found.
 get_active_partition_upper_bound(StepNumber, SessionKey) ->
 	gen_server:call(?MODULE, {get_active_partition_upper_bound, StepNumber, SessionKey},
-			infinity).
+			?DEFAULT_CALL_TIMEOUT).
 
 %% @doc Return the steps of the given interval. The steps are chosen
 %% according to the protocol. Return not_found if the corresponding hash chain is not
@@ -155,7 +156,7 @@ get_steps(StartStepNumber, EndStepNumber, NextSeed, NextVDFDifficulty)
 		when EndStepNumber > StartStepNumber ->
 	SessionKey = session_key(NextSeed, StartStepNumber, NextVDFDifficulty),
 	gen_server:call(?MODULE, {get_steps, StartStepNumber, EndStepNumber, SessionKey},
-			infinity).
+			?DEFAULT_CALL_TIMEOUT).
 
 %% @doc Quickly validate the checkpoints of the latest step.
 validate_last_step_checkpoints(#block{ nonce_limiter_info = #nonce_limiter_info{
@@ -189,8 +190,8 @@ validate_last_step_checkpoints(#block{
 				false ->
 					false
 			end;
-		_ ->
-			{false, cache_mismatch}
+		CachedSteps ->
+			{false, cache_mismatch, CachedSteps}
 	end;
 validate_last_step_checkpoints(_B, _PrevB, _PrevOutput) ->
 	false.
@@ -250,7 +251,7 @@ request_validation(H, #nonce_limiter_info{ output = Output,
 	%% The steps that fall at the intersection of the PrevStepNumber to StepNumber range
 	%% and the SessionKey session.
 	SessionSteps = gen_server:call(?MODULE, {get_session_steps, PrevStepNumber, StepNumber,
-			SessionKey}, infinity),
+			SessionKey}, ?DEFAULT_CALL_TIMEOUT),
 	NextSessionKey = session_key(Info),
 
 	%% We need to validate all the steps from PrevStepNumber to StepNumber:
@@ -258,7 +259,7 @@ request_validation(H, #nonce_limiter_info{ output = Output,
 	%%     PrevOutput x
 	%%                                      |----------------------| StepsToValidate
 	%%                |-----------------------------------| SessionSteps
-	%%                      StartStepNumber x 
+	%%                      StartStepNumber x
 	%%                          StartOutput x
 	%%                                      |-------------| ComputedSteps
 	%%                                      --------------> NumAlreadyComputed
@@ -404,7 +405,7 @@ get_or_init_nonce_limiter_info(#block{ height = Height } = B, RecentBI) ->
 
 %% @doc Apply the nonce limiter update provided by the configured trusted peer.
 apply_external_update(Update, Peer) ->
-	gen_server:call(?MODULE, {apply_external_update, Update, Peer}, infinity).
+	gen_server:call(?MODULE, {apply_external_update, Update, Peer}, ?DEFAULT_CALL_TIMEOUT).
 
 %%%===================================================================
 %%% Generic server callbacks.
@@ -631,7 +632,8 @@ handle_cast({validated_steps, Args}, State) ->
 						{_, Steps2} =
 							get_step_range(Steps, StepNumber, CurrentStepNumber + 1, StepNumber),
 						update_session(Session, StepNumber,
-								#{ StepNumber => LastStepCheckpoints }, Steps2);
+								#{ StepNumber => LastStepCheckpoints }, Steps2,
+								validated_steps);
 					false ->
 						Session
 				end,
@@ -693,7 +695,7 @@ handle_info({'DOWN', Ref, process, _, Reason}, #state{ worker_monitor_ref = Ref 
 
 handle_info({computed, Args}, State) ->
 	#state{ current_session_key = CurrentSessionKey } = State,
-	{StepNumber, PrevOutput, Output, Checkpoints} = Args,
+	{StepNumber, PrevOutput, Output, Checkpoints, SessionKey} = Args,
 	Session = get_session(CurrentSessionKey, State),
 	#vdf_session{ next_vdf_difficulty = NextVDFDifficulty, steps = [SessionOutput | _] } = Session,
 	{NextSeed, IntervalNumber, NextVDFDifficulty} = CurrentSessionKey,
@@ -701,8 +703,11 @@ handle_info({computed, Args}, State) ->
 	SessionOutput2 = ar_nonce_limiter:maybe_add_entropy(
 			SessionOutput, IntervalStart, StepNumber, NextSeed),
 	gen_server:cast(?MODULE, schedule_step),
-	case PrevOutput == SessionOutput2 of
-		false ->
+	case {PrevOutput == SessionOutput2, SessionKey == CurrentSessionKey} of
+		{true, false} ->
+			?LOG_INFO([{event, received_computed_output_for_different_session_key}]),
+			{noreply, State};
+		{false, _} ->
 			case ar_config:use_remote_vdf_server() of
 				true ->
 					ok;
@@ -711,9 +716,9 @@ handle_info({computed, Args}, State) ->
 						{output, ar_util:encode(Output)}])
 			end,
 			{noreply, State};
-		true ->
+		{true, true} ->
 			Session2 = update_session(Session, StepNumber,
-					#{ StepNumber => Checkpoints }, [Output]),
+					#{ StepNumber => Checkpoints }, [Output], computed_step),
 			State2 = cache_session(State, CurrentSessionKey, Session2),
 			?LOG_DEBUG([{event, new_vdf_step}, {source, computed},
 				{session_key, encode_session_key(CurrentSessionKey)}, {step_number, StepNumber}]),
@@ -742,10 +747,31 @@ session_key(NextSeed, StepNumber, NextVDFDifficulty) ->
 get_session(SessionKey, #state{ session_by_key = SessionByKey }) ->
 	maps:get(SessionKey, SessionByKey, not_found).
 
-update_session(Session, StepNumber, StepCheckpointsMap, Steps) ->
+update_session(Session, StepNumber, StepCheckpointsMap, Steps, Source) ->
 	#vdf_session{ step_checkpoints_map = Map } = Session,
+	case find_step_checkpoints_mismatch(StepCheckpointsMap, Map) of
+		{true, MismatchStepNumber} ->
+			?LOG_ERROR([{event, step_checkpoints_mismatch},
+					{step_number, StepNumber},
+					{mismatch_step_number, MismatchStepNumber},
+					{source, Source}]);
+		false ->
+			false
+	end,
 	Map2 = maps:merge(StepCheckpointsMap, Map),
 	update_session(Session#vdf_session{ step_checkpoints_map = Map2 }, StepNumber, Steps).
+
+find_step_checkpoints_mismatch(StepCheckpointsMap, Map) ->
+	maps:fold(fun(StepNumber, Checkpoints, Acc) ->
+		case maps:get(StepNumber, Map, not_found) of
+			not_found ->
+				Acc;
+			Checkpoints ->
+				Acc;
+			_Checkpoints2 ->
+				{true, StepNumber}
+		end
+	end, false, StepCheckpointsMap).
 
 update_session(Session, StepNumber, Steps) ->
 	#vdf_session{ steps = CurrentSteps } = Session,
@@ -843,7 +869,7 @@ apply_base_block(B, State) ->
 			last_step_checkpoints = LastStepCheckpoints,
 			vdf_difficulty = VDFDifficulty,
 			next_vdf_difficulty = NextVDFDifficulty } = B#block.nonce_limiter_info,
-	Session = #vdf_session{ 
+	Session = #vdf_session{
 			seed = Seed, step_number = StepNumber,
 			upper_bound = UpperBound, next_upper_bound = NextUpperBound,
 			vdf_difficulty = VDFDifficulty, next_vdf_difficulty = NextVDFDifficulty ,
@@ -988,11 +1014,11 @@ verify_no_reset(StartStepNumber, PrevOutput, NumCheckpointsBetweenHashes, Hashes
 
 worker() ->
 	receive
-		{compute, {StepNumber, PrevOutput, VDFDifficulty}, From} ->
+		{compute, {StepNumber, PrevOutput, VDFDifficulty, SessionKey}, From} ->
 			{ok, Output, Checkpoints} = prometheus_histogram:observe_duration(
 					vdf_step_time_milliseconds, [], fun() -> compute(StepNumber, PrevOutput,
 							VDFDifficulty) end),
-			From ! {computed, {StepNumber, PrevOutput, Output, Checkpoints}},
+			From ! {computed, {StepNumber, PrevOutput, Output, Checkpoints, SessionKey}},
 			worker();
 		stop ->
 			ok
@@ -1047,7 +1073,7 @@ schedule_step(State) ->
 					{next_vdf_difficulty, NextVDFDifficulty}]),
 				NextVDFDifficulty
 		end,
-	Worker ! {compute, {StepNumber, PrevOutput2, VDFDifficulty2}, self()},
+	Worker ! {compute, {StepNumber, PrevOutput2, VDFDifficulty2, Key}, self()},
 	State.
 
 get_or_init_nonce_limiter_info(#block{ height = Height } = B, Seed, PartitionUpperBound) ->
@@ -1144,7 +1170,7 @@ apply_external_update3(Update, CurrentSession, State) ->
 			Steps2 = lists:sublist(Steps,
 					StepNumber - max(CurrentStepNumber, StartStepNumber)),
 			CurrentSession2 = update_session(CurrentSession, StepNumber,
-					StepCheckpointsMap, Steps2),
+					StepCheckpointsMap, Steps2, apply_external_update),
 			State2 = apply_external_update4(State, SessionKey, CurrentSession2, Steps2),
 			{reply, ok, State2};
 		false ->
@@ -1197,13 +1223,13 @@ apply_external_update4(State, SessionKey, Session, Steps) ->
 %% primarily used to manage "overflow" steps.
 %%
 %% Between blocks nodes will add all computed VDF steps to the same session -
-%% *even if* the new steps have crossed the entropy reset line and therefore 
-%% could be added to a new session (i.e. "overflow steps"). Once a block is 
+%% *even if* the new steps have crossed the entropy reset line and therefore
+%% could be added to a new session (i.e. "overflow steps"). Once a block is
 %% processed the node will open a new session and re-allocate all the steps past
 %% the entropy reset line to that new session. However, any steps that have crossed
 %% *TWO* entropy reset lines are no longer valid (the seed they were generated with
 %% has changed with the arrival of a new block)
-%% 
+%%
 %% Note: This overlap in session caching is intentional. The intention is to
 %% quickly access the steps when validating B1 -> reset line -> B2 given the
 %% current fork of B1 -> B2' -> reset line -> B3 i.e. we can query all steps by
@@ -1234,7 +1260,7 @@ get_step_range(Steps, StepNumber, _RangeStart, RangeEnd)
 get_step_range(Steps, StepNumber, RangeStart, RangeEnd) ->
 	%% Clip RangeStart to the earliest step number in Steps
 	RangeStart2 = max(RangeStart, StepNumber - length(Steps) + 1),
-	RangeSteps = 
+	RangeSteps =
 		case StepNumber > RangeEnd of
 			true ->
 				%% Exclude steps beyond the end of the session
@@ -1293,7 +1319,7 @@ maybe_set_vdf_metrics(SessionKey, CurrentSessionKey, Session) ->
 		true ->
 			#vdf_session{
 				step_number = StepNumber,
-				vdf_difficulty = VDFDifficulty, 
+				vdf_difficulty = VDFDifficulty,
 				next_vdf_difficulty = NextVDFDifficulty } = Session,
 			prometheus_gauge:set(vdf_step, StepNumber),
 			prometheus_gauge:set(vdf_difficulty, [current], VDFDifficulty),
@@ -1549,4 +1575,3 @@ get_triplets_test() ->
 	?assertEqual([{a, 2, 3}, {b, 1, 2}], get_triplets(2, [a, b, c], 2, 2, 3, 2)),
 	?assertEqual([{a, 3, 3}, {b, 2, 3}, {c, 1, 3}], get_triplets(3, [a, b, c], 0, 2, 3, 3)),
 	?assertEqual([{a, 3, 2}, {b, 2, 2}, {c, 1, 2}], get_triplets(3, [a, b, c], none, 2, 3, 4)).
-

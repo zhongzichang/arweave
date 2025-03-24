@@ -71,14 +71,12 @@ start_http_iface_listener(Config) ->
 	TlsCertfilePath = Config#config.tls_cert_file,
 	TlsKeyfilePath = Config#config.tls_key_file,
 	TransportOpts = [
-		{linger, {true, 10}},
 		{port, Config#config.port},
 		{keepalive, true},
 		{max_connections, Config#config.max_connections}
 	],
 	ProtocolOpts = #{
-		inactivity_timeout => 120000,
-		idle_timeout => 30000,
+		idle_timeout => Config#config.http_api_transport_idle_timeout,
 		middlewares => ?HTTP_IFACE_MIDDLEWARES,
 		env => #{ dispatch => Dispatch },
 		metrics_callback => fun prometheus_cowboy2_instrumenter:observe/1,

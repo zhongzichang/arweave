@@ -7,6 +7,12 @@
 %% (e.g. bin/test or bin/shell)
 -define(IS_TEST, erlang:get_cookie() == test).
 
+%% Default gen_server:call timeout.
+%% Is used to safely replace deprecated `infinity` timeout, that was used in
+%% multiple places, with a more reasonable value.
+%% Is a subject for future changes.
+-define(DEFAULT_CALL_TIMEOUT, 600000).
+
 %% The mainnet name. Does not change at the hard forks.
 -ifndef(NETWORK_NAME).
 	-ifdef(AR_TEST).
@@ -27,7 +33,7 @@
 -define(CLIENT_VERSION, 5).
 
 %% The current build number -- incremented for every release.
--define(RELEASE_NUMBER, 80).
+-define(RELEASE_NUMBER, 81).
 
 -define(DEFAULT_REQUEST_HEADERS,
 	[
@@ -102,7 +108,8 @@
 -define(WINSTON_PER_AR, 1000000000000).
 
 %% The number of bytes in a gibibyte.
--define(MiB, (1024 * 1024)).
+-define(KiB, (1024)).
+-define(MiB, (1024 * ?KiB)).
 -define(GiB, (1024 * ?MiB)).
 -define(TiB, (1024 * ?GiB)).
 

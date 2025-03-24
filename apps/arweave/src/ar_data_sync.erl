@@ -2,7 +2,7 @@
 
 -behaviour(gen_server).
 
--export([name/1, start_link/2, register_workers/0, join/1, add_tip_block/2, add_block/2, 
+-export([name/1, start_link/2, register_workers/0, join/1, add_tip_block/2, add_block/2,
 		invalidate_bad_data_record/4, is_chunk_proof_ratio_attractive/3,
 		add_chunk/5, add_data_root_to_disk_pool/3, maybe_drop_data_root_from_disk_pool/3,
 		get_chunk/2, get_chunk_data/2, get_chunk_proof/2, get_tx_data/1, get_tx_data/2,
@@ -270,7 +270,7 @@ add_chunk(DataRoot, DataPath, Chunk, Offset, TXSize) ->
 -spec put_chunk_data(
 	ChunkDataKey :: binary(),
 	StoreID :: term(),
-	Value :: DataPath :: binary() | {Chunk :: binary(), DataPath :: binary()}) -> 
+	Value :: DataPath :: binary() | {Chunk :: binary(), DataPath :: binary()}) ->
 		ok | {error, term()}.
 put_chunk_data(ChunkDataKey, StoreID, Value) ->
 	ar_kv:put({chunk_data_db, StoreID}, ChunkDataKey, term_to_binary(Value)).
@@ -285,7 +285,7 @@ delete_chunk_data(ChunkDataKey, StoreID) ->
 	AbsoluteOffset :: non_neg_integer(),
 	StoreID :: term(),
 	Metadata :: term()) -> ok | {error, term()}.
-put_chunk_metadata(AbsoluteOffset, StoreID, 
+put_chunk_metadata(AbsoluteOffset, StoreID,
 	{_ChunkDataKey, _TXRoot, _DataRoot, _TXPath, _Offset, _ChunkSize} = Metadata) ->
 	Key = << AbsoluteOffset:?OFFSET_KEY_BITSIZE >>,
 	ar_kv:put({chunks_index, StoreID}, Key, term_to_binary(Metadata)).
@@ -459,12 +459,17 @@ get_chunk(Offset, #{ packing := Packing } = Options) ->
 			ModuleIDs = [ar_storage_module:id(Module) || Module <- Modules],
 			RootRecords = [ets:lookup(sync_records, {ar_data_sync, ID})
 					|| ID <- ModuleIDs],
-			log_chunk_error(RequestOrigin, chunk_record_not_found,
-					[{modules_covering_offset, ModuleIDs},
-					{root_sync_records, RootRecords},
-					{seek_offset, SeekOffset},
-					{reply, io_lib:format("~p", [Reply])},
-					{is_recorded_unpacked, io_lib:format("~p", [UnpackedReply])}]),
+			case RequestOrigin of
+				miner ->
+					log_chunk_error(RequestOrigin, chunk_record_not_found,
+							[{modules_covering_offset, ModuleIDs},
+							{root_sync_records, RootRecords},
+							{seek_offset, SeekOffset},
+							{reply, io_lib:format("~p", [Reply])},
+							{is_recorded_unpacked, io_lib:format("~p", [UnpackedReply])}]);
+				_ ->
+					ok
+			end,
 			{error, chunk_not_found}
 	end.
 
@@ -550,7 +555,7 @@ has_data_root(DataRoot, DataSize) ->
 
 %% @doc Record the metadata of the given block.
 add_block(B, SizeTaggedTXs) ->
-	gen_server:call(ar_data_sync_default, {add_block, B, SizeTaggedTXs}, infinity).
+	gen_server:call(ar_data_sync_default, {add_block, B, SizeTaggedTXs}, ?DEFAULT_CALL_TIMEOUT).
 
 %% @doc Request the removal of the transaction data.
 request_tx_data_removal(TXID, Ref, ReplyTo) ->
@@ -622,7 +627,7 @@ get_chunk_by_byte(Byte, StoreID) ->
 
 %% @doc: handle situation where get_chunks_by_byte returns invalid_iterator, so we can't
 %% use the chunk's end offset to advance the cursor.
-%% 
+%%
 %% get_chunk_by_byte looks for a key with the same prefix or the next prefix.
 %% Therefore, if there is no such key, it does not make sense to look for any
 %% key smaller than the prefix + 2 in the next iteration.
@@ -887,7 +892,7 @@ handle_cast({add_tip_block, BlockTXPairs, BI}, State) ->
 		State#sync_data_state{
 			weave_size = WeaveSize,
 			block_index = BI,
-			disk_pool_threshold = DiskPoolThreshold 
+			disk_pool_threshold = DiskPoolThreshold
 		}),
 	{noreply, State2};
 
@@ -1109,7 +1114,7 @@ handle_cast({store_chunk, ChunkArgs, Args} = Cast,
 	end;
 
 handle_cast({store_fetched_chunk, Peer, Byte, Proof} = Cast, State) ->
-	{store_fetched_chunk, Peer, Byte, Proof} = Cast,	
+	{store_fetched_chunk, Peer, Byte, Proof} = Cast,
 	#{ data_path := DataPath, tx_path := TXPath, chunk := Chunk, packing := Packing } = Proof,
 	SeekByte = get_chunk_seek_offset(Byte + 1) - 1,
 	{BlockStartOffset, BlockEndOffset, TXRoot} = ar_block_index:get_block_bounds(SeekByte),
@@ -1483,15 +1488,23 @@ init_sync_status(StoreID) ->
 	end,
 	ar_device_lock:set_device_lock_metric(StoreID, sync, SyncStatus),
 	SyncStatus.
-log_chunk_error(Event, ExtraLogData) ->
-	?LOG_ERROR([{event, Event}, {tags, [solution_proofs]} | ExtraLogData]).
+do_log_chunk_error(LogType, Event, ExtraLogData) ->
+	LogData = [{event, Event}, {tags, [solution_proofs]} | ExtraLogData],
+	case LogType of
+		error ->
+			?LOG_ERROR(LogData);
+		info ->
+			?LOG_INFO(LogData)
+	end.
 
 log_chunk_error(http, _, _) ->
 	ok;
 log_chunk_error(tx_data, _, _) ->
 	ok;
+log_chunk_error(verify, Event, ExtraLogData) ->
+	do_log_chunk_error(info, Event, [{request_origin, verify} | ExtraLogData]);
 log_chunk_error(RequestOrigin, Event, ExtraLogData) ->
-	log_chunk_error(Event, [{request_origin, RequestOrigin} | ExtraLogData]).
+	do_log_chunk_error(error, Event, [{request_origin, RequestOrigin} | ExtraLogData]).
 
 do_sync_intervals(State) ->
 	#sync_data_state{ sync_intervals_queue = Q,
@@ -1668,17 +1681,13 @@ get_chunk(Offset, SeekOffset, Pack, Packing, StoredPacking, StoreID, RequestOrig
 						%% Requested and stored chunk are in different formats,
 						%% and repacking is disabled.
 						{error, chunk_stored_in_different_packing_only};
-					{_, false, true} ->
-						ar_packing_server:repack(
-							Packing, StoredPacking, AbsoluteOffset,
-							TXRoot, Chunk, ChunkSize);
 					_ ->
 						ar_packing_server:repack(
 							Packing, StoredPacking, AbsoluteOffset, TXRoot, Chunk, ChunkSize)
 				end,
 			case {PackResult, ChunkID} of
 				{{error, Reason}, _} ->
-					log_chunk_error(failed_to_repack_chunk,
+					log_chunk_error(RequestOrigin, failed_to_repack_chunk,
 							[{packing, ar_serialize:encode_packing(Packing, true)},
 							{stored_packing, ar_serialize:encode_packing(StoredPacking, true)},
 							{absolute_end_offset, AbsoluteOffset},
@@ -1719,7 +1728,7 @@ get_chunk(Offset, SeekOffset, Pack, Packing, StoredPacking, StoreID, RequestOrig
 								true ->
 									{ok, Proof#{ unpacked_chunk => MaybeUnpackedChunk }};
 								false ->
-									log_chunk_error(get_chunk_invalid_id,
+									log_chunk_error(RequestOrigin, get_chunk_invalid_id,
 											[{chunk_size, ChunkSize},
 											{actual_chunk_size, byte_size(MaybeUnpackedChunk)},
 											{requested_packing,
@@ -1727,9 +1736,12 @@ get_chunk(Offset, SeekOffset, Pack, Packing, StoredPacking, StoreID, RequestOrig
 											{stored_packing,
 												ar_serialize:encode_packing(StoredPacking, true)},
 											{absolute_end_offset, AbsoluteOffset},
+											{offset, Offset},
+											{seek_offset, SeekOffset},
 											{store_id, StoreID},
 											{expected_chunk_id, ar_util:encode(ChunkID)},
-											{chunk_id, ar_util:encode(ComputedChunkID)}]),
+											{chunk_id, ar_util:encode(ComputedChunkID)},
+											{actual_chunk, binary:part(MaybeUnpackedChunk, 0, 32)}]),
 									invalidate_bad_data_record({AbsoluteOffset, ChunkSize,
 										StoreID, get_chunk_invalid_id}),
 									{error, chunk_not_found}
@@ -1831,7 +1843,7 @@ read_chunk_with_metadata(
 						failed_to_read_chunk_data_path}),
 					{error, chunk_not_found};
 				{error, Error} ->
-					log_chunk_error(failed_to_read_chunk,
+					log_chunk_error(RequestOrigin, failed_to_read_chunk,
 							[{reason, io_lib:format("~p", [Error])},
 							{chunk_data_key, ar_util:encode(ChunkDataKey)},
 							{absolute_end_offset, Offset}]),
@@ -1844,12 +1856,12 @@ read_chunk_with_metadata(
 							ModuleIDs = [ar_storage_module:id(Module) || Module <- Modules],
 							RootRecords = [ets:lookup(sync_records, {ar_data_sync, ID})
 									|| ID <- ModuleIDs],
-							log_chunk_error(chunk_metadata_read_sync_record_race_condition,
+							log_chunk_error(RequestOrigin, chunk_metadata_read_sync_record_race_condition,
 								[{seek_offset, SeekOffset},
 								{storeID, StoreID},
 								{modules_covering_seek_offset, ModuleIDs},
 								{root_sync_records, RootRecords},
-								{stored_packing, 
+								{stored_packing,
 									ar_serialize:encode_packing(StoredPacking, true)}]),
 							%% The chunk should have been re-packed
 							%% in the meantime - very unlucky timing.
@@ -1887,7 +1899,7 @@ invalidate_bad_data_record2({AbsoluteEndOffset, ChunkSize, StoreID, Type}) ->
 	case remove_invalid_sync_records(PaddedEndOffset, StartOffset, StoreID) of
 		ok ->
 			ar_sync_record:add(PaddedEndOffset, StartOffset, invalid_chunks, StoreID),
-			case delete_chunk_metadata(AbsoluteEndOffset, StoreID) of
+			case delete_invalid_metadata(AbsoluteEndOffset, StoreID) of
 				ok ->
 					ok;
 				Error2 ->
@@ -1928,13 +1940,28 @@ remove_invalid_sync_records(PaddedEndOffset, StartOffset, StoreID) ->
 			Remove3
 	end.
 
+delete_invalid_metadata(AbsoluteEndOffset, StoreID) ->
+	case get_chunk_metadata(AbsoluteEndOffset, StoreID) of
+		not_found ->
+			ok;
+		{ok, Metadata} ->
+			{ChunkDataKey, _, _, _, _, _} = Metadata,
+			delete_chunk_data(ChunkDataKey, StoreID),
+			delete_chunk_metadata(AbsoluteEndOffset, StoreID)
+	end.
+
 validate_fetched_chunk(Args) ->
 	{Offset, DataPath, TXPath, TXRoot, ChunkSize, StoreID, RequestOrigin} = Args,
 	[{_, T}] = ets:lookup(ar_data_sync_state, disk_pool_threshold),
 	case Offset > T orelse not ar_node:is_joined() of
 		true ->
-			log_chunk_error(RequestOrigin, miner_requested_disk_pool_chunk,
-				[{disk_pool_threshold, T}, {end_offset, Offset}]),
+			case RequestOrigin of
+				miner ->
+					log_chunk_error(RequestOrigin, miner_requested_disk_pool_chunk,
+							[{disk_pool_threshold, T}, {end_offset, Offset}]);
+				_ ->
+					ok
+			end,
 			{true, none};
 		false ->
 			case ar_block_index:get_block_bounds(Offset - 1) of
@@ -1954,7 +1981,7 @@ validate_fetched_chunk(Args) ->
 							false
 					end;
 				{_BlockStart, _BlockEnd, TXRoot2} ->
-					log_chunk_error(stored_chunk_invalid_tx_root,
+					log_chunk_error(RequestOrigin, stored_chunk_invalid_tx_root,
 						[{end_offset, Offset}, {tx_root, ar_util:encode(TXRoot2)},
 						{stored_tx_root, ar_util:encode(TXRoot)}, {store_id, StoreID}]),
 					invalidate_bad_data_record({Offset, ChunkSize, StoreID,
@@ -3191,7 +3218,7 @@ get_required_chunk_packing(_Offset, _ChunkSize, #sync_data_state{ store_id = "de
 	unpacked;
 get_required_chunk_packing(Offset, ChunkSize, State) ->
 	#sync_data_state{ store_id = StoreID } = State,
-	IsEarlySmallChunk = 
+	IsEarlySmallChunk =
 		Offset =< ?STRICT_DATA_SPLIT_THRESHOLD andalso ChunkSize < ?DATA_CHUNK_SIZE,
 	case IsEarlySmallChunk of
 		true ->
@@ -3284,7 +3311,7 @@ parse_disk_pool_chunk(Bin) ->
 	end.
 
 delete_disk_pool_chunk(Iterator, Args, State) ->
-	#sync_data_state{ 
+	#sync_data_state{
 			disk_pool_chunks_index = DiskPoolChunksIndex, store_id = StoreID } = State,
 	{Offset, _, ChunkSize, _, _, ChunkDataKey, DiskPoolKey, _, _, _} = Args,
 	case data_root_index_next_v2(Iterator, 10) of
