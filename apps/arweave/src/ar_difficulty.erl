@@ -1,7 +1,7 @@
 -module(ar_difficulty).
 
 -export([get_hash_rate_fixed_ratio/1, next_cumulative_diff/3, multiply_diff_pre_fork_2_5/2,
-			diff_pair/1, poa1_diff_multiplier/1, poa1_diff/2, scale_diff/3,
+			diff_pair/2, diff_pair/1, poa1_diff_multiplier/1, poa1_diff/2, scale_diff/3,
 			min_difficulty/1, switch_to_randomx_fork_diff/1, sub_diff/2]).
 
 -include_lib("arweave/include/ar.hrl").
