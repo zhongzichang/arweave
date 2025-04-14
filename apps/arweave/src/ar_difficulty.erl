@@ -62,8 +62,8 @@ multiply_diff_pre_fork_2_5(Diff, Multiplier) ->
 	?MAX_DIFF - erlang:trunc(1 / Multiplier * (?MAX_DIFF - Diff)).
 
 diff_pair(Block, DiffFactor) ->
-	Diff = Block#block.diff div DiffFactor,
 	Height = Block#block.height,
+	Diff = scale_diff(Block#block.diff, {1, DiffFactor}, Height),
 	{poa1_diff(Diff, Height), Diff}.
 
 diff_pair(Block) ->
