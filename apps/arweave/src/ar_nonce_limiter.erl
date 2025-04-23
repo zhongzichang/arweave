@@ -17,10 +17,10 @@
 
 -export([init/1, handle_cast/2, handle_call/3, handle_info/2, terminate/2]).
 
--include("../include/ar.hrl").
--include("../include/ar_vdf.hrl").
--include("../include/ar_config.hrl").
--include("../include/ar_consensus.hrl").
+-include("ar.hrl").
+-include("ar_vdf.hrl").
+-include("ar_config.hrl").
+-include("ar_consensus.hrl").
 
 -include_lib("eunit/include/eunit.hrl").
 
@@ -58,6 +58,11 @@ is_ahead_on_the_timeline(NonceLimiterInfo1, NonceLimiterInfo2) ->
 	#nonce_limiter_info{ global_step_number = N1 } = NonceLimiterInfo1,
 	#nonce_limiter_info{ global_step_number = N2 } = NonceLimiterInfo2,
 	N1 > N2.
+
+session_key(#nonce_limiter_info{ 
+		next_seed = NextSeed, global_step_number = StepNumber,
+		next_vdf_difficulty = NextVDFDifficulty }) ->
+	session_key(NextSeed, StepNumber, NextVDFDifficulty).
 
 %% @doc Return the nonce limiter session with the given key.
 get_session(SessionKey) ->
@@ -412,6 +417,7 @@ apply_external_update(Update, Peer) ->
 %%%===================================================================
 
 init([]) ->
+	?LOG_INFO([{event, nonce_limiter_init}]),
 	ok = ar_events:subscribe(node_state),
 	State =
 		case ar_node:is_joined() of
@@ -536,6 +542,12 @@ handle_call(get_steps, _From, State) ->
 
 handle_call({apply_external_update, Update, Peer}, _From, State) ->
 	Now = os:system_time(millisecond),
+	#nonce_limiter_update{ session_key = SessionKey } = Update,
+	%% The client consults the latest session key by peer to decide whether to request the
+	%% missing VDF session when we call ar_nonce_limiter_client:maybe_request_sessions/1
+	%% during VDF validation.
+	gen_server:cast(ar_nonce_limiter_client,
+			{update_latest_session_key, Peer, SessionKey}),
 	apply_external_update2(Update, State#state{ last_external_update = {Peer, Now} });
 
 handle_call({get_session, SessionKey}, _From, State) ->
@@ -713,7 +725,11 @@ handle_info({computed, Args}, State) ->
 					ok;
 				false ->
 					?LOG_WARNING([{event, computed_for_outdated_key}, {step_number, StepNumber},
-						{output, ar_util:encode(Output)}])
+						{output, ar_util:encode(Output)},
+						{prev_output, ar_util:encode(PrevOutput)},
+						{session_output, ar_util:encode(SessionOutput2)},
+						{current_session_key, encode_session_key(CurrentSessionKey)},
+						{session_key, encode_session_key(SessionKey)}])
 			end,
 			{noreply, State};
 		{true, true} ->
@@ -738,9 +754,6 @@ terminate(_Reason, #state{ worker = W }) ->
 %%% Private functions.
 %%%===================================================================
 
-session_key(#nonce_limiter_info{ next_seed = NextSeed, global_step_number = StepNumber,
-		next_vdf_difficulty = NextVDFDifficulty }) ->
-	session_key(NextSeed, StepNumber, NextVDFDifficulty).
 session_key(NextSeed, StepNumber, NextVDFDifficulty) ->
 	{NextSeed, StepNumber div ar_nonce_limiter:get_reset_frequency(), NextVDFDifficulty}.
 
@@ -843,6 +856,8 @@ exclude_computed_steps_from_steps_to_validate(_StepsToValidate, _ComputedSteps, 
 	invalid.
 
 handle_initialized([B | Blocks], State) ->
+	?LOG_INFO([{event, handle_initialized},
+		{module, ar_nonce_limiter}, {blocks, length([B | Blocks])}]),
 	Blocks2 = take_blocks_after_fork([B | Blocks]),
 	handle_initialized2(lists:reverse(Blocks2), State).
 
@@ -1070,7 +1085,8 @@ schedule_step(State) ->
 			_ ->
 				?LOG_DEBUG([{event, entropy_reset_point_found}, {step_number, StepNumber},
 					{interval_start, IntervalStart}, {vdf_difficulty, VDFDifficulty},
-					{next_vdf_difficulty, NextVDFDifficulty}]),
+					{next_vdf_difficulty, NextVDFDifficulty},
+					{session_key, encode_session_key(Key)}]),
 				NextVDFDifficulty
 		end,
 	Worker ! {compute, {StepNumber, PrevOutput2, VDFDifficulty2, Key}, self()},

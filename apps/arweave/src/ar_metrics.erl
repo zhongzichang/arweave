@@ -1,6 +1,6 @@
 -module(ar_metrics).
 
--include_lib("arweave/include/ar.hrl").
+-include("ar.hrl").
 
 -export([register/0, get_status_class/1, record_rate_metric/4]).
 
@@ -84,14 +84,6 @@ register() ->
 	prometheus_gauge:new([{name, outbound_connections},
 			{help, "The current number of the open outbound network connections"}]),
 
-	%% SQLite.
-	prometheus_histogram:new([
-		{name, sqlite_query_time},
-		{buckets, [1, 10, 100, 500, 1000, 2000, 10000, 30000]},
-		{labels, [query_type]},
-		{help, "The time in milliseconds of SQLite queries."}
-	]),
-
 	%% Transaction and block propagation.
 	prometheus_gauge:new([
 		{name, tx_queue_size},
@@ -146,6 +138,29 @@ register() ->
 	prometheus_counter:new([{name, block2_fetched_chunks},
 			{help, "The total number of chunks fetched locally during the successful"
 					" processing of POST /block2."}]),
+	prometheus_histogram:new([
+		{name, ar_mempool_add_tx_duration_milliseconds},
+		{buckets, [0.1, 1, 10, 100, 1000]},
+		{help, "The duration in milliseconds it took to add a transaction to the mempool."}
+	]),
+	prometheus_histogram:new([
+		{name, reverify_mempool_chunk_duration_milliseconds},
+		{buckets, [0.1, 1, 10, 100, 1000]},
+		{help, "The duration in milliseconds it took to reverify a chunk of transactions "
+				"in the mempool."}
+	]),
+	prometheus_histogram:new([
+		{name, drop_txs_duration_milliseconds},
+		{buckets, [0.1, 1, 10, 100, 1000]},
+		{help, "The duration in milliseconds it took to drop a chunk of transactions "
+				"from the mempool."}
+	]),
+	prometheus_histogram:new([
+		{name, del_from_propagation_queue_duration_milliseconds},
+		{buckets, [0.1, 1, 10, 100, 1000]},
+		{help, "The duration in milliseconds it took to remove a transaction from the "
+				"propagation queue after it was emitted to peers."}
+	]),
 
 	%% Data seeding.
 	prometheus_gauge:new([
@@ -212,12 +227,7 @@ register() ->
 		{buckets, lists:seq(1, 50)},
 		{help, "Fork recovery depth metric"}
 	]),
-	prometheus_histogram:new([
-		{name, block_construction_time_milliseconds},
-		{buckets, [1, 10, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 2000, 10000, 30000]},
-		{help, "The time it takes to pick and validate transactions for a block and generate"
-				" a preimage to use in mining."}
-	]),
+
 	prometheus_gauge:new([
 		{name, wallet_list_size},
 		{
@@ -246,6 +256,8 @@ register() ->
 			"The total number of synced block headers."
 		}
 	]),
+
+	%% Mining.
 	prometheus_gauge:new([
 		{name, mining_rate},
 		{labels, [type, partition]},
@@ -268,7 +280,6 @@ register() ->
 				"The peer label indicates the peer that the value is exchanged with, and the "
 				"direction label can be 'to' or 'from'."}
 	]),
-
 	prometheus_gauge:new([
 		{name, cm_h2_count},
 		{labels, [peer, direction]},
@@ -276,7 +287,6 @@ register() ->
 				"The peer label indicates the peer that the value is exchanged with, and the "
 				"direction label can be 'to' or 'from'."}
 	]),
-
 	prometheus_gauge:new([
 		{name, mining_server_chunk_cache_size},
 		{labels, [partition]},
@@ -289,26 +299,31 @@ register() ->
 		{help, "The number of items in the mining server task queue."}
 	]),
 	prometheus_gauge:new([
-		{name, mining_solution_failure},
+		{name, mining_solution},
 		{labels, [reason]},
-		{help, "The number of times we failed to prepare a block from a mining solution."}
-	]),
-	prometheus_gauge:new([
-		{name, mining_solution_success},
-		{help, "The number of times a block was successfully prepared "
-				"from a mining solution. It does not necessarily mean the block "
-				"ended up in the blockchain."}
-	]),
-	prometheus_gauge:new([
-		{name, mining_solution_total},
-		{help, "The total number of mining solutions no matter whether we failed to "
-				"prepare a block from them or not."}
+		{help, "Incremented whenever the miner generates a solution. The 'reason' label "
+				"will be 'success' if a block was successfully prepared from the solution, "
+				"and will list a failure reason otherwise. Note: even if a block is "
+				"successfully prepared from a solution, it does not necessarily mean "
+				"the block ended up in the blockchain."}
 	]),
 	prometheus_histogram:new([
+		{name, chunk_storage_sync_record_check_duration_milliseconds},
+		{labels, [requested_chunk_count]},
+		{buckets, [0.1, 1, 10, 100, 1000, 10000]},
+		{help, "The time in milliseconds it took to check the fetched chunk range "
+				"is actually registered by the chunk storage."}
+	]),
+	prometheus_gauge:new([
+		{name, fixed_broken_chunk_storage_records},
+		{help, "The number of fixed broken chunk storage records detected when "
+				"reading a range of chunks."}
+	]),
+
+	%% VDF.
+	prometheus_histogram:new([
 		{name, vdf_step_time_milliseconds},
-		{buckets, [100, 250, 500, 750, 1000, 1250, 1500, 1750, 2000, 2500, 3000, 3500, 4000,
-				4500, 5000, 5500, 6000, 6500, 7000, 7500, 8000, 8500, 9000, 9500, 10000, 15000,
-				20000, 30000]},
+		{buckets, [infinity]}, %% we don't care about the histogram portion
 		{labels, []},
 		{help, "The time in milliseconds it took to compute a VDF step."}
 	]),
@@ -360,6 +375,18 @@ register() ->
 		{help, "The amount of Winston in the endowment pool."}
 	]),
 	prometheus_gauge:new([
+		{name, kryder_plus_rate_multiplier},
+		{help, "Kryder+ rate multiplier."}
+	]),
+	prometheus_gauge:new([
+		{name, endowment_pool_take},
+		{help, "Value we take from endowment pool to miner to compensate difference between expected and real reward."}
+	]),
+	prometheus_gauge:new([
+		{name, endowment_pool_give},
+		{help, "Value we give to endowment pool from transaction fees."}
+	]),
+	prometheus_gauge:new([
 		{name, available_supply},
 		{help, "The total supply minus the endowment, in Winston."}
 	]),
@@ -393,27 +420,6 @@ register() ->
 				"of the latest block."}
 	]),
 	prometheus_gauge:new([
-		{name, network_burden},
-		{help, "The legacy (2.5) estimation of the cost of storing the current weave "
-				"assuming the 0.5% storage costs decline rate, in Winston."}
-	]),
-	prometheus_gauge:new([
-		{name, network_burden_10_usd_ar},
-		{help, "The legacy (2.5) estimation of the cost of storing the current weave "
-				"assuming the 0.5% storage costs decline rate and 10 $/AR, in Winston."}
-	]),
-	prometheus_gauge:new([
-		{name, network_burden_200_years},
-		{help, "The legacy (2.5) estimation of the cost of storing the current weave for "
-				"200 years assuming the 0.5% storage costs decline rate, in Winston."}
-	]),
-	prometheus_gauge:new([
-		{name, network_burden_200_years_10_usd_ar},
-		{help, "The legacy (2.5) estimation of the cost of storing the current weave for "
-				"200 years assuming the 0.5% storage costs decline rate and 10 $/AR, "
-				"in Winston."}
-	]),
-	prometheus_gauge:new([
 		{name, expected_minimum_200_years_storage_costs_decline_rate},
 		{help, "The expected minimum decline rate sufficient to subsidize storage of "
 				"the current weave for 200 years according to the legacy (2.5) estimations."}
@@ -429,7 +435,7 @@ register() ->
 	prometheus_histogram:new([
 		{name, packing_duration_milliseconds},
 		{labels, [type, packing, trigger]},
-		{buckets, [1, 5, 10, 50, 100, 500, 1000]},
+		{buckets, [infinity]}, %% we don't care about the histogram portion
 		{help, "The packing/unpacking time in milliseconds. The type label indicates what "
 				"type of operation was requested either: 'pack', 'unpack',"
 				"'unpack_sub_chunk', or 'pack_sub_chunk'. The packing "
@@ -443,7 +449,7 @@ register() ->
 	]),
 	prometheus_counter:new([
 		{name, packing_requests},
-		{labels, [type, packing, from]},
+		{labels, [type, packing]},
 		{help, "The number of packing requests received. The type label indicates what "
 				"type of operation was requested either: 'pack', 'unpack', or "
 				"'unpack_sub_chunk'. The packing "
@@ -451,9 +457,7 @@ register() ->
 				"indicates the format of the chunk before being unpacked. If type is 'pack' "
 				"then the packing label indicates the format that the chunk will be packed "
 				"to. In all cases its value can be 'unpacked', 'unpacked_padded', "
-				"'spora_2_5', 'spora_2_6', 'composite', or 'replica_2_9'. "
-				"The from label shows where the request was initiated (e.g. the "
-				"calling function, or message). "}
+				"'spora_2_5', 'spora_2_6', 'composite', or 'replica_2_9'."}
 	]),
 	prometheus_counter:new([
 		{name, validating_packed_spora},
@@ -471,6 +475,24 @@ register() ->
 		{labels, [packing, store_id]},
 		{help, "The counter is incremented every time a chunk is written to "
 				"chunk_storage."}]),
+	prometheus_counter:new([{name, chunks_read},
+		{labels, [store_id]},
+		{help, "The counter is incremented every time a chunk is read from "
+				"chunk_storage."}]),
+	prometheus_histogram:new([
+		{name, chunk_read_rate_bytes_per_second},
+		{labels, [store_id, type]},
+		{buckets, [infinity]}, %% we don't care about the histogram portion
+		{help, "The rate, in bytes per second, at which chunks are read from storage. "
+				"The type label can be 'raw' or 'repack'."}
+	]),
+	prometheus_histogram:new([
+		{name, chunk_write_rate_bytes_per_second},
+		{labels, [store_id, type]},
+		{buckets, [infinity]}, %% we don't care about the histogram portion
+		{help, "The rate, in bytes per second, at which chunks are written to storage."}
+	]),
+
 	prometheus_gauge:new([{name, sync_tasks},
 		{labels, [state, type, peer]},
 		{help, "The number of syncing tasks. 'state' can be 'queued' or 'scheduled'. "
@@ -485,19 +507,23 @@ register() ->
 		{labels, [store_id]},
 		{help, "The size of the syncing intervals queue."}]),
 
+	prometheus_gauge:new([{name, repack_chunk_states},
+		{labels, [store_id, type, state]},
+		{help, "The count of chunks in each state. 'type' can be 'cache' or 'queue'."}]),
+
+
 	%% ---------------------------------------------------------------------------------------
 	%% Replica 2.9 metrics
 	%% ---------------------------------------------------------------------------------------
 	prometheus_counter:new([{name, replica_2_9_entropy_stored},
 		{labels, [store_id]},
 		{help, "The number of bytes of replica.2.9 entropy written to chunk storage."}]),
+	prometheus_counter:new([{name, replica_2_9_entropy_generated},
+		{help, "The number of bytes of replica.2.9 entropy generated."}]),
 	prometheus_histogram:new([
 		{name, replica_2_9_entropy_duration_milliseconds},
-		{labels, [count]},
-		{buckets, [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 250, 500, 1000]},
-		{help, "The time, in milliseconds, to generate replica.2.9 entropy. The count label "
-				"indicates whether this is the time to generate a single 8 MiB entropy or "
-				"the time to generate all 32 entropies needed for full chunks."}
+		{buckets, [infinity]}, %% we don't care about the histogram portion
+		{help, "The time, in milliseconds, to generate 256 MiB of replica.2.9 entropy."}
 	]),
 
 	%% ---------------------------------------------------------------------------------------

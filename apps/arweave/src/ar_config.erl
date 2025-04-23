@@ -221,7 +221,9 @@ parse_options([{<<"storage_modules">>, L} | Rest], Config) when is_list(L) ->
 		parse_options(Rest, Config#config{
 				storage_modules = StorageModules,
 				repack_in_place_storage_modules = RepackInPlaceStorageModules })
-	catch _:_ ->
+	catch Error:Reason ->
+		?LOG_ERROR([{event, parse_failure}, {option, storage_modules},
+			{error, Error}, {reason, Reason}]),
 		{error, {bad_format, storage_modules, "an array of "
 				"\"{number},{address}[,repack_in_place,{to_packing}]\""}, L}
 	end;
@@ -232,6 +234,11 @@ parse_options([{<<"repack_batch_size">>, N} | Rest], Config) when is_integer(N) 
 	parse_options(Rest, Config#config{ repack_batch_size = N });
 parse_options([{<<"repack_batch_size">>, Opt} | _], _) ->
 	{error, {bad_type, repack_batch_size, number}, Opt};
+
+parse_options([{<<"repack_cache_size_mb">>, N} | Rest], Config) when is_integer(N) ->
+	parse_options(Rest, Config#config{ repack_cache_size_mb = N });
+parse_options([{<<"repack_cache_size_mb">>, Opt} | _], _) ->
+	{error, {bad_type, repack_cache_size_mb, number}, Opt};
 
 parse_options([{<<"polling">>, Frequency} | Rest], Config) when is_integer(Frequency) ->
 	parse_options(Rest, Config#config{ polling = Frequency });
@@ -639,7 +646,7 @@ parse_options([{<<"cm_peers">>, Peers} | Rest], Config) when is_list(Peers) ->
 
 parse_options([{<<"cm_exit_peer">>, Peer} | Rest], Config) ->
 	case ar_util:safe_parse_peer(Peer) of
-		{ok, ParsedPeer} ->
+		{ok, [ParsedPeer|_]} ->
 			parse_options(Rest, Config#config{ cm_exit_peer = ParsedPeer });
 		{error, _} ->
 			{error, bad_cm_exit_peer, Peer}
@@ -705,6 +712,14 @@ parse_options([{<<"data_sync_request_packed_chunks">>, Bool} | Rest], Config)
 parse_options([{<<"data_sync_request_packed_chunks">>, InvalidValue} | _Rest], _Config) ->
 	{error, {bad_type, data_sync_request_packed_chunks, boolean}, InvalidValue};
 
+%% shutdown procedure
+parse_options([{<<"shutdown_tcp_connection_timeout">>, Delay} | Rest], Config)
+	when is_integer(Delay) andalso Delay > 0 ->
+		NewConfig = Config#config{ shutdown_tcp_connection_timeout = Delay },
+		parse_options(Rest, NewConfig);
+parse_options([{<<"shutdown_tcp_connection_timeout">>, InvalidValue} | Rest], Config) ->
+	{error, {bad_type, shutdown_tcp_connection_timeout, integer}, InvalidValue};
+
 parse_options([Opt | _], _) ->
 	{error, unknown, Opt};
 parse_options([], Config) ->
@@ -767,11 +782,13 @@ safe_map(Fun, List) ->
 
 parse_peers([Peer | Rest], ParsedPeers) ->
 	case ar_util:safe_parse_peer(Peer) of
-		{ok, ParsedPeer} -> parse_peers(Rest, [ParsedPeer | ParsedPeers]);
+		{ok, ParsedPeer} -> parse_peers(Rest, ParsedPeer ++ ParsedPeers);
 		{error, _} -> error
 	end;
 parse_peers([], ParsedPeers) ->
-	{ok, lists:reverse(ParsedPeers)}.
+	Flatten = lists:flatten(ParsedPeers),
+	Reverse = lists:reverse(Flatten),
+	{ok, Reverse}.
 
 parse_webhooks([{WebhookConfig} | Rest], ParsedWebhookConfigs) when is_list(WebhookConfig) ->
 	case parse_webhook(WebhookConfig, #config_webhook{}) of
@@ -835,7 +852,7 @@ parse_requests_per_minute_limit_by_ip({[{IP, Object} | Pairs]}, Parsed) ->
 	case ar_util:safe_parse_peer(IP) of
 		{error, invalid} ->
 			error;
-		{ok, {A, B, C, D, _Port}} ->
+		{ok, [{A, B, C, D, _Port}]} ->
 			case parse_atom_number_map(Object, #{}) of
 				error ->
 					error;

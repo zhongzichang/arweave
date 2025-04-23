@@ -209,9 +209,5 @@
 	%% The threshold controlling the brief accumuluation of the chunks in the queue before
 	%% the actual disk dump, to reduce the chance of out-of-order write causing disk
 	%% fragmentation.
-	store_chunk_queue_threshold = ?STORE_CHUNK_QUEUE_FLUSH_SIZE_THRESHOLD,
-	%% Cache mapping peers to /data_sync_record responses
-	all_peers_intervals = #{},
-	%% The target packing of the storage module managed by the process.
-	packing = not_set
+	store_chunk_queue_threshold = ?STORE_CHUNK_QUEUE_FLUSH_SIZE_THRESHOLD
 }).

@@ -252,6 +252,7 @@ start_other_node(Node, B0, Config, WaitUntilSync) ->
 start_node(B0, Config) ->
 	start_node(B0, Config, true).
 start_node(B0, Config, WaitUntilSync) ->
+	?LOG_INFO("Starting node"),
 	clean_up_and_stop(),
 	{ok, BaseConfig} = application:get_env(arweave, config),
 	write_genesis_files(BaseConfig#config.data_dir, B0),
@@ -264,6 +265,7 @@ start_node(B0, Config, WaitUntilSync) ->
 		false ->
 			ok
 	end,
+	?LOG_INFO("Node started"),
 	erlang:node().
 
 %% @doc Launch the given number (>= 1, =< ?MAX_MINERS) of the mining nodes in the coordinated
@@ -388,12 +390,15 @@ load_fixture(Fixture) ->
 
 clean_up_and_stop() ->
 	Config = stop(),
+	?LOG_DEBUG([{event, clean_up_and_stop}, {data_dir, Config#config.data_dir}]),
 	ok = filelib:ensure_dir(Config#config.data_dir),
 	{ok, Entries} = file:list_dir_all(Config#config.data_dir),
 	lists:foreach(
 		fun	("wallets") ->
 				ok;
 			(Entry) ->
+				?LOG_DEBUG([{event, clean_up_and_stop},
+					{delete, filename:join(Config#config.data_dir, Entry)}]),
 				ok = file:del_dir_r(filename:join(Config#config.data_dir, Entry))
 		end,
 		Entries
@@ -627,6 +632,7 @@ restart_with_config(Node, Config) ->
 	remote_call(Node, ?MODULE, restart_with_config, [Config], 90000).
 
 start_peer(Node, Args) when is_map(Args) ->
+	?LOG_DEBUG([{event, start_peer}, {peer, Node}]),
 	remote_call(Node, ?MODULE, start, [Args], ?PEER_START_TIMEOUT),
 	wait_until_joined(Node),
 	wait_until_syncs_genesis_data(Node);
@@ -1128,27 +1134,51 @@ get_tx_confirmations(Node, TXID) ->
 	end.
 
 new_mock(Module, Options) ->
+	new_mock(Module, Options, 5).
+
+new_mock(_Module, _Options, 0) ->
+	ok;
+new_mock(Module, Options, Retries) ->
 	try
 		meck:new(Module, Options)
 	catch
 		error:E ->
-			?LOG_ERROR("Error creating mock for ~p: ~p", [Module, E])
+			?debugFmt("ar_test_node (retries left ~p): Error creating mock for ~p: ~p",
+					[Retries - 1, Module, E]),
+			timer:sleep(1000),
+			new_mock(Module, Options, Retries - 1)
 	end.
 
 mock_function(Module, Fun, Mock) ->
+	mock_function(Module, Fun, Mock, 5).
+
+mock_function(_Module, _Fun, _Mock, 0) ->
+	ok;
+mock_function(Module, Fun, Mock, Retries) ->
 	try
 		meck:expect(Module, Fun, Mock)
 	catch
 		error:E ->
-			?LOG_ERROR("Error setting mock for ~p: ~p", [Module, E])
+			?debugFmt("ar_test_node (retries left ~p): Error setting mock for ~p: ~p",
+					[Retries - 1, Module, E]),
+			timer:sleep(1000),
+			mock_function(Module, Fun, Mock, Retries - 1)
 	end.
 
 unmock_module(Module) ->
+	unmock_module(Module, 5).
+
+unmock_module(_Module, 0) ->
+	ok;
+unmock_module(Module, Retries) ->
 	try
 		meck:unload(Module)
 	catch
 		error:E ->
-			?LOG_ERROR("Error unloading mock for ~p: ~p", [Module, E])
+			?debugFmt("ar_test_node (retries left ~p): Error unloading mock for ~p: ~p",
+					[Retries - 1, Module, E]),
+			timer:sleep(1000),
+			unmock_module(Module, Retries - 1)
 	end.
 
 mock_functions(Functions) ->
@@ -1187,7 +1217,7 @@ mock_functions(Functions) ->
 				fun(Module, _, _) ->
 					unmock_module(Module),
 					lists:foreach(
-						fun({_Build, Node}) ->
+						fun({_TestType, Node}) ->
 							remote_call(Node, ar_test_node, unmock_module, [Module])
 						end,
 						all_peers(test))
@@ -1202,11 +1232,21 @@ test_with_mocked_functions(Functions, TestFun) ->
 	test_with_mocked_functions(Functions, TestFun, ?TEST_MOCKED_FUNCTIONS_TIMEOUT).
 
 test_with_mocked_functions(Functions, TestFun, Timeout) ->
+	WrappedTestFun = fun() ->
+		try
+			TestFun()
+		catch
+			Type:Reason ->
+				?assert(false,
+					iolist_to_binary(
+						io_lib:format("Mocked test failed with ~p: ~p", [Type, Reason])))
+		end
+	end,
 	{Setup, Cleanup} = mock_functions(Functions),
 	{
 		foreach,
 		Setup, Cleanup,
-		[{timeout, Timeout, TestFun}]
+		[{timeout, Timeout, WrappedTestFun}]
 	}.
 
 post_and_mine(#{ miner := Node, await_on := AwaitOnNode }, TXs) ->

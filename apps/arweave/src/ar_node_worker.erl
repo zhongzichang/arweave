@@ -87,6 +87,7 @@ found_solution(Source, Solution, PoACache, PoA2Cache) ->
 %%%===================================================================
 
 init([]) ->
+	?LOG_INFO([{start, ?MODULE}, {pid,self()}]),
 	%% Trap exit to avoid corrupting any open files on quit.
 	process_flag(trap_exit, true),
 	[ok, ok, ok, ok] = ar_events:subscribe([tx, block, nonce_limiter, node_state]),
@@ -157,8 +158,6 @@ init([]) ->
 		{is_joined,						false},
 		{hash_list_2_0_for_1_0_blocks,	read_hash_list_2_0_for_1_0_blocks()}
 	]),
-	%% Start the HTTP server.
-	ok = ar_http_iface_server:start(),
 	gen_server:cast(?MODULE, compute_mining_difficulty),
 	{ok, #{
 		miner_2_6 => undefined,
@@ -491,18 +490,6 @@ handle_info({tx_ready_for_mining, TX}, State) ->
 	ar_events:send(tx, {ready_for_mining, TX}),
 	{noreply, State};
 
-handle_info({event, block, {double_signing, Proof}}, State) ->
-	Map = maps:get(double_signing_proofs, State, #{}),
-	Key = element(1, Proof),
-	Addr = ar_wallet:hash_pub_key(Key),
-	case is_map_key(Addr, Map) of
-		true ->
-			{noreply, State};
-		false ->
-			Map2 = maps:put(Addr, {os:system_time(second), Proof}, Map),
-			{noreply, State#{ double_signing_proofs => Map2 }}
-	end;
-
 handle_info({event, block, {new, Block, _Source}}, State)
 		when length(Block#block.txs) > ?BLOCK_TX_COUNT_LIMIT ->
 	?LOG_WARNING([{event, received_block_with_too_many_txs},
@@ -525,9 +512,10 @@ handle_info({event, block, {new, B, _Source}}, State) ->
 					ar_ignore_registry:remove(H),
 					{noreply, State};
 				_PrevB ->
+					State2 = may_be_report_double_signing(B, State),
 					ar_block_cache:add(block_cache, B),
 					gen_server:cast(?MODULE, apply_block),
-					{noreply, State}
+					{noreply, State2}
 			end;
 		_ ->
 			%% The block's already received from a different peer or
@@ -587,12 +575,14 @@ handle_info({'DOWN', _Ref, process, PID, _Info}, State) ->
 handle_info({'EXIT', _PID, normal}, State) ->
 	{noreply, State};
 
+handle_info(shutdown, State) ->
+	{stop, shutdown, State};
+
 handle_info(Info, State) ->
 	?LOG_ERROR([{event, unhandled_info}, {module, ?MODULE}, {message, Info}]),
 	{noreply, State}.
 
 terminate(Reason, _State) ->
-	ar_http_iface_server:stop(),
 	case ets:lookup(node_state, is_joined) of
 		[{_, true}] ->
 			[{mempool_size, MempoolSize}] = ets:lookup(node_state, mempool_size),
@@ -690,20 +680,25 @@ handle_task({filter_mempool, Mempool}, State) ->
 			[{recent_txs_map, RecentTXMap}] = ets:lookup(node_state, recent_txs_map),
 			Wallets = ar_wallets:get(WalletList, ar_tx:get_addresses(List)),
 			InvalidTXs =
-				lists:foldl(
-					fun(TX, Acc) ->
-						case ar_tx_replay_pool:verify_tx({TX, Rate, Price,
-								KryderPlusRateMultiplier, Denomination, Height,
-								RedenominationHeight, BlockAnchors, RecentTXMap, #{}, Wallets},
-								do_not_verify_signature) of
-							valid ->
-								Acc;
-							{invalid, _Reason} ->
-								[TX | Acc]
-						end
-					end,
-					[],
-					List
+				prometheus_histogram:observe_duration(
+					reverify_mempool_chunk_duration_milliseconds,
+					fun() ->
+						lists:foldl(
+							fun(TX, Acc) ->
+								case ar_tx_replay_pool:verify_tx({TX, Rate, Price,
+										KryderPlusRateMultiplier, Denomination, Height,
+										RedenominationHeight, BlockAnchors, RecentTXMap,
+										#{}, Wallets}, do_not_verify_signature) of
+									valid ->
+										Acc;
+									{invalid, _Reason} ->
+										[TX | Acc]
+								end
+							end,
+							[],
+							List
+						)
+					end
 				),
 			ar_mempool:drop_txs(InvalidTXs),
 			case RemainingMempool of
@@ -1022,33 +1017,61 @@ may_be_get_double_signing_proof2(Iterator, RootHash, LockedRewards, Height) ->
 		none ->
 			undefined;
 		{Addr, {_Timestamp, Proof2}, Iterator2} ->
-			{Key, Sig1, _CDiff1, _PrevCDiff1, _Preimage1,
-					Sig2, _CDiff2, _PrevCDiff2, _Preimage2} = Proof2,
+			{Pub, Sig1, CDiff1, PrevCDiff1, Preimage1,
+					Sig2, CDiff2, PrevCDiff2, Preimage2} = Proof2,
 			?LOG_INFO([{event, evaluating_double_signing_proof},
-				{key_size, byte_size(Key)},
+				{key_size, byte_size(Pub)},
 				{sig1_size, byte_size(Sig1)},
 				{sig2_size, byte_size(Sig2)},
 				{height, Height}]),
 			CheckKeyType =
-				case {byte_size(Key) == ?ECDSA_PUB_KEY_SIZE, Height >= ar_fork:height_2_9()} of
+				case {byte_size(Pub) == ?ECDSA_PUB_KEY_SIZE, Height >= ar_fork:height_2_9()} of
 					{true, false} ->
 						false;
 					{true, true} ->
 						byte_size(Sig1) == ?ECDSA_SIG_SIZE
 							andalso byte_size(Sig2) == ?ECDSA_SIG_SIZE;
 					_ ->
-						byte_size(Key) == ?RSA_BLOCK_SIG_SIZE
+						byte_size(Pub) == ?RSA_BLOCK_SIG_SIZE
 							andalso byte_size(Sig1) == ?RSA_BLOCK_SIG_SIZE
 							andalso byte_size(Sig2) == ?RSA_BLOCK_SIG_SIZE
 				end,
-			HasLockedReward =
+			CheckDifferentSignatures =
 				case CheckKeyType of
+					false ->
+						false;
+					true ->
+						Sig1 /= Sig2
+				end,
+			HasLockedReward =
+				case CheckDifferentSignatures of
 					false ->
 						false;
 					true ->
 						ar_rewards:has_locked_reward(Addr, LockedRewards)
 				end,
-			case HasLockedReward of
+			ValidSignatures =
+				case HasLockedReward of
+					false ->
+						false;
+					true ->
+						SignaturePreimage1 = ar_block:get_block_signature_preimage(
+								CDiff1, PrevCDiff1, Preimage1, Height),
+						SignaturePreimage2 = ar_block:get_block_signature_preimage(
+								CDiff2, PrevCDiff2, Preimage2, Height),
+						Key = ar_block:get_reward_key(Pub, Height),
+						ar_wallet:verify(Key, SignaturePreimage1, Sig1)
+								andalso ar_wallet:verify(Key, SignaturePreimage2, Sig2)
+				end,
+			ValidCDiffs =
+				case ValidSignatures of
+					false ->
+						false;
+					true ->
+						CDiff1 == CDiff2
+							orelse (CDiff1 > PrevCDiff2 andalso CDiff2 > PrevCDiff1)
+				end,
+			case ValidCDiffs of
 				false ->
 					may_be_get_double_signing_proof2(Iterator2,
 							RootHash, LockedRewards, Height);
@@ -1518,9 +1541,8 @@ record_economic_metrics2(B, PrevB) ->
 	prometheus_gauge:set(log_diff, [poa2], ar_retarget:switch_to_log_diff(Diff)),
 	prometheus_gauge:set(network_hashrate, ar_difficulty:get_hash_rate_fixed_ratio(B)),
 	prometheus_gauge:set(endowment_pool, B#block.reward_pool),
+	prometheus_gauge:set(kryder_plus_rate_multiplier, B#block.kryder_plus_rate_multiplier),
 	Period_200_Years = 200 * 365 * 24 * 60 * 60,
-	Burden = ar_pricing:get_storage_cost(B#block.weave_size, B#block.timestamp,
-			B#block.usd_to_ar_rate, B#block.height),
 	case B#block.height >= ar_fork:height_2_6() of
 		true ->
 			#block{ reward_history = RewardHistory } = B,
@@ -1539,7 +1561,9 @@ record_economic_metrics2(B, PrevB) ->
 					PrevB#block.kryder_plus_rate_multiplier, PrevB#block.denomination,
 					BlockInterval},
 			{ExpectedBlockReward,
-					_, _, _, _} = ar_pricing:get_miner_reward_endowment_pool_debt_supply(Args),
+					_, _, _, _, Give, Take} = ar_pricing:get_miner_reward_endowment_pool_debt_supply(Args),
+			prometheus_gauge:set(endowment_pool_take, Take),
+			prometheus_gauge:set(endowment_pool_give, Give),
 			prometheus_gauge:set(expected_block_reward, ExpectedBlockReward),
 			LegacyPricePerGibibyte = ar_pricing:get_storage_cost(1024 * 1024 * 1024,
 					os:system_time(second), PrevB#block.usd_to_ar_rate, B#block.height),
@@ -1550,17 +1574,6 @@ record_economic_metrics2(B, PrevB) ->
 		false ->
 			ok
 	end,
-	%% 2.5 metrics:
-	prometheus_gauge:set(network_burden, Burden),
-	Burden_10_USD_AR = ar_pricing:get_storage_cost(B#block.weave_size, B#block.timestamp,
-			{1, 10}, B#block.height),
-	prometheus_gauge:set(network_burden_10_usd_ar, Burden_10_USD_AR),
-	Burden_200_Years = Burden - ar_pricing:get_storage_cost(B#block.weave_size,
-			B#block.timestamp + Period_200_Years, B#block.usd_to_ar_rate, B#block.height),
-	prometheus_gauge:set(network_burden_200_years, Burden_200_Years),
-	Burden_200_Years_10_USD_AR = Burden_10_USD_AR - ar_pricing:get_storage_cost(
-			B#block.weave_size, B#block.timestamp + Period_200_Years, {1, 10}, B#block.height),
-	prometheus_gauge:set(network_burden_200_years_10_usd_ar, Burden_200_Years_10_USD_AR),
 	case catch ar_pricing:get_expected_min_decline_rate(B#block.timestamp,
 			Period_200_Years, B#block.reward_pool, B#block.weave_size, B#block.usd_to_ar_rate,
 			B#block.height) of
@@ -2188,7 +2201,7 @@ handle_found_solution(Args, PrevB, State, IsRebase) ->
 							undefined -> 1;
 							_ -> 2
 						end}]),
-			prometheus_gauge:inc(mining_solution_success),
+			prometheus_gauge:inc(mining_solution, [success]),
 			ar_block_cache:add(block_cache, B),
 			ar_events:send(solution, {accepted,
 					#{ indep_hash => H, source => Source, is_rebase => IsRebase }}),
@@ -2251,4 +2264,54 @@ update_solution_cache(H, Args, State) ->
 						{Map2, Q2}
 				end,
 			State#{ solution_cache => Map3, solution_cache_records => Q3 }
+	end.
+
+may_be_report_double_signing(B, State) ->
+	#block{ indep_hash = H, hash = SolutionH, cumulative_diff = CDiff1,
+			previous_cumulative_diff = PrevCDiff1,
+			previous_solution_hash = PrevSolutionH1,
+			reward_key = {_, Key},
+			signature = Signature1 } = B,
+	case ar_block_cache:get_by_solution_hash(block_cache,
+			SolutionH, H, CDiff1, PrevCDiff1) of
+		not_found ->
+			State;
+		CacheB ->
+			#block{
+					hash = SolutionH,
+					cumulative_diff = CDiff2,
+					previous_cumulative_diff = PrevCDiff2,
+					previous_solution_hash = PrevSolutionH2,
+					reward_key = {_, Key},
+					signature = Signature2 } = CacheB,
+			case CDiff1 == CDiff2 orelse (CDiff1 > PrevCDiff2 andalso CDiff2 > PrevCDiff1) of
+				true ->
+					Preimage1 = << PrevSolutionH1/binary,
+							(ar_block:generate_signed_hash(B))/binary >>,
+					Preimage2 = << PrevSolutionH2/binary,
+							(ar_block:generate_signed_hash(CacheB))/binary >>,
+					Proof = {Key, Signature1, CDiff1, PrevCDiff1, Preimage1,
+							Signature2, CDiff2, PrevCDiff2, Preimage2},
+					?LOG_INFO([{event, report_double_signing},
+							{key, ar_util:encode(Key)},
+							{block1, ar_util:encode(H)},
+							{block2, ar_util:encode(CacheB#block.indep_hash)},
+							{height1, B#block.height},
+							{height2, CacheB#block.height}]),
+					cache_double_signing_proof(Proof, State);
+				false ->
+					State
+			end
+	end.
+
+cache_double_signing_proof(Proof, State) ->
+	Map = maps:get(double_signing_proofs, State, #{}),
+	Key = element(1, Proof),
+	Addr = ar_wallet:hash_pub_key(Key),
+	case is_map_key(Addr, Map) of
+		true ->
+			State;
+		false ->
+			Map2 = maps:put(Addr, {os:system_time(second), Proof}, Map),
+			State#{ double_signing_proofs => Map2 }
 	end.

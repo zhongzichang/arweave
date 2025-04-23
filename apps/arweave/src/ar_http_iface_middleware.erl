@@ -4,13 +4,13 @@
 
 -export([execute/2, read_body_chunk/4]).
 
--include("../include/ar.hrl").
--include("../include/ar_config.hrl").
--include("../include/ar_mining.hrl").
--include("../include/ar_data_sync.hrl").
--include("../include/ar_data_discovery.hrl").
+-include("ar.hrl").
+-include("ar_config.hrl").
+-include("ar_mining.hrl").
+-include("ar_data_sync.hrl").
+-include("ar_data_discovery.hrl").
 
--include("../include/ar_pool.hrl").
+-include("ar_pool.hrl").
 
 
 -define(HANDLER_TIMEOUT, 55000).
@@ -352,6 +352,30 @@ handle(<<"GET">>, [<<"data_sync_record">>, EncodedStart, EncodedLimit], Req, _Pi
 						false ->
 							ok = ar_semaphore:acquire(get_sync_record, ?DEFAULT_CALL_TIMEOUT),
 							handle_get_data_sync_record(Start, Limit, Req)
+					end
+			end
+	end;
+
+handle(<<"GET">>, [<<"data_sync_record">>, EncodedStart, EncodedEnd, EncodedLimit], Req, _Pid) ->
+	case catch binary_to_integer(EncodedStart) of
+		{'EXIT', _} ->
+			{400, #{}, jiffy:encode(#{ error => invalid_start_encoding }), Req};
+		Start ->
+			case catch binary_to_integer(EncodedEnd) of
+				{'EXIT', _} ->
+					{400, #{}, jiffy:encode(#{ error => invalid_end_encoding }), Req};
+				End ->
+					case catch binary_to_integer(EncodedLimit) of
+						{'EXIT', _} ->
+							{400, #{}, jiffy:encode(#{ error => invalid_limit_encoding }), Req};
+						Limit ->
+							case Limit > ?MAX_SHARED_SYNCED_INTERVALS_COUNT of
+								true ->
+									{400, #{}, jiffy:encode(#{ error => limit_too_big }), Req};
+								false ->
+									ok = ar_semaphore:acquire(get_sync_record, ?DEFAULT_CALL_TIMEOUT),
+									handle_get_data_sync_record(Start, End, Limit, Req)
+							end
 					end
 			end
 	end;
@@ -1986,6 +2010,22 @@ handle_get_data_sync_record(Start, Limit, Req) ->
 			{503, #{}, jiffy:encode(#{ error => timeout }), Req}
 	end.
 
+handle_get_data_sync_record(Start, End, Limit, Req) ->
+	Format =
+		case cowboy_req:header(<<"content-type">>, Req) of
+			<<"application/json">> ->
+				json;
+			_ ->
+				etf
+		end,
+	Options = #{ start => Start, right_bound => End, limit => Limit, format => Format },
+	case ar_global_sync_record:get_serialized_sync_record(Options) of
+		{ok, Binary} ->
+			{200, #{}, Binary, Req};
+		{error, timeout} ->
+			{503, #{}, jiffy:encode(#{ error => timeout }), Req}
+	end.
+
 handle_get_chunk(OffsetBinary, Req, Encoding) ->
 	case catch binary_to_integer(OffsetBinary) of
 		Offset when is_integer(Offset) ->
@@ -2231,7 +2271,9 @@ handle_post_chunk(validate_proof, Proof, Req) ->
 	#{ chunk := Chunk, data_path := DataPath, data_size := TXSize, offset := Offset,
 			data_root := DataRoot } = Proof,
 	spawn(fun() ->
-			Parent ! ar_data_sync:add_chunk(DataRoot, DataPath, Chunk, Offset, TXSize) end),
+			Parent ! ar_data_sync:add_chunk_to_disk_pool(
+				DataRoot, DataPath, Chunk, Offset, TXSize)
+			end),
 	receive
 		ok ->
 			{200, #{}, <<>>, Req};

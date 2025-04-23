@@ -55,7 +55,11 @@
 -endif.
 
 %% The default frequency of checking for the available disk space.
+-ifdef(AR_TEST).
+-define(DISK_SPACE_CHECK_FREQUENCY_MS, 1000).
+-else.
 -define(DISK_SPACE_CHECK_FREQUENCY_MS, 30 * 1000).
+-endif.
 
 -define(NUM_HASHING_PROCESSES,
 	max(1, (erlang:system_info(schedulers_online) - 1))).
@@ -105,12 +109,14 @@
 
 -define(CHUNK_GROUP_SIZE, (256 * 1024 * 8000)). % 2 GiB.
 
-%% The default number of chunks fetched from disk at a time during in-place repacking.
+%% The number of consecutive chunks to read at a time during in-place repacking.
 -ifdef(AR_TEST).
 -define(DEFAULT_REPACK_BATCH_SIZE, 2).
 -else.
 -define(DEFAULT_REPACK_BATCH_SIZE, 100).
 -endif.
+
+-define(DEFAULT_REPACK_CACHE_SIZE_MB, 4000).
 
 %% default filtering value for the peer list (30days)
 -define(CURRENT_PEERS_LIST_FILTER, 30*60*60*24).
@@ -129,6 +135,10 @@
 
 %% The number of packing workers.
 -define(DEFAULT_PACKING_WORKERS, erlang:system_info(dirty_cpu_schedulers_online)).
+
+%% The default connection tcp delay when arweave is shutting down
+-define(SHUTDOWN_TCP_CONNECTION_TIMEOUT, 60).
+-define(SHUTDOWN_TCP_MAX_CONNECTION_TIMEOUT, ?SHUTDOWN_TCP_CONNECTION_TIMEOUT*5).
 
 %% @doc Startup options with default values.
 -record(config, {
@@ -167,6 +177,7 @@
 	storage_modules = [],
 	repack_in_place_storage_modules = [],
 	repack_batch_size = ?DEFAULT_REPACK_BATCH_SIZE,
+	repack_cache_size_mb = ?DEFAULT_REPACK_CACHE_SIZE_MB,
 	start_from_latest_state = false,
 	start_from_block,
 	internal_api_secret = not_set,
@@ -232,7 +243,8 @@
 	%% Undocumented/unsupported options
 	chunk_storage_file_size = ?CHUNK_GROUP_SIZE,
 	rocksdb_flush_interval_s = ?DEFAULT_ROCKSDB_FLUSH_INTERVAL_S,
-	rocksdb_wal_sync_interval_s = ?DEFAULT_ROCKSDB_WAL_SYNC_INTERVAL_S
+	rocksdb_wal_sync_interval_s = ?DEFAULT_ROCKSDB_WAL_SYNC_INTERVAL_S,
+	shutdown_tcp_connection_timeout = ?SHUTDOWN_TCP_CONNECTION_TIMEOUT
 }).
 
 -endif.

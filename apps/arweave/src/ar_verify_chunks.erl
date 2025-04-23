@@ -5,11 +5,12 @@
 -export([start_link/2, name/1]).
 -export([init/1, handle_cast/2, handle_call/3, handle_info/2, terminate/2]).
 
--include("../include/ar.hrl").
--include("../include/ar_config.hrl").
--include("../include/ar_consensus.hrl").
--include("../include/ar_chunk_storage.hrl").
--include("../include/ar_verify_chunks.hrl").
+-include("ar.hrl").
+-include("ar_poa.hrl").
+-include("ar_config.hrl").
+-include("ar_consensus.hrl").
+-include("ar_chunk_storage.hrl").
+-include("ar_verify_chunks.hrl").
 
 -include_lib("eunit/include/eunit.hrl").
 
@@ -195,10 +196,16 @@ verify_proof(Metadata, State) ->
 
 	case ar_data_sync:read_data_path(ChunkDataKey, StoreID) of
 		{ok, DataPath} ->
-			case ar_poa:validate_paths(TXRoot, TXPath, DataPath, AbsoluteOffset - 1) of
-				{false, _Proof} ->
+			ChunkMetadata = #chunk_metadata{
+				tx_root = TXRoot,
+				tx_path = TXPath,
+				data_path = DataPath
+			},
+			ChunkProof = ar_poa:chunk_proof(ChunkMetadata, AbsoluteOffset - 1),
+			case ar_poa:validate_paths(ChunkProof) of
+				{false, _} ->
 					invalidate_chunk(validate_paths_error, AbsoluteOffset, ChunkSize, State);
-				{true, _Proof} ->
+				{true, _} ->
 					State
 			end;
 		Error ->
@@ -234,7 +241,7 @@ verify_packing(Metadata, State) ->
 			%% Miners should make sure to only run `verify` in the `purge` mode after they
 			%% have completed packing.
 			invalidate_chunk(unexpected_packing, AbsoluteOffset, ChunkSize, 
-				[{stored_packing, ar_storage_module:packing_label(StoredPacking)}], State);
+				[{stored_packing, ar_serialize:encode_packing(StoredPacking, true)}], State);
 		{Reply, _} ->
 			invalidate_chunk(missing_packing_info, AbsoluteOffset, ChunkSize,
 				[{packing_reply, io_lib:format("~p", [Reply])}], State)
@@ -528,13 +535,15 @@ verify_proof_test_() ->
 		),
 		ar_test_node:test_with_mocked_functions([
 			{ar_data_sync, read_data_path, fun(_, _) -> {ok, <<>>} end},
-			{ar_poa, validate_paths, fun(_, _, _, _) -> {true, <<>>} end}
+			{ar_poa, chunk_proof, fun(_, _) -> #chunk_proof{} end},
+			{ar_poa, validate_paths, fun(_) -> {true, <<>>} end}
 		],
 			fun test_verify_proof_valid_paths/0
 		),
 		ar_test_node:test_with_mocked_functions([
 			{ar_data_sync, read_data_path, fun(_, _) -> {ok, <<>>} end},
-			{ar_poa, validate_paths, fun(_, _, _, _) -> {false, <<>>} end}
+			{ar_poa, chunk_proof, fun(_, _) -> #chunk_proof{} end},
+			{ar_poa, validate_paths, fun(_) -> {false, <<>>} end}
 		],
 			fun test_verify_proof_invalid_paths/0
 		)
@@ -544,7 +553,8 @@ verify_chunk_test_() ->
 	[
 		ar_test_node:test_with_mocked_functions([
 			{ar_data_sync, read_data_path, fun(_, _) -> {ok, <<>>} end},
-			{ar_poa, validate_paths, fun(_, _, _, _) -> {true, <<>>} end},
+			{ar_poa, validate_paths, fun(_) -> {true, <<>>} end},
+			{ar_poa, chunk_proof, fun(_, _) -> #chunk_proof{} end},
 			{ar_chunk_storage, read_offset,
 				fun(_Offset, _StoreID) -> {ok, << ?DATA_CHUNK_SIZE:24 >>} end},
 			{ar_data_sync, get_chunk_data,

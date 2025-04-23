@@ -133,7 +133,7 @@ log_prepare_solution_failure2(Solution, FailureType, FailureReason, Source, Addi
 			{reason, FailureReason},
 			{solution_hash, ar_util:safe_encode(SolutionH)},
 			{packing_difficulty, PackingDifficulty} | AdditionalLogData]),
-	prometheus_gauge:inc(mining_solution_failure, [FailureReason]).
+	prometheus_gauge:inc(mining_solution, [FailureReason]).
 
 -spec get_packing_difficulty(Packing :: ar_storage_module:packing()) ->
 	PackingDifficulty :: non_neg_integer().
@@ -531,13 +531,9 @@ distribute_output(Candidate, State) ->
 distribute_output([], _Candidate, _State) ->
 	ok;
 distribute_output([{_Partition, _MiningAddress, PackingDifficulty} | _Partitions],
-		_Candidate, #state{ allow_composite_packing = false }) when PackingDifficulty >= 1 ->
-	%% Do not mine with the composite packing until some time after the fork 2.8.
-	ok;
-distribute_output([{_Partition, _MiningAddress, PackingDifficulty} | _Partitions],
-		_Candidate, #state{ allow_replica_2_9_mining = false })
-			when PackingDifficulty == ?REPLICA_2_9_PACKING_DIFFICULTY ->
-	%% Do not mine with replica_2_9 until some time after the fork 2.9.
+		_Candidate, #state{ allow_composite_packing = false })
+		when PackingDifficulty >= 1, PackingDifficulty /= ?REPLICA_2_9_PACKING_DIFFICULTY ->
+	%% Only mine with composite packing until some time after the fork 2.9.
 	ok;
 distribute_output([{Partition, MiningAddress, PackingDifficulty} | Partitions],
 		Candidate, State) ->
@@ -679,7 +675,8 @@ prepare_solution(last_step_checkpoints, Candidate, Solution) ->
 prepare_solution(steps, Candidate, Solution) ->
 	#mining_candidate{ step_number = StepNumber } = Candidate,
 	[{_, TipNonceLimiterInfo}] = ets:lookup(node_state, nonce_limiter_info),
-	#nonce_limiter_info{ global_step_number = PrevStepNumber, next_seed = PrevNextSeed,
+	#nonce_limiter_info{ global_step_number = PrevStepNumber, seed = PrevSeed,
+			next_seed = PrevNextSeed,
 			next_vdf_difficulty = PrevNextVDFDifficulty } = TipNonceLimiterInfo,
 	case StepNumber > PrevStepNumber of
 		true ->
@@ -687,9 +684,16 @@ prepare_solution(steps, Candidate, Solution) ->
 					PrevStepNumber, StepNumber, PrevNextSeed, PrevNextVDFDifficulty),
 			case Steps of
 				not_found ->
+					CurrentSessionKey = ar_nonce_limiter:session_key(TipNonceLimiterInfo),
+					SolutionSessionKey = Candidate#mining_candidate.session_key,
 					LogData = [
+						{current_session_key,
+							ar_nonce_limiter:encode_session_key(CurrentSessionKey)},
+						{solution_session_key,
+							ar_nonce_limiter:encode_session_key(SolutionSessionKey)},
 						{start_step_number, PrevStepNumber},
 						{next_step_number, StepNumber},
+						{seed, ar_util:safe_encode(PrevSeed)},
 						{next_seed, ar_util:safe_encode(PrevNextSeed)},
 						{next_vdf_difficulty, PrevNextVDFDifficulty},
 						{h1, ar_util:safe_encode(Candidate#mining_candidate.h1)},

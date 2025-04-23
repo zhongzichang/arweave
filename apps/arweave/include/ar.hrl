@@ -33,7 +33,7 @@
 -define(CLIENT_VERSION, 5).
 
 %% The current build number -- incremented for every release.
--define(RELEASE_NUMBER, 81).
+-define(RELEASE_NUMBER, 83).
 
 -define(DEFAULT_REQUEST_HEADERS,
 	[
@@ -218,7 +218,11 @@
 -define(REJOIN_RETRIES, 3).
 
 %% Maximum allowed number of accepted requests per minute per IP.
+-ifdef(AR_TEST).
+-define(DEFAULT_REQUESTS_PER_MINUTE_LIMIT, 100_000).
+-else.
 -define(DEFAULT_REQUESTS_PER_MINUTE_LIMIT, 900).
+-endif.
 
 %% Number of seconds an IP address should be completely banned from doing
 %% HTTP requests after posting an invalid block.
@@ -758,6 +762,27 @@
 	%% The type of signature this transaction was signed with. A system field,
 	%% not used by the protocol yet.
 	signature_type = ?DEFAULT_KEY_TYPE
+}).
+
+%% @doc The data_path field will only be not_found if the chunk record is corrupt/invalid.
+%% This can happen if the chunk entry exists in the chunks_index but not in the chunk_data_db.
+%% In this case:
+%% - not_set means that a field has not been queried yet.
+%% - not_found means that the field has been queried but could not be found.
+-record(chunk_metadata, {
+	chunk_data_key = not_set :: not_set | binary(),
+	tx_root = not_set :: not_set | binary(),
+	tx_path = not_set :: not_set | binary(),
+	data_root = not_set :: not_set | binary(),
+	data_path = not_set :: not_set | not_found | binary(),
+	chunk_size = not_set :: not_set | non_neg_integer()
+}).
+
+-record(chunk_offsets, {
+	absolute_offset = not_set :: not_set | non_neg_integer(),
+	bucket_end_offset = not_set :: not_set | non_neg_integer(),
+	padded_end_offset = not_set :: not_set | non_neg_integer(),
+	relative_offset = not_set :: not_set | non_neg_integer()
 }).
 
 %% A macro to convert AR into Winstons.

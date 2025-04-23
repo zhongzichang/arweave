@@ -204,9 +204,11 @@ get_miner_reward_and_endowment_pool(Args) ->
 	true = Height >= ar_fork:height_2_4(),
 	case ar_pricing_transition:is_v2_pricing_height(Height) of
 		true ->
-			ar_pricing:get_miner_reward_endowment_pool_debt_supply({EndowmentPool, DebtSupply,
+			{MinerReward, EndowmentPool2, DebtSupply2, KryderPlusRateMultiplierLatch2,
+					KryderPlusRateMultiplier2, _, _} = ar_pricing:get_miner_reward_endowment_pool_debt_supply({EndowmentPool, DebtSupply,
 					TXs, WeaveSize, Height, PricePerGiBMinute, KryderPlusRateMultiplierLatch,
-					KryderPlusRateMultiplier, Denomination, BlockInterval});
+					KryderPlusRateMultiplier, Denomination, BlockInterval}),
+			{MinerReward, EndowmentPool2, DebtSupply2, KryderPlusRateMultiplierLatch2, KryderPlusRateMultiplier2};
 		false ->
 			{MinerReward, EndowmentPool2} = ar_pricing:get_miner_reward_and_endowment_pool({
 					EndowmentPool, TXs, RewardAddr, WeaveSize, Height, Timestamp, Rate}),
@@ -248,23 +250,10 @@ may_be_apply_double_signing_proof(B, PrevB, Accounts) ->
 			may_be_apply_double_signing_proof2(B, PrevB, Accounts)
 	end.
 
-get_reward_key(Pub, Height) ->
-	case Height >= ar_fork:height_2_9() of
-		false ->
-			{?DEFAULT_KEY_TYPE, Pub};
-		true ->
-			case byte_size(Pub) of
-				?ECDSA_PUB_KEY_SIZE ->
-					{?ECDSA_KEY_TYPE, Pub};
-				_ ->
-					{?RSA_KEY_TYPE, Pub}
-			end
-	end.
-
 may_be_apply_double_signing_proof2(B, PrevB, Accounts) ->
 	{Pub, _Signature1, _CDiff1, _PrevCDiff1, _Preimage1, _Signature2, _CDiff2, _PrevCDiff2,
 			_Preimage2} = B#block.double_signing_proof,
-	Key = get_reward_key(Pub, B#block.height),
+	Key = ar_block:get_reward_key(Pub, B#block.height),
 	case B#block.reward_key == Key of
 		true ->
 			{error, invalid_double_signing_proof_same_address};
@@ -290,7 +279,7 @@ may_be_apply_double_signing_proof3(B, PrevB, Accounts) ->
 			Preimage2} = B#block.double_signing_proof,
 	SignaturePreimage1 = ar_block:get_block_signature_preimage(CDiff1, PrevCDiff1,
 			Preimage1, Height),
-	Key = get_reward_key(Pub, B#block.height),
+	Key = ar_block:get_reward_key(Pub, B#block.height),
 	Addr = ar_wallet:to_address(Key),
 	case ar_wallet:verify(Key, SignaturePreimage1, Signature1) of
 		false ->

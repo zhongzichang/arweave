@@ -54,7 +54,7 @@ register_workers() ->
 			WorkerMaster = ?CHILD_WITH_ARGS(
 				ar_data_sync_worker_master, worker, ar_data_sync_worker_master,
 				[WorkerNames]),
-				Workers ++ [WorkerMaster];
+				[WorkerMaster] ++ Workers;
 		false ->
 			[]
 	end.
@@ -65,7 +65,7 @@ register_sync_workers() ->
 	{Workers, WorkerNames} = lists:foldl(
 		fun(Number, {AccWorkers, AccWorkerNames}) ->
 			Name = list_to_atom("ar_data_sync_worker_" ++ integer_to_list(Number)),
-			Worker = ?CHILD_WITH_ARGS(ar_data_sync_worker, worker, Name, [Name]),
+			Worker = ?CHILD_WITH_ARGS(ar_data_sync_worker, worker, Name, [Name, sync]),
 			{[Worker | AccWorkers], [Name | AccWorkerNames]}
 		end,
 		{[], []},
@@ -93,6 +93,7 @@ ready_for_work() ->
 %%%===================================================================
 
 init(Workers) ->
+	?LOG_INFO([{event, init}, {module, ?MODULE}, {workers, Workers}]),
 	gen_server:cast(?MODULE, process_main_queue),
 	ar_util:cast_after(?REBALANCE_FREQUENCY_MS, ?MODULE, rebalance_peers),
 
@@ -105,6 +106,14 @@ handle_call(ready_for_work, _From, State) ->
 	TotalTaskCount = State#state.scheduled_task_count + State#state.queued_task_count,
 	ReadyForWork = TotalTaskCount < max_tasks(State#state.worker_count),
 	{reply, ReadyForWork, State};
+
+handle_call({reset_worker, Worker}, _From, State) ->
+	Load = maps:get(Worker, State#state.worker_loads, 0),
+	State2 = State#state{
+		scheduled_task_count = State#state.scheduled_task_count - Load,
+		worker_loads = maps:put(Worker, 0, State#state.worker_loads)
+	},
+	{reply, ok, State2};
 
 handle_call(Request, _From, State) ->
 	?LOG_WARNING([{event, unhandled_call}, {module, ?MODULE}, {request, Request}]),
