@@ -68,7 +68,7 @@ diff_pair(Block) ->
 
 pool_diff_pair(Block, PoolDiff) ->
 	Height = Block#block.height,
-	{poa1_diff(Diff, Height), PoolDiff}.
+	{poa1_diff(PoolDiff, Height), PoolDiff}.
 
 poa1_diff_multiplier(Height) ->
 	case Height >= ar_fork:height_2_7_2() of
