@@ -672,9 +672,9 @@ parse_options([{<<"pool_server_address">>, Host} | Rest], Config) when is_binary
 parse_options([{<<"pool_server_address">>, Host} | _], _) ->
 	{error, {bad_type, pool_server_address, string}, Host};
 
-parse_options([{<<"pool_diff_factor">>, PoolDiffFactor} | Rest], Config)
-		when is_integer(PoolDiffFactor) ->
-	parse_options(Rest, Config#config{ pool_diff_factor = PoolDiffFactor });
+parse_options([{<<"pool_diff">>, PoolDiff} | Rest], Config)
+		when is_integer(PoolDiff) ->
+	parse_options(Rest, Config#config{ pool_diff = PoolDiff });
 
 %% Undocumented/unsupported options
 parse_options([{<<"chunk_storage_file_size">>, ChunkGroupSize} | Rest], Config)

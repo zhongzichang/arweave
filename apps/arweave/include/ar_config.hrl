@@ -130,7 +130,9 @@
 -define(DEFAULT_PACKING_WORKERS, erlang:system_info(dirty_cpu_schedulers_online)).
 
 %% The default pool minging diff factor.
--define(DEFAULT_POOL_DIFF_FACTOR, 10).
+-define(DEFAULT_POOL_DIFF, (
+	115791896250500799896578612390379560040090229215666121305184184911939783118054
+)).
 
 %% @doc Startup options with default values.
 -record(config, {
@@ -227,7 +229,7 @@
 	pool_server_address = not_set,
 	pool_api_key = not_set,
 	pool_worker_name = not_set,
-	pool_diff_factor = ?DEFAULT_POOL_DIFF_FACTOR,
+	pool_diff = ?DEFAULT_POOL_DIFF,
 	packing_workers = ?DEFAULT_PACKING_WORKERS,
 	replica_2_9_workers = ?DEFAULT_REPLICA_2_9_WORKERS,
 	%% Undocumented/unsupported options
