@@ -479,7 +479,7 @@ calculate_cache_limits(NumActivePartitions, PackingDifficulty) ->
 	%% Allow enough compute_h0 tasks to be queued to completely refill the chunk cache.
 	VDFQueueLimit = max(
 		1,
-		PartitionCacheLimit div (2 * ar_block:get_nonces_per_recall_range(PackingDifficulty))
+		PartitionCacheLimit div (4 * ar_block:get_nonces_per_recall_range(PackingDifficulty))
 	),
 
 	GarbageCollectionFrequency = 4 * VDFQueueLimit * 1000,
