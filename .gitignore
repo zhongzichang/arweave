@@ -12,7 +12,6 @@ apps/arweave/priv/*.so
 _build
 releases
 lib
-bin/arweave-dev
 /result
 .rebar3
 apps/arweave/c_src/**/*.o
@@ -35,3 +34,4 @@ release/output
 .tmp
 node_modules
 screenlog.0
+_*

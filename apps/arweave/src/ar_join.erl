@@ -496,7 +496,7 @@ worker() ->
 %%%===================================================================
 
 %% @doc Check that nodes can join a running network by using the fork recoverer.
-basic_node_join_test() ->
+basic_node_join_test_() ->
 	{timeout, 60, fun() ->
 		[B0] = ar_weave:init([]),
 		ar_test_node:start(B0),
@@ -509,7 +509,7 @@ basic_node_join_test() ->
 	end}.
 
 %% @doc Ensure that both nodes can mine after a join.
-node_join_test() ->
+node_join_test_() ->
 	{timeout, 60, fun() ->
 		[B0] = ar_weave:init([]),
 		ar_test_node:start(B0),
@@ -522,3 +522,18 @@ node_join_test() ->
 		ar_test_node:mine(peer1),
 		ar_test_node:wait_until_height(main, 3)
 	end}.
+
+%% @doc Ensure that get_tx works with a single peer and a list of peers.
+get_tx_test_() ->
+	[
+		ar_test_node:test_with_mocked_functions(
+			[{ar_http_iface_client, get_tx_from_remote_peer,
+				fun(_, _, _) -> {error,{closed,"The connection was lost."}} end}],
+			fun test_get_tx/0)
+	].
+
+test_get_tx() ->
+	?assertEqual(ar_http_iface_client:get_tx({127, 0, 0, 1, 1984}, <<"123">>), not_found),
+	?assertEqual(ar_http_iface_client:get_tx([{127, 0, 0, 1, 1984}], <<"123">>), not_found),
+	?assertEqual(ar_http_iface_client:get_tx(
+		[{127, 0, 0, 1, 1984}, {127, 0, 0, 1, 1985}], <<"123">>), not_found).

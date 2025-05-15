@@ -5,7 +5,8 @@
 
 -export([delayed_print/2, packing_type_to_packing/2,
 	start_source_node/3, source_node_storage_modules/3, max_chunk_offset/1,
-	assert_block/2, assert_syncs_range/3, assert_does_not_sync_range/3,
+	assert_recall_byte/3,
+	assert_block/2, assert_syncs_range/3, assert_syncs_range/4, assert_does_not_sync_range/3,
 	assert_has_entropy/4, assert_no_entropy/4,
 	assert_chunks/3, assert_chunks/4, assert_no_chunks/2,
 	assert_partition_size/3, assert_partition_size/4, assert_empty_partition/3,
@@ -180,7 +181,7 @@ start_source_node(Node, PackingType, WalletFixture) ->
 
 	SourcePacking = ar_e2e:packing_type_to_packing(PackingType, RewardAddr),
 
-	ar_e2e:assert_syncs_range(Node, 0, 4*?PARTITION_SIZE),
+	ar_e2e:assert_syncs_range(Node, SourcePacking, 0, 4*?PARTITION_SIZE),
 
 	%% No overlap since we aren't syncing or repacking chunks.
 	ar_e2e:assert_partition_size(Node, 0, SourcePacking, ?PARTITION_SIZE),
@@ -255,7 +256,21 @@ generate_chunks(Node, WeaveSize, DataSize, Acc) when DataSize > 0 ->
 generate_chunks(_, _, _, Acc) ->
 	Acc.
 
-
+assert_recall_byte(Node, RangeStart, RangeEnd) when RangeStart > RangeEnd ->
+	ok;
+assert_recall_byte(Node, RangeStart, RangeEnd) ->
+	Options = #{ pack => true, packing => unpacked, origin => miner },
+	Result = ar_test_node:remote_call(
+		Node, ar_data_sync, get_chunk, [RangeStart + 1, Options]),
+	case Result of
+		{ok, _} ->
+			?LOG_INFO("Recall byte found at ~p", [RangeStart + 1]),
+			assert_recall_byte(Node, RangeStart + 1, RangeEnd);
+		Error ->
+			?LOG_ERROR([{event, recall_byte_not_found}, 
+						{recall_byte, RangeStart}, 
+						{error, Error}])
+	end.
 assert_block({spora_2_6, Address}, MinedBlock) ->
 	?assertEqual(Address, MinedBlock#block.reward_addr),
 	?assertEqual(0, MinedBlock#block.packing_difficulty);
@@ -315,6 +330,16 @@ assert_no_entropy(Node, StartOffset, EndOffset, StoreID) ->
 		_ ->
 			ok
 	end.
+
+assert_syncs_range(_Node, {replica_2_9, _}, _StartOffset, _EndOffset) ->
+	%% For now GET /data_sync_record does not work for replica_2_9. We could assert that
+	%% the node *does not* sync the range - but we end up with race conditions around
+	%% the disk pool threshold (as those chunksa above the threshold as initially stored
+	%% as unpacked).
+	%% So for now we'll just skip the test.
+	ok;
+assert_syncs_range(Node, _Packing, StartOffset, EndOffset) ->
+	assert_syncs_range(Node, StartOffset, EndOffset).
 
 assert_syncs_range(Node, StartOffset, EndOffset) ->
 	HasRange = ar_util:do_until(

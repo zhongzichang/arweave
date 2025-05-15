@@ -4,10 +4,10 @@
 		pull_from_remote_vdf_server/0, compute_own_vdf/0, is_vdf_server/0,
 		is_public_vdf_server/0, parse/1, parse_storage_module/1, log_config/1]).
 
--include_lib("arweave/include/ar.hrl").
--include_lib("arweave/include/ar_consensus.hrl").
--include_lib("arweave/include/ar_config.hrl").
--include_lib("arweave/include/ar_p3.hrl").
+-include("../include/ar.hrl").
+-include("../include/ar_consensus.hrl").
+-include("../include/ar_config.hrl").
+-include("../include/ar_p3.hrl").
 
 %%%===================================================================
 %%% Public interface.
@@ -176,12 +176,17 @@ parse_options([{<<"mine">>, false} | Rest], Config) ->
 parse_options([{<<"mine">>, Opt} | _], _) ->
 	{error, {bad_type, mine, boolean}, Opt};
 
-parse_options([{<<"verify">>, true} | Rest], Config) ->
-	parse_options(Rest, Config#config{ verify = true });
-parse_options([{<<"verify">>, false} | Rest], Config) ->
-	parse_options(Rest, Config);
+parse_options([{<<"verify">>, <<"purge">>} | Rest], Config) ->
+	parse_options(Rest, Config#config{ verify = purge });
+parse_options([{<<"verify">>, <<"log">>} | Rest], Config) ->
+	parse_options(Rest, Config#config{ verify = log });
 parse_options([{<<"verify">>, Opt} | _], _) ->
-	{error, {bad_type, verify, boolean}, Opt};
+	{error, bad_verify_mode, Opt};
+
+parse_options([{<<"verify_samples">>, N} | Rest], Config) when is_integer(N) ->
+	parse_options(Rest, Config#config{ verify_samples = N });
+parse_options([{<<"verify_samples">>, Opt} | _], _) ->
+	{error, {bad_type, verify_samples, number}, Opt};
 
 parse_options([{<<"port">>, Port} | Rest], Config) when is_integer(Port) ->
 	parse_options(Rest, Config#config{ port = Port });
@@ -602,6 +607,9 @@ parse_options([{<<"p3">>, {P3Config}} | Rest], Config) ->
 			P3Config}
 	end;
 
+parse_options([{<<"http_api_transport_idle_timeout_seconds">>, D} | Rest], Config) when is_integer(D) ->
+	parse_options(Rest, Config#config{ http_api_transport_idle_timeout = D * 1000 });
+
 parse_options([{<<"coordinated_mining">>, true} | Rest], Config) ->
 	parse_options(Rest, Config#config{ coordinated_mining = true });
 parse_options([{<<"coordinated_mining">>, false} | Rest], Config) ->
@@ -804,6 +812,7 @@ parse_webhook_events([Event | Rest], Events) ->
 		<<"transaction">> -> parse_webhook_events(Rest, [transaction | Events]);
 		<<"transaction_data">> -> parse_webhook_events(Rest, [transaction_data | Events]);
 		<<"block">> -> parse_webhook_events(Rest, [block | Events]);
+		<<"solution">> -> parse_webhook_events(Rest, [solution | Events]);
 		_ -> error
 	end;
 parse_webhook_events([], Events) ->
@@ -1016,11 +1025,10 @@ validate_unique_replication_type(Config) ->
 
 validate_verify(#config{ verify = false }) ->
 	true;
-validate_verify(#config{ verify = true, mine = true }) ->
+validate_verify(#config{ mine = true }) ->
 	io:format("~nThe verify flag cannot be set together with the mine flag.~n~n"),
 	false;
-validate_verify(#config{ verify = true,
-		repack_in_place_storage_modules = RepackInPlaceStorageModules })
+validate_verify(#config{ repack_in_place_storage_modules = RepackInPlaceStorageModules })
 			when RepackInPlaceStorageModules =/= [] ->
 	io:format("~nThe verify flag cannot be set together with the repack_in_place flag.~n~n"),
 	false;
@@ -1028,7 +1036,7 @@ validate_verify(_Config) ->
 	true.
 
 disable_vdf(Config) ->
-	RemovePublicVDFServer = 
+	RemovePublicVDFServer =
 		lists:filter(fun(Item) -> Item =/= public_vdf_server end, Config#config.enable),
 	Config#config{
 		nonce_limiter_client_peers = [],
@@ -1041,11 +1049,18 @@ set_verify_flags(#config{ verify = false } = Config) ->
 	Config;
 set_verify_flags(Config) ->
 	io:format("~n~nWARNING: The verify flag is set. Forcing the following options:"),
-	io:format("~n  - auto_join = false"),
-	io:format("~n  - start_from_latest_state = true"),
-	io:format("~n  - sync_jobs = 0"),
-	io:format("~n  - block_pollers = 0"),
-	io:format("~n  - header_sync_jobs = 0"),
+	io:format("~n  - auto_join false"),
+	io:format("~n  - start_from_latest_state true"),
+	io:format("~n  - sync_jobs 0"),
+	io:format("~n  - block_pollers 0"),
+	io:format("~n  - header_sync_jobs 0"),
+	io:format("~n  - disable tx_poller"),
+	io:format("~n  - replica_2_9_workers 0"),
+	io:format("~n  - max_propagation_peers 0"),
+	io:format("~n  - max_block_propagation_peers 0"),
+	io:format("~n  - coordinated_mining false"),
+	io:format("~n  - cm_peers []"),
+	io:format("~n  - cm_exit_peer not_set"),
 	io:format("~n  - all VDF features disabled"),
 	Config2 = disable_vdf(Config),
 	Config2#config{
@@ -1053,5 +1068,12 @@ set_verify_flags(Config) ->
 		start_from_latest_state = true,
 		sync_jobs = 0,
 		block_pollers = 0,
-		header_sync_jobs = 0
+		header_sync_jobs = 0,
+		disable = [tx_poller | Config#config.disable],
+		replica_2_9_workers = 0,
+		coordinated_mining = false,
+		cm_peers = [],
+		cm_exit_peer = not_set,
+		max_propagation_peers = 0,
+		max_block_propagation_peers = 0
 	}.

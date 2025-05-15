@@ -2,7 +2,7 @@
 
 %% The new, more flexible, and more user-friendly interface.
 -export([boot_peers/1, wait_for_peers/1, get_config/1,set_config/2,
-		wait_until_joined/0, wait_until_joined/1, 
+		wait_until_joined/0, wait_until_joined/1,
 		restart/0, restart/1, restart_with_config/1, restart_with_config/2,
 		start_other_node/4, start_node/2, start_node/3, start_coordinated/1, base_cm_config/1, mine/1,
 		wait_until_height/1, wait_until_height/2, wait_until_height/3, assert_wait_until_height/2, http_get_block/2, get_blocks/1,
@@ -315,6 +315,7 @@ start_coordinated(MiningNodeCount) when MiningNodeCount >= 1, MiningNodeCount =<
 base_cm_config(Peers) ->
 	RewardAddr = ar_wallet:to_address(remote_call(peer1, ar_wallet, new_keyfile, [])),
 	#config{
+		mining_cache_size_mb = 16,
 		start_from_latest_state = true,
 		auto_join = true,
 		mining_addr = RewardAddr,
@@ -625,23 +626,22 @@ restart(Node) ->
 restart_with_config(Node, Config) ->
 	remote_call(Node, ?MODULE, restart_with_config, [Config], 90000).
 
-start_peer(Node, Args) when is_list(Args) ->
-	remote_call(Node, ?MODULE, start , Args, ?PEER_START_TIMEOUT),
+start_peer(Node, Args) when is_map(Args) ->
+	remote_call(Node, ?MODULE, start, [Args], ?PEER_START_TIMEOUT),
 	wait_until_joined(Node),
 	wait_until_syncs_genesis_data(Node);
 
 %% @doc Start a fresh peer node with the given genesis block.
 start_peer(Node, B0) ->
-	start_peer(Node, [B0]).
+	start_peer(Node, #{ b0 => B0 }).
 
 %% @doc Start a fresh peer node with the given genesis block and mining address.
 start_peer(Node, B0, RewardAddr) ->
-	start_peer(Node, [B0, RewardAddr]).
+	start_peer(Node, #{ b0 => B0, addr => RewardAddr }).
 
 %% @doc Start a fresh peer node with the given genesis block, mining address, and config.
 start_peer(Node, B0, RewardAddr, Config) ->
-	start_peer(Node, [B0, RewardAddr, Config]).
-
+	start_peer(Node, #{ b0 => B0, addr => RewardAddr, config => Config }).
 
 %% @doc Fetch the fee estimation and the denomination (call GET /price2/[size])
 %% from the given node.
@@ -921,13 +921,13 @@ wait_until_height(Node, TargetHeight) ->
 	wait_until_height(Node, TargetHeight, true).
 
 wait_until_height(Node, TargetHeight, Strict) ->
-	{BI, Height} = case Node of 
+	{BI, Height} = case Node of
 		main ->
 			{
 				wait_until_height(TargetHeight),
 				ar_node:get_height()
 			};
-		_ -> 
+		_ ->
 			{
 				remote_call(Node, ?MODULE, wait_until_height, [TargetHeight],
 					?WAIT_UNTIL_BLOCK_HEIGHT_TIMEOUT + 500),
@@ -936,7 +936,7 @@ wait_until_height(Node, TargetHeight, Strict) ->
 	end,
 	case Strict of
 		true ->
-			?assertEqual(TargetHeight, Height, 
+			?assertEqual(TargetHeight, Height,
 				iolist_to_binary(io_lib:format("Node ~p not at the expected height", [Node])));
 		false ->
 			ok
@@ -1331,7 +1331,7 @@ get_chunk(Node, Offset) ->
 get_chunk(Node, Offset, Packing) ->
 	Headers = case Packing of
 		undefined -> [];
-		_ -> 
+		_ ->
 			PackingBinary = iolist_to_binary(ar_serialize:encode_packing(Packing, false)),
 			[{<<"x-packing">>, PackingBinary}]
 	end,
@@ -1433,13 +1433,23 @@ assert_data_not_found(Node, TXID) ->
 					path => "/tx/" ++ binary_to_list(ar_util:encode(TXID)) ++ "/data" })).
 
 get_node_namespace() ->
-	lists:nth(2, split_node_name()). % Retrieve the element between the '-' and '@'
+	% Return the namespace part (everything after first - and before @)
+	{_, Namespace} = split_node_name(),
+	Namespace.
 
 get_node() ->
-	lists:nth(1, split_node_name()). % Retrieve the element before the '-'
+	% Return the name part (everything before first -)
+	{Name, _} = split_node_name(),
+	Name.
 
 split_node_name() ->
-	string:tokens(atom_to_list(node()), "-@").
+	% First split by '@' to separate host part
+	[NamePart, _Host] = string:split(atom_to_list(node()), "@"),
+	% Then split by first '-' to get name and namespace
+	case string:split(NamePart, "-", leading) of
+		[Name, Namespace] -> {Name, Namespace};
+		[Name] -> {Name, ""}  % Handle case where there is no '-'
+	end.
 
 get_unused_port() ->
   {ok, ListenSocket} = gen_tcp:listen(0, [{port, 0}]),

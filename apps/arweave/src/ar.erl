@@ -7,7 +7,7 @@
 
 -export([main/0, main/1, create_wallet/0, create_wallet/1,
 		create_ecdsa_wallet/0, create_ecdsa_wallet/1,
-		benchmark_packing/1, benchmark_packing/0, benchmark_2_9/0, benchmark_2_9/1, 
+		benchmark_packing/1, benchmark_packing/0, benchmark_2_9/0, benchmark_2_9/1,
 		benchmark_vdf/0,
 		benchmark_hash/1, benchmark_hash/0, start/0,
 		start/1, start/2, stop/1, stop_dependencies/0, start_dependencies/0,
@@ -17,6 +17,7 @@
 -include("../include/ar.hrl").
 -include("../include/ar_consensus.hrl").
 -include("../include/ar_config.hrl").
+-include("../include/ar_verify_chunks.hrl").
 
 -include_lib("eunit/include/eunit.hrl").
 
@@ -68,6 +69,10 @@ show_help() ->
 				"    {~n"
 				"      \"events\": [\"transaction_data\"],~n"
 				"      \"url\": \"http://127.0.0.1:1985/tx_data\"~n"
+				"    },~n"
+				"    {~n"
+				"      \"events\": [\"solution\"],~n"
+				"      \"url\": \"http://127.0.0.1:1985/solution\"~n"
 				"    },~n"
 				"  \"semaphores\": {\"post_tx\": 100}~n"
 				"}~n~n"
@@ -171,7 +176,7 @@ show_help() ->
 			{"mining_server_chunk_cache_size_limit (num)", "DEPRECATED. Use "
 				"mining_cache_size_mb instead."},
 			{"max_emitters (num)", io_lib:format("The number of transaction propagation "
-				"processes to spawn. Default is ~B.", [?NUM_EMITTER_PROCESSES])},
+				"processes to spawn. Must be at least 1. Default is ~B.", [?NUM_EMITTER_PROCESSES])},
 			{"tx_validators (num)", "Ignored. Set the post_tx key in the semaphores object"
 				" in the configuration file instead."},
 			{"post_tx_timeout", io_lib:format("The time in seconds to wait for the available"
@@ -309,6 +314,10 @@ show_help() ->
 			{"tls_key_file",
 				"The path to the TLS key file for TLS support, depends "
 				"on 'tls_cert_file' being set as well."},
+			{"http_api_transport_idle_timeout_seconds",
+				"The number of seconds allowed for incoming API client connections to be idle "
+				"before closing them. Default is 10 seconds. Please, do not set this value too low "
+				"as it will negatively affect the performance of the node."},
 			{"coordinated_mining", "Enable coordinated mining. If you are a solo pool miner "
 					"coordinating on a replica with other pool miners, set this flag too. "
 					"To connect the internal nodes, set cm_api_secret, cm_peer, "
@@ -349,12 +358,15 @@ show_help() ->
 			{"pool_diff", "The pool diff."},
 			{"rocksdb_flush_interval", "RocksDB flush interval in seconds"},
 			{"rocksdb_wal_sync_interval", "RocksDB WAL sync interval in seconds"},
-			{"verify", "Run in verify mode. The node will run several checks on all listed "
-				"storage_modules, and flag any errors so that the chunks can be resynced and "
-				"repacked. After completing a full verification cycle, you can restart "
-				"the node in normal mode to have it resync and/or repack any flagged chunks. "
-				"When running in verify mode several flags will be forced on and several "
-				"flags are disallowed. See the node output for details."}
+			{"verify", "Run in verify. There are two valid values 'purge' or 'log'. "
+				"The node will run several checks on all listed storage_modules, and flag any "
+				"errors. In 'log' mode the error are just logged, in 'purge' node the chunks "
+				"are invalidated so that they have to be repacked. After completing a full "
+				"verification cycle, you can restart the node in normal mode to have it "
+				"resync and/or repack any flagged chunks. When running in verify mode several "
+				"flags are disallowed. See the node output for details."},
+			{"verify_samples (num)", io_lib:format("Number of chunks to sample and unpack "
+				"during 'verify'. Default is ~B.", [?SAMPLE_CHUNK_COUNT])}
 		]
 	),
 	erlang:halt().
@@ -385,8 +397,16 @@ read_config_from_file(Path) ->
 parse_cli_args([], C) -> C;
 parse_cli_args(["mine" | Rest], C) ->
 	parse_cli_args(Rest, C#config{ mine = true });
-parse_cli_args(["verify" | Rest], C) ->
-	parse_cli_args(Rest, C#config{ verify = true });
+parse_cli_args(["verify", "purge" | Rest], C) ->
+	parse_cli_args(Rest, C#config{ verify = purge });
+parse_cli_args(["verify", "log" | Rest], C) ->
+	parse_cli_args(Rest, C#config{ verify = log });
+parse_cli_args(["verify", _ | _], C) ->
+	io:format("Invalid verify mode. Valid modes are 'purge' or 'log'.~n"),
+	timer:sleep(1000),
+	erlang:halt();
+parse_cli_args(["verify_samples", N | Rest], C) ->
+	parse_cli_args(Rest, C#config{ verify_samples = list_to_integer(N) });
 parse_cli_args(["peer", Peer | Rest], C = #config{ peers = Ps }) ->
 	case ar_util:safe_parse_peer(Peer) of
 		{ok, ValidPeer} ->
@@ -617,6 +637,8 @@ parse_cli_args(["tls_key_file", KeyFilePath | Rest], C) ->
     AbsKeyFilePath = filename:absname(KeyFilePath),
     ar_util:assert_file_exists_and_readable(AbsKeyFilePath),
     parse_cli_args(Rest, C#config{ tls_key_file = AbsKeyFilePath });
+parse_cli_args(["http_api_transport_idle_timeout_seconds", Num | Rest], C) ->
+	parse_cli_args(Rest, C#config { http_api_transport_idle_timeout = list_to_integer(Num) * 1000 });
 parse_cli_args(["coordinated_mining" | Rest], C) ->
 	parse_cli_args(Rest, C#config{ coordinated_mining = true });
 parse_cli_args(["cm_api_secret", CMSecret | Rest], C)
@@ -710,54 +732,11 @@ start(Config) ->
 	end,
 	start_dependencies().
 
+
 start(normal, _Args) ->
 	{ok, Config} = application:get_env(arweave, config),
-	%% Configure logging for console output.
-	LoggerFormatterConsole = #{
-		legacy_header => false,
-		single_line => true,
-		chars_limit => 16256,
-		max_size => 8128,
-		depth => 256,
-		template => [time," [",level,"] ",mfa,":",line," ",msg,"\n"]
-	},
-	logger:set_handler_config(default, formatter, {logger_formatter, LoggerFormatterConsole}),
-	logger:set_handler_config(default, level, error),
-	%% Configure logging to the logfile.
-	LoggerConfigDisk = #{
-		file => lists:flatten(filename:join(Config#config.log_dir, atom_to_list(node()))),
-		type => wrap,
-		max_no_files => 10,
-		max_no_bytes => 51418800 % 10 x 5MB
-	},
-	logger:add_handler(disk_log, logger_disk_log_h,
-			#{ config => LoggerConfigDisk, level => info }),
-	Level =
-		case Config#config.debug of
-			false ->
-				info;
-			true ->
-				DebugLoggerConfigDisk = #{
-					file => lists:flatten(filename:join([Config#config.log_dir, "debug_logs",
-							atom_to_list(node())])),
-					type => wrap,
-					max_no_files => 20,
-					max_no_bytes => 51418800 % 10 x 5MB
-				},
-				logger:add_handler(disk_debug_log, logger_disk_log_h,
-						#{ config => DebugLoggerConfigDisk, level => debug }),
-				debug
-		end,
-	LoggerFormatterDisk = #{
-		chars_limit => 16256,
-		max_size => 8128,
-		depth => 256,
-		legacy_header => false,
-		single_line => true,
-		template => [time," [",level,"] ",mfa,":",line," ",msg,"\n"]
-	},
-	logger:set_handler_config(disk_log, formatter, {logger_formatter, LoggerFormatterDisk}),
-	logger:set_application_level(arweave, Level),
+	%% Configure logger
+	ar_logger:init(Config),
 	%% Start the Prometheus metrics subsystem.
 	prometheus_registry:register_collector(prometheus_process_collector),
 	prometheus_registry:register_collector(ar_metrics_collector),
@@ -869,7 +848,7 @@ benchmark_2_9() ->
 benchmark_2_9(Args) ->
 	ar_bench_2_9:run_benchmark_from_cli(Args),
 	erlang:halt().
-	
+
 shutdown([NodeName]) ->
 	rpc:cast(NodeName, init, stop, []).
 

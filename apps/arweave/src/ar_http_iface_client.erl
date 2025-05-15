@@ -7,7 +7,7 @@
 -export([send_tx_json/3, send_tx_json/4, send_tx_binary/3, send_tx_binary/4]).
 -export([send_block_json/3, send_block_binary/3, send_block_binary/4,
 	 send_block_announcement/2,
-	 get_block/3, get_tx/2, get_txs/2, get_tx_from_remote_peer/2,
+	 get_block/3, get_tx/2, get_txs/2, get_tx_from_remote_peers/3,
 	 get_tx_data/2, get_wallet_list_chunk/2, get_wallet_list_chunk/3,
 	 get_wallet_list/2, add_peer/1, get_info/1, get_info/2, get_peers/1,
 	 get_time/2, get_height/1, get_block_index/3,
@@ -22,6 +22,10 @@
 	 get_pool_cm_jobs/2, post_pool_cm_jobs/2,
 	 post_cm_partition_table_to_pool/2]).
 -export([get_block_shadow/2, get_block_shadow/3, get_block_shadow/4]).
+
+%% -- Testing exports
+-export([get_tx_from_remote_peer/3]).
+%% -- End of testing exports
 
 -include_lib("arweave/include/ar.hrl").
 -include_lib("arweave/include/ar_config.hrl").
@@ -419,6 +423,20 @@ get_chunk_binary(Peer, Offset, RequestedPacking) ->
 		erlang:monotonic_time() - StartTime),
 
 	handle_chunk_response(Response, RequestedPacking, Peer).
+
+get_mempool([]) ->
+	{error, not_found};
+get_mempool([Peer | Peers]) ->
+    case get_mempool(Peer) of
+        {ok, TXIDs} ->
+            {ok, TXIDs};
+        {error, Error} ->
+			?LOG_DEBUG([{event, failed_to_get_mempool_txids_from_peer},
+					{peer, ar_util:format_peer(Peer)},
+					{error, io_lib:format("~p", [Error])}
+			]),
+            get_mempool(Peers -- [Peer])
+    end;
 
 get_mempool(Peer) ->
 	handle_mempool_response(ar_http:req(#{
@@ -1071,35 +1089,46 @@ get_txs(Height, Peers, [TXID | Rest], TXs, TotalSize) ->
 	end.
 
 %% @doc Retreive a tx by ID from the memory pool, disk, or a remote peer.
+get_tx(Peer, TX) when not is_list(Peer) ->
+	get_tx([Peer], TX);
 get_tx(_Peers, #tx{} = TX) ->
 	TX;
 get_tx(Peers, TXID) ->
 	case ar_mempool:get_tx(TXID) of
 		not_found ->
-			get_tx_from_disk_or_peer(Peers, TXID);
+			get_tx_from_disk_or_peers(Peers, TXID);
 		TX ->
 			TX
 	end.
 
-get_tx_from_disk_or_peer(Peers, TXID) ->
+get_tx_from_disk_or_peers(Peers, TXID) ->
 	case ar_storage:read_tx(TXID) of
 		unavailable ->
-			get_tx_from_remote_peer(Peers, TXID);
+			case get_tx_from_remote_peers(Peers, TXID) of
+				not_found ->
+					not_found;
+				{TX, _Peer, _Time, _Size} ->
+					TX
+			end;
 		TX ->
 			TX
 	end.
 
-get_tx_from_remote_peer([], _TXID) ->
+get_tx_from_remote_peers(Peers, TXID) ->
+	get_tx_from_remote_peers(Peers, TXID, true).
+
+get_tx_from_remote_peers([], _TXID, _RatePeer) ->
 	not_found;
-get_tx_from_remote_peer(Peers, TXID) when is_list(Peers) ->
+get_tx_from_remote_peers(Peers, TXID, RatePeer) ->
 	Peer = lists:nth(rand:uniform(min(5, length(Peers))), Peers),
-	case get_tx_from_remote_peer(Peer, TXID) of
-		#tx{} = TX ->
-			TX;
+	case get_tx_from_remote_peer(Peer, TXID, RatePeer) of
+		{#tx{} = TX, Peer, Time, Size} ->
+			{TX, Peer, Time, Size};
 		_ ->
-			get_tx_from_remote_peer(Peers -- [Peer], TXID)
-	end;
-get_tx_from_remote_peer(Peer, TXID) ->
+			get_tx_from_remote_peers(Peers -- [Peer], TXID, RatePeer)
+	end.
+
+get_tx_from_remote_peer(Peer, TXID, RatePeer) ->
 	Release = ar_peers:get_peer_release(Peer),
 	Encoding = case Release >= 52 of true -> binary; _ -> json end,
 	case handle_tx_response(Peer, Encoding,
@@ -1124,8 +1153,13 @@ get_tx_from_remote_peer(Peer, TXID) ->
 					ar_peers:issue_warning(Peer, tx, invalid),
 					{error, invalid_tx};
 				true ->
-					ar_peers:rate_fetched_data(Peer, tx, Time, Size),
-					TX
+					case RatePeer of
+						true ->
+							ar_peers:rate_fetched_data(Peer, tx, Time, Size);
+						false ->
+							ok
+					end,
+					{TX, Peer, Time, Size}
 			end;
 		Error ->
 			Error

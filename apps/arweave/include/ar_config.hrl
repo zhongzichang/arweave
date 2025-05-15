@@ -3,6 +3,7 @@
 
 -include_lib("ar.hrl").
 -include_lib("ar_p3.hrl").
+-include_lib("ar_verify_chunks.hrl").
 
 -record(config_webhook, {
 	events = [],
@@ -140,6 +141,7 @@
 	port = ?DEFAULT_HTTP_IFACE_PORT,
 	mine = false,
 	verify = false,
+	verify_samples = ?SAMPLE_CHUNK_COUNT,
 	peers = [],
 	block_gossip_peers = [],
 	local_peers = [],
@@ -217,6 +219,7 @@
 	block_throttle_by_solution_interval = ?DEFAULT_BLOCK_THROTTLE_BY_SOLUTION_INTERVAL_MS,
 	tls_cert_file = not_set, %% required to enable TLS
 	tls_key_file = not_set,  %% required to enable TLS
+	http_api_transport_idle_timeout = 10000,
 	p3 = #p3_config{},
 	coordinated_mining = false,
 	cm_api_secret = not_set,

@@ -7,6 +7,12 @@
 %% (e.g. bin/test or bin/shell)
 -define(IS_TEST, erlang:get_cookie() == test).
 
+%% Default gen_server:call timeout.
+%% Is used to safely replace deprecated `infinity` timeout, that was used in
+%% multiple places, with a more reasonable value.
+%% Is a subject for future changes.
+-define(DEFAULT_CALL_TIMEOUT, 600000).
+
 %% The mainnet name. Does not change at the hard forks.
 -ifndef(NETWORK_NAME).
 	-ifdef(AR_TEST).
@@ -102,7 +108,8 @@
 -define(WINSTON_PER_AR, 1000000000000).
 
 %% The number of bytes in a gibibyte.
--define(MiB, (1024 * 1024)).
+-define(KiB, (1024)).
+-define(MiB, (1024 * ?KiB)).
 -define(GiB, (1024 * ?MiB)).
 -define(TiB, (1024 * ?GiB)).
 
@@ -265,9 +272,6 @@
 %% Transaction headers directory, relative to the disk cache directory.
 -define(DISK_CACHE_TX_DIR, "txs").
 
-%% Directory with files indicating completed storage migrations, relative to the data dir.
--define(STORAGE_MIGRATIONS_DIR, "data/storage_migrations").
-
 %% Backup block hash list storage directory, relative to the data dir.
 -define(HASH_LIST_DIR, "hash_lists").
 
@@ -368,6 +372,12 @@
 
 -ifndef(INITIAL_VDF_DIFFICULTY).
 -define(INITIAL_VDF_DIFFICULTY, 600_000).
+-endif.
+
+%% By default we prevent syncing replica 2.9 chunks since they are too expensive to unpack.
+%% This flag will also enable the global sync record filtering.
+-ifndef(BLOCK_2_9_SYNCING).
+-define(BLOCK_2_9_SYNCING, true).
 -endif.
 
 %% @doc A chunk with the proofs of its presence in the weave at a particular offset.

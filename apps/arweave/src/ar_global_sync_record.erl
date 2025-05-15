@@ -71,22 +71,22 @@ get_serialized_sync_buckets() ->
 init([]) ->
 	ok = ar_events:subscribe(sync_record),
 	{ok, Config} = application:get_env(arweave, config),
-	SyncRecord =
-		lists:foldl(
-			fun(Module, Acc) ->
-				StoreID =
-					case Module of
-						"default" ->
-							"default";
-						_ ->
-							ar_storage_module:id(Module)
-					end,
-				R = ar_sync_record:get(ar_data_sync, StoreID),
-				ar_intervals:union(R, Acc)
-			end,
-			ar_intervals:new(),
-			["default" | Config#config.storage_modules]
-		),
+	SyncRecord = lists:foldl(
+		fun(Module, Acc) ->
+			case Module of
+				{_, _, {replica_2_9, _}} when ?BLOCK_2_9_SYNCING ->
+					%% Ignore replica.2.9 packing. This is a temporary solution until
+					%% we can support data syncing in batches corresponding to the
+					%% replica.2.9 entropy footprint
+					Acc;
+				_ ->
+					StoreID = ar_storage_module:id(Module),
+					ar_intervals:union(ar_sync_record:get(ar_data_sync, StoreID), Acc)
+			end
+		end,
+		ar_intervals:new(),
+		["default" | Config#config.storage_modules]
+	),
 	SyncBuckets = ar_sync_buckets:from_intervals(SyncRecord),
 	{SyncBuckets2, SerializedSyncBuckets} = ar_sync_buckets:serialize(SyncBuckets,
 					?MAX_SYNC_BUCKETS_SIZE),
@@ -126,11 +126,19 @@ handle_cast(Cast, State) ->
 	?LOG_WARNING([{event, unhandled_cast}, {module, ?MODULE}, {cast, Cast}]),
 	{noreply, State}.
 
-handle_info({event, sync_record, {add_range, Start, End, ar_data_sync, _StoreID}}, State) ->
-	#state{ sync_record = SyncRecord, sync_buckets = SyncBuckets } = State,
-	SyncRecord2 = ar_intervals:add(SyncRecord, End, Start),
-	SyncBuckets2 = ar_sync_buckets:add(End, Start, SyncBuckets),
-	{noreply, State#state{ sync_record = SyncRecord2, sync_buckets = SyncBuckets2 }};
+handle_info({event, sync_record, {add_range, Start, End, ar_data_sync, StoreID}}, State) ->
+	case ar_storage_module:get_packing(StoreID) of
+		{replica_2_9, _} when ?BLOCK_2_9_SYNCING ->
+			%% Ignore replica.2.9 packing. This is a temporary solution until
+			%% we can support data syncing in batches corresponding to the
+			%% replica.2.9 entropy footprint
+			{noreply, State};
+		_ ->
+			#state{ sync_record = SyncRecord, sync_buckets = SyncBuckets } = State,
+			SyncRecord2 = ar_intervals:add(SyncRecord, End, Start),
+			SyncBuckets2 = ar_sync_buckets:add(End, Start, SyncBuckets),
+			{noreply, State#state{ sync_record = SyncRecord2, sync_buckets = SyncBuckets2 }}
+	end;
 
 handle_info({event, sync_record, {global_cut, Offset}}, State) ->
 	#state{ sync_record = SyncRecord, sync_buckets = SyncBuckets } = State,
