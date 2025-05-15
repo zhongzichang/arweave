@@ -77,7 +77,7 @@ parse_storage_module(IOList) ->
 		[PartitionNumberBin, PackingBin, <<"repack_in_place">>, ToPackingBin] ->
 			PartitionNumber = binary_to_integer(PartitionNumberBin),
 			true = PartitionNumber >= 0,
-			parse_storage_module(PartitionNumber, ?PARTITION_SIZE, PackingBin, ToPackingBin);
+			parse_storage_module(PartitionNumber, ar_block:partition_size(), PackingBin, ToPackingBin);
 		[RangeNumberBin, RangeSizeBin, PackingBin, <<"repack_in_place">>, ToPackingBin] ->
 			RangeNumber = binary_to_integer(RangeNumberBin),
 			true = RangeNumber >= 0,
@@ -87,7 +87,7 @@ parse_storage_module(IOList) ->
 		[PartitionNumberBin, PackingBin] ->
 			PartitionNumber = binary_to_integer(PartitionNumberBin),
 			true = PartitionNumber >= 0,
-			parse_storage_module(PartitionNumber, ?PARTITION_SIZE, PackingBin);
+			parse_storage_module(PartitionNumber, ar_block:partition_size(), PackingBin);
 		[RangeNumberBin, RangeSizeBin, PackingBin] ->
 			RangeNumber = binary_to_integer(RangeNumberBin),
 			true = RangeNumber >= 0,
@@ -185,6 +185,8 @@ parse_options([{<<"verify">>, Opt} | _], _) ->
 
 parse_options([{<<"verify_samples">>, N} | Rest], Config) when is_integer(N) ->
 	parse_options(Rest, Config#config{ verify_samples = N });
+parse_options([{<<"verify_samples">>, <<"all">>} | Rest], Config) ->
+	parse_options(Rest, Config#config{ verify_samples = all });
 parse_options([{<<"verify_samples">>, Opt} | _], _) ->
 	{error, {bad_type, verify_samples, number}, Opt};
 
@@ -221,7 +223,9 @@ parse_options([{<<"storage_modules">>, L} | Rest], Config) when is_list(L) ->
 		parse_options(Rest, Config#config{
 				storage_modules = StorageModules,
 				repack_in_place_storage_modules = RepackInPlaceStorageModules })
-	catch _:_ ->
+	catch Error:Reason ->
+		?LOG_ERROR([{event, parse_failure}, {option, storage_modules},
+			{error, Error}, {reason, Reason}]),
 		{error, {bad_format, storage_modules, "an array of "
 				"\"{number},{address}[,repack_in_place,{to_packing}]\""}, L}
 	end;
@@ -232,6 +236,11 @@ parse_options([{<<"repack_batch_size">>, N} | Rest], Config) when is_integer(N) 
 	parse_options(Rest, Config#config{ repack_batch_size = N });
 parse_options([{<<"repack_batch_size">>, Opt} | _], _) ->
 	{error, {bad_type, repack_batch_size, number}, Opt};
+
+parse_options([{<<"repack_cache_size_mb">>, N} | Rest], Config) when is_integer(N) ->
+	parse_options(Rest, Config#config{ repack_cache_size_mb = N });
+parse_options([{<<"repack_cache_size_mb">>, Opt} | _], _) ->
+	{error, {bad_type, repack_cache_size_mb, number}, Opt};
 
 parse_options([{<<"polling">>, Frequency} | Rest], Config) when is_integer(Frequency) ->
 	parse_options(Rest, Config#config{ polling = Frequency });
@@ -639,7 +648,7 @@ parse_options([{<<"cm_peers">>, Peers} | Rest], Config) when is_list(Peers) ->
 
 parse_options([{<<"cm_exit_peer">>, Peer} | Rest], Config) ->
 	case ar_util:safe_parse_peer(Peer) of
-		{ok, ParsedPeer} ->
+		{ok, [ParsedPeer|_]} ->
 			parse_options(Rest, Config#config{ cm_exit_peer = ParsedPeer });
 		{error, _} ->
 			{error, bad_cm_exit_peer, Peer}
@@ -709,6 +718,14 @@ parse_options([{<<"data_sync_request_packed_chunks">>, Bool} | Rest], Config)
 parse_options([{<<"data_sync_request_packed_chunks">>, InvalidValue} | _Rest], _Config) ->
 	{error, {bad_type, data_sync_request_packed_chunks, boolean}, InvalidValue};
 
+%% shutdown procedure
+parse_options([{<<"shutdown_tcp_connection_timeout">>, Delay} | Rest], Config)
+	when is_integer(Delay) andalso Delay > 0 ->
+		NewConfig = Config#config{ shutdown_tcp_connection_timeout = Delay },
+		parse_options(Rest, NewConfig);
+parse_options([{<<"shutdown_tcp_connection_timeout">>, InvalidValue} | Rest], Config) ->
+	{error, {bad_type, shutdown_tcp_connection_timeout, integer}, InvalidValue};
+
 parse_options([Opt | _], _) ->
 	{error, unknown, Opt};
 parse_options([], Config) ->
@@ -733,16 +750,12 @@ parse_storage_module(RangeNumber, RangeSize, PackingBin) ->
 	{ok, {RangeSize, RangeNumber, Packing}}.
 
 parse_storage_module(RangeNumber, RangeSize, PackingBin, ToPackingBin) ->
-	%% We do not support repacking in place from the 2.9 replication format.
 	Packing =
 		case PackingBin of
 			<<"unpacked">> ->
 				unpacked;
-			<< MiningAddr:43/binary, ".", PackingDifficultyBin/binary >> ->
-				PackingDifficulty = binary_to_integer(PackingDifficultyBin),
-				true = PackingDifficulty >= 1
-						andalso PackingDifficulty =< ?MAX_PACKING_DIFFICULTY,
-				{composite, ar_util:decode(MiningAddr), PackingDifficulty};
+			<< MiningAddr:43/binary, ".replica.2.9" >> ->
+				{replica_2_9, ar_util:decode(MiningAddr)};
 			MiningAddr when byte_size(MiningAddr) == 43 ->
 				{spora_2_6, ar_util:decode(MiningAddr)}
 		end,
@@ -752,11 +765,6 @@ parse_storage_module(RangeNumber, RangeSize, PackingBin, ToPackingBin) ->
 				unpacked;
 			<< ToMiningAddr:43/binary, ".replica.2.9" >> ->
 				{replica_2_9, ar_util:decode(ToMiningAddr)};
-			<< ToMiningAddr:43/binary, ".", ToPackingDifficultyBin/binary >> ->
-				ToPackingDifficulty = binary_to_integer(ToPackingDifficultyBin),
-				true = ToPackingDifficulty >= 1
-						andalso ToPackingDifficulty =< ?MAX_PACKING_DIFFICULTY,
-				{composite, ar_util:decode(ToMiningAddr), ToPackingDifficulty};
 			ToMiningAddr when byte_size(ToMiningAddr) == 43 ->
 				{spora_2_6, ar_util:decode(ToMiningAddr)}
 		end,
@@ -771,11 +779,13 @@ safe_map(Fun, List) ->
 
 parse_peers([Peer | Rest], ParsedPeers) ->
 	case ar_util:safe_parse_peer(Peer) of
-		{ok, ParsedPeer} -> parse_peers(Rest, [ParsedPeer | ParsedPeers]);
+		{ok, ParsedPeer} -> parse_peers(Rest, ParsedPeer ++ ParsedPeers);
 		{error, _} -> error
 	end;
 parse_peers([], ParsedPeers) ->
-	{ok, lists:reverse(ParsedPeers)}.
+	Flatten = lists:flatten(ParsedPeers),
+	Reverse = lists:reverse(Flatten),
+	{ok, Reverse}.
 
 parse_webhooks([{WebhookConfig} | Rest], ParsedWebhookConfigs) when is_list(WebhookConfig) ->
 	case parse_webhook(WebhookConfig, #config_webhook{}) of
@@ -839,7 +849,7 @@ parse_requests_per_minute_limit_by_ip({[{IP, Object} | Pairs]}, Parsed) ->
 	case ar_util:safe_parse_peer(IP) of
 		{error, invalid} ->
 			error;
-		{ok, {A, B, C, D, _Port}} ->
+		{ok, [{A, B, C, D, _Port}]} ->
 			case parse_atom_number_map(Object, #{}) of
 				error ->
 					error;
@@ -950,25 +960,16 @@ validate_repack_in_place(Config) ->
 
 validate_repack_in_place([], _Modules) ->
 	true;
-validate_repack_in_place([{Module, ToPacking} | L], Modules) ->
-	{_BucketSize, _Bucket, Packing} = Module,
+validate_repack_in_place([{Module, _ToPacking} | L], Modules) ->
 	ID = ar_storage_module:id(Module),
 	ModuleInUse = lists:member(ID, Modules),
-	FromPackingType = ar_mining_server:get_packing_type(Packing),
-	ToPackingType = ar_mining_server:get_packing_type(ToPacking),
-	case {ModuleInUse, FromPackingType, ToPackingType} of
-		{true, _, _} ->
+	case ModuleInUse of
+		true ->
 			io:format("~nCannot use the storage module ~s "
 					"while it is being repacked in place.~n~n", [ID]),
 			false;
-		{_, replica_2_9, _} ->
-			io:format("~nCannot repack in place from replica_2_9 to any format.~n~n"),
-			false;
-		{_, _, replica_2_9} ->
-			validate_repack_in_place(L, Modules);
-		_ ->
-			io:format("~nCan only repack in place to replica_2_9.~n~n"),
-			false
+		false ->
+			validate_repack_in_place(L, Modules)
 	end.
 
 validate_cm_pool(Config) ->

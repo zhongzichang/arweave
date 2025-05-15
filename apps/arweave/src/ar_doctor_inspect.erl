@@ -3,6 +3,7 @@
 -export([main/1, help/0]).
 
 -include_lib("arweave/include/ar.hrl").
+-include_lib("arweave/include/ar_consensus.hrl").
 -include_lib("arweave/include/ar_config.hrl").
 -include_lib("arweave/include/ar_chunk_storage.hrl").
 
@@ -10,11 +11,15 @@
 %% API
 %%--------------------------------------------------------------------
 
-%% main/1 expects [Dir, StartStr, EndStr, Address1, Address2, ...]
+%% main/1 expects either:
+%% 1. [Dir, StartStr, EndStr, Address1, Address2, ...] for traditional inspection
+%% 2. ["bitmap", DataDir, StorageModule] for generating a bitmap of chunk states
 main(Args) ->
-	%% Expect: [Dir, StartStr, EndStr, Address1, Address2, ...]
 	case Args of
-		[Dir, StartStr, EndStr | AddrListStr] when length(AddrListStr) >= 1 ->
+		["bitmap", DataDir, StorageModuleConfig] ->
+			bitmap(DataDir, StorageModuleConfig),
+			true;
+		["chunks", Dir, StartStr, EndStr | AddrListStr] when length(AddrListStr) >= 1 ->
 			Addresses = [ar_util:decode(AddrStr) || AddrStr <- AddrListStr],
 			application:set_env(arweave, config, #config{
 				disable = [], enable  = [randomx_large_pages]
@@ -34,10 +39,11 @@ main(Args) ->
 	end.
 
 help() ->
-	ar:console("Usage: inspect <directory> <start_range> <end_range> <address1> [address2 ...]~n").
+	ar:console("Usage: inspect chunks <directory> <start_range> <end_range> <address1> [address2 ...]~n"),
+	ar:console("       inspect bitmap <data_dir> <storage_module>~n").
 
 %%--------------------------------------------------------------------
-%% Internal implementation
+%% Inspect Chunks
 %%--------------------------------------------------------------------
 
 %% iterate from Padded (chunk end offset) = Start to End (inclusive)
@@ -204,4 +210,37 @@ print_match({match, Type}) when is_list(Type) ->
 print_match({match, Packing}) ->
 	ar:console("~nMATCH: ~p~n", [ar_serialize:encode_packing(Packing, true)]);
 print_match(no_match) ->
-	ar:console("~nNO MATCH~n"). 
+	ar:console("~nNO MATCH~n").
+
+%%--------------------------------------------------------------------
+%% Inspect Bitmap
+%%--------------------------------------------------------------------
+
+%% @doc Generates a bitmap of the provided storage module. Each pixel is a chunk where
+%% the color is determined by the packing format of the chunk. Each row of the bitmap
+%% is a replica.2.9 sector (so the bitmap is 1024 rows high).
+bitmap(DataDir, StorageModuleConfig) ->
+	{ok, StorageModule} = ar_config:parse_storage_module(StorageModuleConfig),
+	
+	Config = #config{
+		data_dir = DataDir,
+		storage_modules = [StorageModule]},
+	application:set_env(arweave, config, Config),
+
+	StoreID = ar_storage_module:id(StorageModule),
+	
+	ar_kv_sup:start_link(),
+	ar_storage_sup:start_link(),
+	ar_sync_record_sup:start_link(),
+	ar_data_sync:init_kv(StoreID),
+	
+	{ModuleStart, ModuleEnd} = ar_storage_module:module_range(StorageModule),
+
+	ChunkPackings = ar_chunk_visualization:get_chunk_packings(
+		ModuleStart, ModuleEnd, StoreID, true),
+	ar_chunk_visualization:print_chunk_stats(ChunkPackings),
+	Bitmap = ar_chunk_visualization:generate_bitmap(ChunkPackings),
+	
+	Filename = "bitmap_" ++ StoreID ++ ".ppm",
+	file:write_file(Filename, ar_chunk_visualization:bitmap_to_binary(Bitmap)),
+	ar:console("Bitmap written to ~s~n", [Filename]).

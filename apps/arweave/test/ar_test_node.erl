@@ -6,7 +6,8 @@
 		restart/0, restart/1, restart_with_config/1, restart_with_config/2,
 		start_other_node/4, start_node/2, start_node/3, start_coordinated/1, base_cm_config/1, mine/1,
 		wait_until_height/1, wait_until_height/2, wait_until_height/3, assert_wait_until_height/2, http_get_block/2, get_blocks/1,
-		mock_to_force_invalid_h1/0, get_difficulty_for_invalid_hash/0, invalid_solution/0,
+		mock_to_force_invalid_h1/0, mainnet_packing_mocks/0,
+		get_difficulty_for_invalid_hash/0, invalid_solution/0,
 		valid_solution/0, new_mock/2, mock_function/3, unmock_module/1, remote_call/4,
 		load_fixture/1,
 		get_default_storage_module_packing/2, get_genesis_chunk/1,
@@ -36,9 +37,9 @@
 
 		mock_functions/1, test_with_mocked_functions/2, test_with_mocked_functions/3]).
 
--include("../include/ar.hrl").
--include("../include/ar_config.hrl").
--include("../include/ar_consensus.hrl").
+-include("ar.hrl").
+-include("ar_config.hrl").
+-include("ar_consensus.hrl").
 
 -include_lib("eunit/include/eunit.hrl").
 
@@ -252,6 +253,7 @@ start_other_node(Node, B0, Config, WaitUntilSync) ->
 start_node(B0, Config) ->
 	start_node(B0, Config, true).
 start_node(B0, Config, WaitUntilSync) ->
+	?LOG_INFO("Starting node"),
 	clean_up_and_stop(),
 	{ok, BaseConfig} = application:get_env(arweave, config),
 	write_genesis_files(BaseConfig#config.data_dir, B0),
@@ -264,6 +266,7 @@ start_node(B0, Config, WaitUntilSync) ->
 		false ->
 			ok
 	end,
+	?LOG_INFO("Node started"),
 	erlang:node().
 
 %% @doc Launch the given number (>= 1, =< ?MAX_MINERS) of the mining nodes in the coordinated
@@ -272,7 +275,7 @@ start_node(B0, Config, WaitUntilSync) ->
 start_coordinated(MiningNodeCount) when MiningNodeCount >= 1, MiningNodeCount =< ?MAX_MINERS ->
 	%% Set weave larger than what we'll cover with the 3 nodes so that every node can find
 	%% a solution.
-	[B0] = ar_weave:init([], get_difficulty_for_invalid_hash(), ?PARTITION_SIZE * 5),
+	[B0] = ar_weave:init([], get_difficulty_for_invalid_hash(), ar_block:partition_size() * 5),
 	ExitPeer = peer_ip(peer1),
 	ValidatorPeer = peer_ip(main),
 	MinerNodes = lists:sublist([peer2, peer3, peer4], MiningNodeCount),
@@ -371,6 +374,16 @@ mock_to_force_invalid_h1() ->
 		end
 	}.
 
+%% @doc Mock out packing-related constants to replicate mainnet behavior.
+mainnet_packing_mocks() ->
+	[
+		{ar_block, partition_size, fun() -> 3_600_000_000_000 end},
+		{ar_block, strict_data_split_threshold, fun() -> 30_607_159_107_830 end},
+		{ar_storage_module, get_overlap, fun(_) -> 104_857_600 end},
+		{ar_replica_2_9, sub_chunks_per_entropy, fun() -> 1024 end},
+		{ar_replica_2_9, get_sector_size, fun() -> 3_515_875_328 end}
+	].
+
 get_difficulty_for_invalid_hash() ->
 	%% Set the difficulty just high enough to exclude the invalid_solution(), this lets
 	%% us selectively disable one- or two-chunk mining in tests.
@@ -388,12 +401,15 @@ load_fixture(Fixture) ->
 
 clean_up_and_stop() ->
 	Config = stop(),
+	?LOG_DEBUG([{event, clean_up_and_stop}, {data_dir, Config#config.data_dir}]),
 	ok = filelib:ensure_dir(Config#config.data_dir),
 	{ok, Entries} = file:list_dir_all(Config#config.data_dir),
 	lists:foreach(
 		fun	("wallets") ->
 				ok;
 			(Entry) ->
+				?LOG_DEBUG([{event, clean_up_and_stop},
+					{delete, filename:join(Config#config.data_dir, Entry)}]),
 				ok = file:del_dir_r(filename:join(Config#config.data_dir, Entry))
 		end,
 		Entries
@@ -489,7 +505,7 @@ get_cm_storage_modules(RewardAddr, N, MiningNodeCount)
 	%% skip partitions so that no two nodes can mine the same range even accounting for ?OVERLAP
 	%% Note that replica_2_9 modules do not have ?OVERLAP.
 	RangeNumber = lists:nth(N, [0, 2, 4]),
-	[{?PARTITION_SIZE, RangeNumber, get_default_storage_module_packing(RewardAddr, 0)}].
+	[{ar_block:partition_size(), RangeNumber, get_default_storage_module_packing(RewardAddr, 0)}].
 
 remote_call(Node, Module, Function, Args) ->
 	remote_call(Node, Module, Function, Args, ?REMOTE_CALL_TIMEOUT).
@@ -557,7 +573,7 @@ start(Options) when is_map(Options) ->
 	StorageModules =
 		case maps:get(storage_modules, Options, not_set) of
 			not_set ->
-				[{20 * 1024 * 1024, N,
+				[{10 * ar_block:partition_size(), N,
 						get_default_storage_module_packing(RewardAddr, N, Options)}
 					|| N <- lists:seq(0, 8)];
 			Value3 ->
@@ -571,7 +587,7 @@ start(B0, RewardAddr) ->
 
 %% @doc Start a fresh node with the given genesis block, mining address, and config.
 start(B0, RewardAddr, Config) ->
-	StorageModules = [{20 * 1024 * 1024, N, get_default_storage_module_packing(RewardAddr, N)}
+	StorageModules = [{10 * ar_block:partition_size(), N, get_default_storage_module_packing(RewardAddr, N)}
 			|| N <- lists:seq(0, 8)],
 	start(B0, RewardAddr, Config, StorageModules).
 
@@ -627,6 +643,7 @@ restart_with_config(Node, Config) ->
 	remote_call(Node, ?MODULE, restart_with_config, [Config], 90000).
 
 start_peer(Node, Args) when is_map(Args) ->
+	?LOG_DEBUG([{event, start_peer}, {peer, Node}]),
 	remote_call(Node, ?MODULE, start, [Args], ?PEER_START_TIMEOUT),
 	wait_until_joined(Node),
 	wait_until_syncs_genesis_data(Node);
@@ -802,7 +819,7 @@ join(JoinOnNode, Rejoin) ->
 			clean_up_and_stop()
 	end,
 	RewardAddr = ar_wallet:to_address(ar_wallet:new_keyfile()),
-	StorageModules = [{?PARTITION_SIZE, N,
+	StorageModules = [{ar_block:partition_size(), N,
 			get_default_storage_module_packing(RewardAddr, N)} || N <- lists:seq(0, 4)],
 	ok = application:set_env(arweave, config, Config#config{
 		start_from_latest_state = false,
@@ -910,8 +927,13 @@ wait_until_syncs_genesis_data() ->
 	%% Once the data is stored in the disk pool, make the storage modules
 	%% copy the missing data over from each other. This procedure is executed on startup
 	%% but the disk pool did not have any data at the time.
-	[gen_server:cast(list_to_atom("ar_data_sync_" ++ ar_storage_module:label(Module)),
-			sync_data) || Module <- Config#config.storage_modules],
+	[
+		gen_server:cast(
+			list_to_atom("ar_data_sync_" ++ ar_storage_module:label(ar_storage_module:id(M))),
+			sync_data
+		) 
+		|| M <- Config#config.storage_modules
+	],
 	[wait_until_syncs_data(N * Size, (N + 1) * Size, WeaveSize, Packing)
 			|| {Size, N, Packing} <- Config#config.storage_modules],
 	?LOG_INFO([{event, wait_until_syncs_genesis_data}, {status, cross_module_sync_complete}]),
@@ -1128,27 +1150,51 @@ get_tx_confirmations(Node, TXID) ->
 	end.
 
 new_mock(Module, Options) ->
+	new_mock(Module, Options, 5).
+
+new_mock(_Module, _Options, 0) ->
+	ok;
+new_mock(Module, Options, Retries) ->
 	try
 		meck:new(Module, Options)
 	catch
 		error:E ->
-			?LOG_ERROR("Error creating mock for ~p: ~p", [Module, E])
+			?debugFmt("ar_test_node (retries left ~p): Error creating mock for ~p: ~p",
+					[Retries - 1, Module, E]),
+			timer:sleep(1000),
+			new_mock(Module, Options, Retries - 1)
 	end.
 
 mock_function(Module, Fun, Mock) ->
+	mock_function(Module, Fun, Mock, 5).
+
+mock_function(_Module, _Fun, _Mock, 0) ->
+	ok;
+mock_function(Module, Fun, Mock, Retries) ->
 	try
 		meck:expect(Module, Fun, Mock)
 	catch
 		error:E ->
-			?LOG_ERROR("Error setting mock for ~p: ~p", [Module, E])
+			?debugFmt("ar_test_node (retries left ~p): Error setting mock for ~p: ~p",
+					[Retries - 1, Module, E]),
+			timer:sleep(1000),
+			mock_function(Module, Fun, Mock, Retries - 1)
 	end.
 
 unmock_module(Module) ->
+	unmock_module(Module, 5).
+
+unmock_module(_Module, 0) ->
+	ok;
+unmock_module(Module, Retries) ->
 	try
 		meck:unload(Module)
 	catch
 		error:E ->
-			?LOG_ERROR("Error unloading mock for ~p: ~p", [Module, E])
+			?debugFmt("ar_test_node (retries left ~p): Error unloading mock for ~p: ~p",
+					[Retries - 1, Module, E]),
+			timer:sleep(1000),
+			unmock_module(Module, Retries - 1)
 	end.
 
 mock_functions(Functions) ->
@@ -1187,7 +1233,7 @@ mock_functions(Functions) ->
 				fun(Module, _, _) ->
 					unmock_module(Module),
 					lists:foreach(
-						fun({_Build, Node}) ->
+						fun({_TestType, Node}) ->
 							remote_call(Node, ar_test_node, unmock_module, [Module])
 						end,
 						all_peers(test))

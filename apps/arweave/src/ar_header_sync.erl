@@ -223,7 +223,6 @@ handle_cast({remove_tx, TXID}, State) ->
 	{noreply, State};
 
 handle_cast({remove_block, Height}, State) ->
-	?LOG_INFO([{event, removing_block_record}, {height, Height}]),
 	#state{ sync_record = Record } = State,
 	ok = ar_kv:delete(?MODULE, << Height:256 >>),
 	{noreply, State#state{ sync_record = ar_intervals:delete(Record, Height, Height - 1) }};
@@ -271,7 +270,7 @@ handle_info({event, tx, {preparing_unblacklisting, TXID}}, State) ->
 handle_info({event, tx, _}, State) ->
 	{noreply, State};
 
-handle_info({event, disksup, {remaining_disk_space, "default", true, _Percentage, Bytes}},
+handle_info({event, disksup, {remaining_disk_space, ?DEFAULT_MODULE, true, _Percentage, Bytes}},
 		State) ->
 	{ok, Config} = application:get_env(arweave, config),
 	DiskPoolSize = Config#config.max_disk_pool_buffer_mb * 1024 * 1024,

@@ -33,11 +33,11 @@
 		partial_solution_response_to_json_struct/1,
 		pool_cm_jobs_to_json_struct/1, json_map_to_pool_cm_jobs/1]).
 
--include("../include/ar.hrl").
--include("../include/ar_consensus.hrl").
--include("../include/ar_vdf.hrl").
--include("../include/ar_mining.hrl").
--include("../include/ar_pool.hrl").
+-include("ar.hrl").
+-include("ar_consensus.hrl").
+-include("ar_vdf.hrl").
+-include("ar_mining.hrl").
+-include("ar_pool.hrl").
 
 -include_lib("eunit/include/eunit.hrl").
 
@@ -1067,9 +1067,10 @@ parse_tx(<< Format:8, TXID:32/binary,
 						{?ECDSA_SIGN_ALG, secp256k1} ->
 							DataSegment = ar_tx:generate_signature_data_segment(TX),
 							Owner2 = ar_wallet:recover_key(DataSegment, Signature, SigType),
-							{ok, TX#tx{ owner = Owner2 }};
+							{ok, TX#tx{ owner = Owner2,
+									owner_address = ar_wallet:to_address(Owner2, SigType) }};
 						{?RSA_SIGN_ALG, 65537} ->
-							{ok, TX}
+							{ok, TX#tx{ owner_address = ar_wallet:to_address(Owner, SigType) }}
 					end;
 				{error, Reason} ->
 					{error, Reason}
@@ -1630,9 +1631,9 @@ json_struct_to_tx(TXStruct, ComputeDataSize) ->
 		?ECDSA_KEY_TYPE ->
 			DataSegment = ar_tx:generate_signature_data_segment(TX),
 			Owner2 = ar_wallet:recover_key(DataSegment, Sig, SigType),
-			TX#tx{ owner = Owner2 };
+			TX#tx{ owner = Owner2, owner_address = ar_wallet:to_address(Owner2, SigType) };
 		?RSA_KEY_TYPE ->
-			TX
+			TX#tx{ owner_address = ar_wallet:to_address(Owner, SigType) }
 	end.
 
 set_sig_type_from_pub_key(_Owner, <<>>) ->
@@ -2225,12 +2226,10 @@ partition_to_json_struct(Bucket, BucketSize, Addr, PackingDifficulty) ->
 		end,
 	{Fields2}.
 
+%% Used in logging among other things, therefore we have more
+%% possible values here than in decode_packing/2.
 encode_packing(undefined, false) ->
 	"undefined";
-encode_packing(none, false) ->
-	"none";
-encode_packing(any, false) ->
-	"any";
 encode_packing({spora_2_6, Addr}, _Strict) ->
 	"spora_2_6_" ++ binary_to_list(ar_util:encode(Addr));
 encode_packing({composite, Addr, PackingDifficulty}, _Strict) ->
@@ -2240,10 +2239,12 @@ encode_packing(spora_2_5, _Strict) ->
 	"spora_2_5";
 encode_packing(unpacked, _Strict) ->
 	"unpacked";
+encode_packing(unpacked_padded, _Strict) ->
+	"unpacked_padded";
 encode_packing({replica_2_9, Addr}, _Strict) ->
 	"replica_2_9_" ++ binary_to_list(ar_util:encode(Addr));
-encode_packing(unpacked_padded, _Strict) ->
-	"unpacked_padded".
+encode_packing(Packing, false) when is_atom(Packing) ->
+	atom_to_list(Packing).
 
 decode_packing(<<"unpacked">>, _Error) ->
 	unpacked;

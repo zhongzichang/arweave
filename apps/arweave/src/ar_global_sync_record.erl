@@ -2,9 +2,9 @@
 
 -behaviour(gen_server).
 
--include_lib("arweave/include/ar.hrl").
--include_lib("arweave/include/ar_config.hrl").
--include_lib("arweave/include/ar_data_discovery.hrl").
+-include("ar.hrl").
+-include("ar_config.hrl").
+-include("ar_data_discovery.hrl").
 
 -export([start_link/0, get_serialized_sync_record/1, get_serialized_sync_buckets/0]).
 
@@ -40,6 +40,7 @@ start_link() ->
 %% format			required	etf or json		serialize in Erlang Term Format or JSON
 %% random_subset	optional	any()			pick a random subset if the key is present
 %% start			optional	integer()		pick intervals with right bound >= start
+%% right_bound		optional	integer()		pick intervals with right bound <= right_bound
 %% limit			optional	integer()		the number of intervals to pick
 %%
 %% ?MAX_SHARED_SYNCED_INTERVALS_COUNT is both the default and the maximum value for limit.
@@ -85,7 +86,7 @@ init([]) ->
 			end
 		end,
 		ar_intervals:new(),
-		["default" | Config#config.storage_modules]
+		[?DEFAULT_MODULE | Config#config.storage_modules]
 	),
 	SyncBuckets = ar_sync_buckets:from_intervals(SyncRecord),
 	{SyncBuckets2, SerializedSyncBuckets} = ar_sync_buckets:serialize(SyncBuckets,
@@ -126,8 +127,9 @@ handle_cast(Cast, State) ->
 	?LOG_WARNING([{event, unhandled_cast}, {module, ?MODULE}, {cast, Cast}]),
 	{noreply, State}.
 
-handle_info({event, sync_record, {add_range, Start, End, ar_data_sync, StoreID}}, State) ->
-	case ar_storage_module:get_packing(StoreID) of
+handle_info({event, sync_record, {add_range, Start, End, ar_data_sync, Module}}, State) ->
+	Packing = ar_storage_module:get_packing(Module),
+	case Packing of
 		{replica_2_9, _} when ?BLOCK_2_9_SYNCING ->
 			%% Ignore replica.2.9 packing. This is a temporary solution until
 			%% we can support data syncing in batches corresponding to the

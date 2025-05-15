@@ -134,9 +134,14 @@ show_help() ->
 					"Note: as of 2.9.1 you can only repack in place to the replica_2_9 "
 					"format."
 			},
-			{"repack_batch_size", io_lib:format("The number of chunk fetched from disk "
-				"at a time during in-place repacking. Default: ~B.",
+			{"repack_batch_size", io_lib:format("The number of batches to process at a time "
+				"during in-place repacking. For each partition being repacked, a batch "
+				"requires about 512 MiB of memory. Default: ~B.",
 				[?DEFAULT_REPACK_BATCH_SIZE])},
+			{"repack_cache_size_mb", io_lib:format("The size (in MiB) of the cache for "
+				"in-place repacking. The node will restrict the cache size to this amount for "
+				"each partition being repacked. Default: ~B.",
+				[?DEFAULT_REPACK_CACHE_SIZE_MB])},
 			{"polling (num)", lists:flatten(
 					io_lib:format(
 						"Ask some peers about new blocks every N seconds. Default is ~p.",
@@ -252,14 +257,14 @@ show_help() ->
 				"The time in seconds of how long a pending or orphaned data root is kept in "
 				"the disk pool. The default is 2 * 60 * 60 (2 hours)."},
 			{"max_disk_pool_buffer_mb",
-				"The max total size in mebibytes of the pending chunks in the disk pool."
+				"The max total size (in MiB)) of the pending chunks in the disk pool."
 				"The default is 2000 (2 GiB)."},
 			{"max_disk_pool_data_root_buffer_mb",
-				"The max size in mebibytes per data root of the pending chunks in the disk"
+				"The max size (in MiB) per data root of the pending chunks in the disk"
 				" pool. The default is 50."},
 			{"disk_cache_size_mb",
 				lists:flatten(io_lib:format(
-					"The maximum size in mebibytes of the disk space allocated for"
+					"The maximum size (in MiB) of the disk space allocated for"
 					" storing recent block and transaction headers. Default is ~B.",
 					[?DISK_CACHE_SIZE]
 				)
@@ -366,7 +371,9 @@ show_help() ->
 				"resync and/or repack any flagged chunks. When running in verify mode several "
 				"flags are disallowed. See the node output for details."},
 			{"verify_samples (num)", io_lib:format("Number of chunks to sample and unpack "
-				"during 'verify'. Default is ~B.", [?SAMPLE_CHUNK_COUNT])}
+				"during 'verify'. Default is ~B.", [?SAMPLE_CHUNK_COUNT])},
+			{"shutdown_tcp_connection_timeout", io_lib:format("shutdown tcp connection timeout in seconds. "
+				"Default is ~Bs.", [?SHUTDOWN_TCP_CONNECTION_TIMEOUT])}
 		]
 	),
 	erlang:halt().
@@ -405,12 +412,15 @@ parse_cli_args(["verify", _ | _], C) ->
 	io:format("Invalid verify mode. Valid modes are 'purge' or 'log'.~n"),
 	timer:sleep(1000),
 	erlang:halt();
+parse_cli_args(["verify_samples", "all" | Rest], C) ->
+	parse_cli_args(Rest, C#config{ verify_samples = all });
 parse_cli_args(["verify_samples", N | Rest], C) ->
 	parse_cli_args(Rest, C#config{ verify_samples = list_to_integer(N) });
 parse_cli_args(["peer", Peer | Rest], C = #config{ peers = Ps }) ->
 	case ar_util:safe_parse_peer(Peer) of
-		{ok, ValidPeer} ->
-			parse_cli_args(Rest, C#config{ peers = [ValidPeer|Ps] });
+		{ok, ValidPeers} when is_list(ValidPeers) ->
+			NewConfig = C#config{peers = ValidPeers ++ Ps},
+			parse_cli_args(Rest, NewConfig);
 		{error, _} ->
 			io:format("Peer ~p is invalid.~n", [Peer]),
 			parse_cli_args(Rest, C)
@@ -418,16 +428,16 @@ parse_cli_args(["peer", Peer | Rest], C = #config{ peers = Ps }) ->
 parse_cli_args(["block_gossip_peer", Peer | Rest],
 		C = #config{ block_gossip_peers = Peers }) ->
 	case ar_util:safe_parse_peer(Peer) of
-		{ok, ValidPeer} ->
-			parse_cli_args(Rest, C#config{ block_gossip_peers = [ValidPeer | Peers] });
+		{ok, ValidPeer} when is_list(ValidPeer) ->
+			parse_cli_args(Rest, C#config{ block_gossip_peers = ValidPeer ++ Peers });
 		{error, _} ->
 			io:format("Peer ~p invalid ~n", [Peer]),
 			parse_cli_args(Rest, C)
 	end;
 parse_cli_args(["local_peer", Peer | Rest], C = #config{ local_peers = Peers }) ->
 	case ar_util:safe_parse_peer(Peer) of
-		{ok, ValidPeer} ->
-			parse_cli_args(Rest, C#config{ local_peers = [ValidPeer | Peers] });
+		{ok, ValidPeer} when is_list(ValidPeer) ->
+			parse_cli_args(Rest, C#config{ local_peers = ValidPeer ++ Peers });
 		{error, _} ->
 			io:format("Peer ~p is invalid.~n", [Peer]),
 			parse_cli_args(Rest, C)
@@ -471,6 +481,8 @@ parse_cli_args(["storage_module", StorageModuleString | Rest], C) ->
 	end;
 parse_cli_args(["repack_batch_size", N | Rest], C) ->
 	parse_cli_args(Rest, C#config{ repack_batch_size = list_to_integer(N) });
+parse_cli_args(["repack_cache_size_mb", N | Rest], C) ->
+	parse_cli_args(Rest, C#config{ repack_cache_size_mb = list_to_integer(N) });
 parse_cli_args(["polling", Frequency | Rest], C) ->
 	parse_cli_args(Rest, C#config{ polling = list_to_integer(Frequency) });
 parse_cli_args(["block_pollers", N | Rest], C) ->
@@ -652,15 +664,15 @@ parse_cli_args(["cm_poll_interval", Num | Rest], C) ->
 	parse_cli_args(Rest, C#config{ cm_poll_interval = list_to_integer(Num) });
 parse_cli_args(["cm_peer", Peer | Rest], C = #config{ cm_peers = Ps }) ->
 	case ar_util:safe_parse_peer(Peer) of
-		{ok, ValidPeer} ->
-			parse_cli_args(Rest, C#config{ cm_peers = [ValidPeer|Ps] });
+		{ok, ValidPeer} when is_list(ValidPeer) ->
+			parse_cli_args(Rest, C#config{ cm_peers = ValidPeer ++ Ps });
 		{error, _} ->
 			io:format("Peer ~p is invalid.~n", [Peer]),
 			parse_cli_args(Rest, C)
 	end;
 parse_cli_args(["cm_exit_peer", Peer | Rest], C) ->
 	case ar_util:safe_parse_peer(Peer) of
-		{ok, ValidPeer} ->
+		{ok, [ValidPeer|_]} ->
 			parse_cli_args(Rest, C#config{ cm_exit_peer = ValidPeer });
 		{error, _} ->
 			io:format("Peer ~p is invalid.~n", [Peer]),
@@ -688,6 +700,10 @@ parse_cli_args(["rocksdb_flush_interval", Seconds | Rest], C) ->
 	parse_cli_args(Rest, C#config{ rocksdb_flush_interval_s = list_to_integer(Seconds) });
 parse_cli_args(["rocksdb_wal_sync_interval", Seconds | Rest], C) ->
 	parse_cli_args(Rest, C#config{ rocksdb_wal_sync_interval_s = list_to_integer(Seconds) });
+
+%% tcp shutdown procedure
+parse_cli_args(["shutdown_tcp_connection_timeout", Delay|Rest], C) ->
+		parse_cli_args(Rest, C#config{ shutdown_tcp_connection_timeout = list_to_integer(Delay) });
 
 %% Undocumented/unsupported options
 parse_cli_args(["chunk_storage_file_size", Num | Rest], C) ->
@@ -853,7 +869,7 @@ shutdown([NodeName]) ->
 	rpc:cast(NodeName, init, stop, []).
 
 stop(_State) ->
-	ok.
+	?LOG_INFO([{stop, ?MODULE}]).
 
 stop_dependencies() ->
 	{ok, [_Kernel, _Stdlib, _SASL, _OSMon | Deps]} = application:get_key(arweave, applications),
@@ -998,3 +1014,4 @@ console(Format) ->
 console(Format, Params) ->
 	io:format(Format, Params).
 -endif.
+

@@ -54,7 +54,7 @@ register_workers() ->
 			WorkerMaster = ?CHILD_WITH_ARGS(
 				ar_data_sync_worker_master, worker, ar_data_sync_worker_master,
 				[WorkerNames]),
-				Workers ++ [WorkerMaster];
+				[WorkerMaster] ++ Workers;
 		false ->
 			[]
 	end.
@@ -65,7 +65,7 @@ register_sync_workers() ->
 	{Workers, WorkerNames} = lists:foldl(
 		fun(Number, {AccWorkers, AccWorkerNames}) ->
 			Name = list_to_atom("ar_data_sync_worker_" ++ integer_to_list(Number)),
-			Worker = ?CHILD_WITH_ARGS(ar_data_sync_worker, worker, Name, [Name]),
+			Worker = ?CHILD_WITH_ARGS(ar_data_sync_worker, worker, Name, [Name, sync]),
 			{[Worker | AccWorkers], [Name | AccWorkerNames]}
 		end,
 		{[], []},
@@ -93,6 +93,7 @@ ready_for_work() ->
 %%%===================================================================
 
 init(Workers) ->
+	?LOG_INFO([{event, init}, {module, ?MODULE}, {workers, Workers}]),
 	gen_server:cast(?MODULE, process_main_queue),
 	ar_util:cast_after(?REBALANCE_FREQUENCY_MS, ?MODULE, rebalance_peers),
 
@@ -105,6 +106,14 @@ handle_call(ready_for_work, _From, State) ->
 	TotalTaskCount = State#state.scheduled_task_count + State#state.queued_task_count,
 	ReadyForWork = TotalTaskCount < max_tasks(State#state.worker_count),
 	{reply, ReadyForWork, State};
+
+handle_call({reset_worker, Worker}, _From, State) ->
+	Load = maps:get(Worker, State#state.worker_loads, 0),
+	State2 = State#state{
+		scheduled_task_count = State#state.scheduled_task_count - Load,
+		worker_loads = maps:put(Worker, 0, State#state.worker_loads)
+	},
+	{reply, ok, State2};
 
 handle_call(Request, _From, State) ->
 	?LOG_WARNING([{event, unhandled_call}, {module, ?MODULE}, {request, Request}]),
@@ -537,8 +546,8 @@ test_format_peer() ->
 test_enqueue_main_task() ->
 	Peer1 = {1, 2, 3, 4, 1984},
 	Peer2 = {5, 6, 7, 8, 1985},
-	StoreID1 = ar_storage_module:id({?PARTITION_SIZE, 1, default}),
-	StoreID2 = ar_storage_module:id({?PARTITION_SIZE, 2, default}),
+	StoreID1 = ar_storage_module:id({ar_block:partition_size(), 1, default}),
+	StoreID2 = ar_storage_module:id({ar_block:partition_size(), 2, default}),
 	State0 = #state{},
 
 	Ref = make_ref(),
@@ -559,7 +568,7 @@ test_enqueue_main_task() ->
 test_enqueue_peer_task() ->
 	PeerA = {1, 2, 3, 4, 1984},
 	PeerB = {5, 6, 7, 8, 1985},
-	StoreID1 = ar_storage_module:id({?PARTITION_SIZE, 1, default}),
+	StoreID1 = ar_storage_module:id({ar_block:partition_size(), 1, default}),
 
 	PeerATasks = #peer_tasks{ peer = PeerA },
 	PeerBTasks = #peer_tasks{ peer = PeerB },
@@ -588,7 +597,7 @@ test_enqueue_peer_task() ->
 test_process_main_queue() ->
 	Peer1 = {1, 2, 3, 4, 1984},
 	Peer2 = {5, 6, 7, 8, 1985},
-	StoreID1 = ar_storage_module:id({?PARTITION_SIZE, 1, default}),
+	StoreID1 = ar_storage_module:id({ar_block:partition_size(), 1, default}),
 	State0 = #state{
 		workers = queue:from_list([worker1, worker2, worker3]), worker_count = 3
 	},

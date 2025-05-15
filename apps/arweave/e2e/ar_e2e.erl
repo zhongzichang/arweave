@@ -4,7 +4,9 @@
 	write_chunk_fixture/3, load_chunk_fixture/2]).
 
 -export([delayed_print/2, packing_type_to_packing/2,
-	start_source_node/3, source_node_storage_modules/3, max_chunk_offset/1,
+	start_source_node/3, start_source_node/4, 
+	source_node_storage_modules/3, source_node_storage_modules/4,
+	max_chunk_offset/1,
 	assert_recall_byte/3,
 	assert_block/2, assert_syncs_range/3, assert_syncs_range/4, assert_does_not_sync_range/3,
 	assert_has_entropy/4, assert_no_entropy/4,
@@ -73,15 +75,18 @@ packing_type_to_packing(PackingType, Address) ->
 		unpacked -> unpacked
 	end.
 
-start_source_node(Node, unpacked, _WalletFixture) ->
+start_source_node(Node, PackingType, WalletFixture) ->
+	start_source_node(Node, PackingType, WalletFixture, default).
+
+start_source_node(Node, unpacked, _WalletFixture, ModuleSize) ->
 	?LOG_INFO("Starting source node ~p with packing type ~p and wallet fixture ~p",
 		[Node, unpacked, _WalletFixture]),
 	TempNode = case Node of
 		peer1 -> peer2;
 		peer2 -> peer1
 	end,
-	{Blocks, _SourceAddr, Chunks} = ar_e2e:start_source_node(TempNode, spora_2_6, wallet_a),
-	{_, StorageModules} = ar_e2e:source_node_storage_modules(Node, unpacked, wallet_a),
+	{Blocks, _SourceAddr, Chunks} = start_source_node(TempNode, spora_2_6, wallet_a),
+	{_, StorageModules} = source_node_storage_modules(Node, unpacked, wallet_a, ModuleSize),
 	[B0, _, {TX2, _} | _] = Blocks,
 	{ok, Config} = ar_test_node:get_config(Node),
 	ar_test_node:start_other_node(Node, B0, Config#config{
@@ -92,15 +97,9 @@ start_source_node(Node, unpacked, _WalletFixture) ->
 
 	?LOG_INFO("Source node ~p started.", [Node]),
 	
-	ar_e2e:assert_syncs_range(Node, 0, 4*?PARTITION_SIZE),
+	assert_syncs_range(Node, 0, 4*ar_block:partition_size()),
 	
-	ar_e2e:assert_partition_size(Node, 0, unpacked),
-	ar_e2e:assert_partition_size(Node, 1, unpacked),
-	ar_e2e:assert_partition_size(Node, 2, unpacked, floor(0.5*?PARTITION_SIZE)),
-
-	ar_e2e:assert_chunks(Node, unpacked, Chunks),
-
-	ar_e2e:assert_empty_partition(Node, 3, unpacked),
+	assert_chunks(Node, unpacked, Chunks),
 
 	?LOG_INFO("Source node ~p assertions passed.", [Node]),
 
@@ -121,19 +120,20 @@ start_source_node(Node, unpacked, _WalletFixture) ->
 			peer => ar_test_node:peer_ip(Node),
 			path => "/tx/" ++ binary_to_list(ar_util:encode(TX2#tx.id)) ++ "/data"
 		}),
-	{ok, ExpectedData} = ar_e2e:load_chunk_fixture(
-		unpacked, ?PARTITION_SIZE + floor(3.75 * ?DATA_CHUNK_SIZE)),
+	{ok, ExpectedData} = load_chunk_fixture(
+		unpacked, ar_block:partition_size() + floor(3.75 * ?DATA_CHUNK_SIZE)),
 	?assertEqual(ExpectedData, ar_util:decode(Data)),
 
 	?LOG_INFO("Source node ~p restarted.", [Node]),
 
 	{Blocks, undefined, Chunks};
-start_source_node(Node, PackingType, WalletFixture) ->
+start_source_node(Node, PackingType, WalletFixture, ModuleSize) ->
 	?LOG_INFO("Starting source node ~p with packing type ~p and wallet fixture ~p",
 		[Node, PackingType, WalletFixture]),
-	{Wallet, StorageModules} = source_node_storage_modules(Node, PackingType, WalletFixture),
+	{Wallet, StorageModules} = source_node_storage_modules(
+		Node, PackingType, WalletFixture, ModuleSize),
 	RewardAddr = ar_wallet:to_address(Wallet),
-	[B0] = ar_weave:init([{RewardAddr, ?AR(200), <<>>}], 0, ?PARTITION_SIZE),
+	[B0] = ar_weave:init([{RewardAddr, ?AR(200), <<>>}], 0, ar_block:partition_size()),
 
 	{ok, Config} = ar_test_node:remote_call(Node, application, get_env, [arweave, config]),
 	
@@ -153,44 +153,37 @@ start_source_node(Node, PackingType, WalletFixture) ->
 	%% and B2 starts at a chunk boundary and contains 1 chunk of data.
 	{TX1, B1} = mine_block(Node, Wallet, floor(2.5 * ?DATA_CHUNK_SIZE), false), %% p1
 	{TX2, B2} = mine_block(Node, Wallet, floor(0.75 * ?DATA_CHUNK_SIZE), false), %% p1
-	{TX3, B3} = mine_block(Node, Wallet, ?PARTITION_SIZE, false), %% p1 to p2
-	{TX4, B4} = mine_block(Node, Wallet, floor(0.5 * ?PARTITION_SIZE), false), %% p2
-	{TX5, B5} = mine_block(Node, Wallet, ?PARTITION_SIZE, true), %% p3 chunks are stored in disk pool
+	{TX3, B3} = mine_block(Node, Wallet, ar_block:partition_size(), false), %% p1 to p2
+	{TX4, B4} = mine_block(Node, Wallet, floor(0.5 * ar_block:partition_size()), false), %% p2
+	{TX5, B5} = mine_block(Node, Wallet, ar_block:partition_size(), true), %% p3 chunks are stored in disk pool
 
 	%% List of {Block, EndOffset, ChunkSize}
 	Chunks = [
 		%% PaddedEndOffset: 2359296
-		{B1, ?PARTITION_SIZE + ?DATA_CHUNK_SIZE, ?DATA_CHUNK_SIZE}, 
+		{B1, ar_block:partition_size() + ?DATA_CHUNK_SIZE, ?DATA_CHUNK_SIZE}, 
 		%% PaddedEndOffset: 2621440
-		{B1, ?PARTITION_SIZE + (2*?DATA_CHUNK_SIZE), ?DATA_CHUNK_SIZE}, 
+		{B1, ar_block:partition_size() + (2*?DATA_CHUNK_SIZE), ?DATA_CHUNK_SIZE}, 
 		%% PaddedEndOffset: 2883584
-		{B1, ?PARTITION_SIZE + floor(2.5 * ?DATA_CHUNK_SIZE), floor(0.5 * ?DATA_CHUNK_SIZE)},
+		{B1, ar_block:partition_size() + floor(2.5 * ?DATA_CHUNK_SIZE), floor(0.5 * ?DATA_CHUNK_SIZE)},
 		%% PaddedEndOffset: 3145728
-		{B2, ?PARTITION_SIZE + floor(3.75 * ?DATA_CHUNK_SIZE), floor(0.75 * ?DATA_CHUNK_SIZE)},
+		{B2, ar_block:partition_size() + floor(3.75 * ?DATA_CHUNK_SIZE), floor(0.75 * ?DATA_CHUNK_SIZE)},
 		%% PaddedEndOffset: 3407872
-		{B3, ?PARTITION_SIZE + (5*?DATA_CHUNK_SIZE), ?DATA_CHUNK_SIZE},
+		{B3, ar_block:partition_size() + (5*?DATA_CHUNK_SIZE), ?DATA_CHUNK_SIZE},
 		%% PaddedEndOffset: 3670016
-		{B3, ?PARTITION_SIZE + (6*?DATA_CHUNK_SIZE), ?DATA_CHUNK_SIZE},
+		{B3, ar_block:partition_size() + (6*?DATA_CHUNK_SIZE), ?DATA_CHUNK_SIZE},
 		%% PaddedEndOffset: 3932160
-		{B3, ?PARTITION_SIZE + (7*?DATA_CHUNK_SIZE), ?DATA_CHUNK_SIZE},
+		{B3, ar_block:partition_size() + (7*?DATA_CHUNK_SIZE), ?DATA_CHUNK_SIZE},
 		%% PaddedEndOffset: 4194304
-		{B3, ?PARTITION_SIZE + (8*?DATA_CHUNK_SIZE), ?DATA_CHUNK_SIZE}
+		{B3, ar_block:partition_size() + (8*?DATA_CHUNK_SIZE), ?DATA_CHUNK_SIZE}
 	],
 
 	?LOG_INFO("Source node ~p blocks mined.", [Node]),
 
-	SourcePacking = ar_e2e:packing_type_to_packing(PackingType, RewardAddr),
+	SourcePacking = packing_type_to_packing(PackingType, RewardAddr),
 
-	ar_e2e:assert_syncs_range(Node, SourcePacking, 0, 4*?PARTITION_SIZE),
-
-	%% No overlap since we aren't syncing or repacking chunks.
-	ar_e2e:assert_partition_size(Node, 0, SourcePacking, ?PARTITION_SIZE),
-	ar_e2e:assert_partition_size(Node, 1, SourcePacking, ?PARTITION_SIZE),
-	ar_e2e:assert_partition_size(Node, 2, SourcePacking, floor(0.5*?PARTITION_SIZE)),
+	assert_syncs_range(Node, SourcePacking, 0, 4*ar_block:partition_size()),
 	
-	ar_e2e:assert_chunks(Node, SourcePacking, Chunks),
-
-	ar_e2e:assert_empty_partition(Node, 3, SourcePacking),
+	assert_chunks(Node, SourcePacking, Chunks),
 
 	%% pack_served_chunks is not enabled so we shouldn't return unpacked data
 	?assertMatch({ok, {{<<"404">>, _}, _, _, _, _}},
@@ -207,22 +200,24 @@ start_source_node(Node, PackingType, WalletFixture) ->
 max_chunk_offset(Chunks) ->
 	lists:foldl(fun({_, EndOffset, _}, Acc) -> max(Acc, EndOffset) end, 0, Chunks).
 
-source_node_storage_modules(_Node, unpacked, _WalletFixture) ->
-	{undefined, source_node_storage_modules(unpacked)};
 source_node_storage_modules(Node, PackingType, WalletFixture) ->
+	source_node_storage_modules(Node, PackingType, WalletFixture, default).
+
+source_node_storage_modules(_Node, unpacked, _WalletFixture, ModuleSize) ->
+	{undefined, source_node_storage_modules(unpacked, ModuleSize)};
+source_node_storage_modules(Node, PackingType, WalletFixture, ModuleSize) ->
 	Wallet = ar_test_node:remote_call(Node, ar_e2e, load_wallet_fixture, [WalletFixture]),
 	RewardAddr = ar_wallet:to_address(Wallet),
 	SourcePacking = packing_type_to_packing(PackingType, RewardAddr),
-	{Wallet, source_node_storage_modules(SourcePacking)}.
+	{Wallet, source_node_storage_modules(SourcePacking, ModuleSize)}.
 
-source_node_storage_modules(SourcePacking) ->
-	[
-		{?PARTITION_SIZE, 0, SourcePacking},
-		{?PARTITION_SIZE, 1, SourcePacking},
-		{?PARTITION_SIZE, 2, SourcePacking},
-		{?PARTITION_SIZE, 3, SourcePacking},
-		{?PARTITION_SIZE, 4, SourcePacking}
-	].
+source_node_storage_modules(SourcePacking, default) ->
+	Size = ar_block:partition_size(),
+	lists:map(fun(I) -> {Size, I, SourcePacking} end, lists:seq(0, 4));
+
+source_node_storage_modules(SourcePacking, small) ->
+	Size = ar_block:partition_size() div 4,
+	lists:map(fun(I) -> {Size, I, SourcePacking} end, lists:seq(0, 19)).
 	
 mine_block(Node, Wallet, DataSize, IsTemporary) ->
 	WeaveSize = ar_test_node:remote_call(Node, ar_node, get_current_weave_size, []),
@@ -287,7 +282,7 @@ assert_has_entropy(Node, StartOffset, EndOffset, StoreID) ->
 		fun() -> 
 			Intersection = ar_test_node:remote_call(
 				Node, ar_sync_record, get_intersection_size,
-				[EndOffset, StartOffset, ar_chunk_storage_replica_2_9_1_entropy, StoreID]),
+				[EndOffset, StartOffset, ar_entropy_storage:sync_record_id(), StoreID]),
 			Intersection >= RangeSize
 		end,
 		100,
@@ -299,7 +294,7 @@ assert_has_entropy(Node, StartOffset, EndOffset, StoreID) ->
 		_ ->
 			Intersection = ar_test_node:remote_call(
 				Node, ar_sync_record, get_intersection_size,
-				[EndOffset, StartOffset, ar_chunk_storage_replica_2_9_1_entropy, StoreID]),
+				[EndOffset, StartOffset, ar_entropy_storage:sync_record_id(), StoreID]),
 			?assert(false, 
 				iolist_to_binary(io_lib:format(
 					"~s failed to prepare entropy range ~p - ~p. Intersection: ~p", 
@@ -311,7 +306,7 @@ assert_no_entropy(Node, StartOffset, EndOffset, StoreID) ->
 		fun() -> 
 			Intersection = ar_test_node:remote_call(
 				Node, ar_sync_record, get_intersection_size,
-				[EndOffset, StartOffset, ar_chunk_storage_replica_2_9_1_entropy, StoreID]),
+				[EndOffset, StartOffset, ar_entropy_storage:sync_record_id(), StoreID]),
 			Intersection > 0
 		end,
 		100,
@@ -321,7 +316,7 @@ assert_no_entropy(Node, StartOffset, EndOffset, StoreID) ->
 		true ->
 			Intersection = ar_test_node:remote_call(
 				Node, ar_sync_record, get_intersection_size,
-				[EndOffset, StartOffset, ar_chunk_storage_replica_2_9_1_entropy, StoreID]),
+				[EndOffset, StartOffset, ar_entropy_storage:sync_record_id(), StoreID]),
 			?assert(false, 
 				iolist_to_binary(io_lib:format(
 					"~s found entropy when it should not have. Range: ~p - ~p. "
@@ -372,7 +367,7 @@ assert_does_not_sync_range(Node, StartOffset, EndOffset) ->
 
 assert_partition_size(Node, PartitionNumber, Packing) ->
 	Overlap = ar_storage_module:get_overlap(Packing),
-	assert_partition_size(Node, PartitionNumber, Packing, ?PARTITION_SIZE + Overlap).
+	assert_partition_size(Node, PartitionNumber, Packing, ar_block:partition_size() + Overlap).
 assert_partition_size(Node, PartitionNumber, Packing, Size) ->
 	?LOG_INFO("~p: Asserting partition ~p,~p is size ~p",
 		[Node, PartitionNumber, ar_serialize:encode_packing(Packing, true), Size]),
@@ -420,7 +415,7 @@ assert_mine_and_validate(MinerNode, ValidatorNode, MinerPacking) ->
 
 	MinerBI = ar_test_node:wait_until_height(MinerNode, CurrentHeight + 1),
 	{ok, MinerBlock} = ar_test_node:http_get_block(element(1, hd(MinerBI)), MinerNode),
-	ar_e2e:assert_block(MinerPacking, MinerBlock),
+	assert_block(MinerPacking, MinerBlock),
 
 	ValidatorBI = ar_test_node:wait_until_height(ValidatorNode, MinerBlock#block.height),
 	{ok, ValidatorBlock} = ar_test_node:http_get_block(element(1, hd(ValidatorBI)), ValidatorNode),
@@ -482,17 +477,18 @@ assert_chunk(Node, RequestPacking, Packing, Block, EndOffset, ChunkSize) ->
 	Proof = ar_serialize:json_map_to_poa_map(
 		jiffy:decode(EncodedProof, [return_maps])
 	),
-	{true, _} = ar_test_node:remote_call(Node, ar_poa, validate_paths, [
-		Block#block.tx_root,
-		maps:get(tx_path, Proof),
-		maps:get(data_path, Proof),
-		EndOffset - 1
-	]),
+	ChunkMetadata = #chunk_metadata{
+		tx_root = Block#block.tx_root,
+		tx_path = maps:get(tx_path, Proof),
+		data_path = maps:get(data_path, Proof)
+	},
+	ChunkProof = ar_test_node:remote_call(Node, ar_poa, chunk_proof, [ChunkMetadata, EndOffset - 1]),
+	{true, _} = ar_test_node:remote_call(Node, ar_poa, validate_paths, [ChunkProof]),
 	Chunk = maps:get(chunk, Proof),
 
 	maybe_write_chunk_fixture(Packing, EndOffset, Chunk),
 
-	{ok, ExpectedPackedChunk} = ar_e2e:load_chunk_fixture(Packing, EndOffset),
+	{ok, ExpectedPackedChunk} = load_chunk_fixture(Packing, EndOffset),
 	?assertEqual(ExpectedPackedChunk, Chunk,
 		iolist_to_binary(io_lib:format(
 			"~p: Chunk at offset ~p, size ~p, packing ~p does not match packed chunk",
@@ -536,7 +532,7 @@ write_wallet_fixtures() ->
 	lists:foreach(fun(Wallet) ->
 		WalletName = atom_to_list(Wallet),
 		ar_wallet:new_keyfile(?DEFAULT_KEY_TYPE, WalletName),
-		ar_e2e:install_fixture(
+		install_fixture(
 			ar_wallet:wallet_filepath(Wallet), wallets, WalletName ++ ".json")
 	end, Wallets),
 	ok.
@@ -544,6 +540,6 @@ write_wallet_fixtures() ->
 maybe_write_chunk_fixture(Packing, EndOffset, Chunk) when ?UPDATE_CHUNK_FIXTURES =:= true ->
 	?LOG_ERROR("WARNING: Updating chunk fixture! EndOffset: ~p, Packing: ~p", 
 		[EndOffset, ar_serialize:encode_packing(Packing, true)]),
-	ar_e2e:write_chunk_fixture(Packing, EndOffset, Chunk);
+	write_chunk_fixture(Packing, EndOffset, Chunk);
 maybe_write_chunk_fixture(_, _, _) ->
 	ok.

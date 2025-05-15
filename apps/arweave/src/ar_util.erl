@@ -2,18 +2,21 @@
 
 -export([bool_to_int/1, int_to_bool/1, ceil_int/2, floor_int/2, between/3,
 		integer_to_binary/1, binary_to_integer/1, pick_random/1, pick_random/2,
-		encode/1, decode/1, safe_encode/1, safe_decode/1, timestamp_to_seconds/1,
-		invert_map/1,
+		encode/1, decode/1, safe_encode/1, safe_decode/1, safe_ets_lookup/2, 
+		timestamp_to_seconds/1,invert_map/1,
 		parse_peer/1, peer_to_str/1, parse_port/1, safe_parse_peer/1, format_peer/1,
 		unique/1, count/2,
-		genesis_wallets/0, pmap/2, pfilter/2,
+		genesis_wallets/0, pmap/2, batch_pmap/3, pfilter/2,
 		do_until/3, block_index_entry_from_block/1,
 		bytes_to_mb_string/1, cast_after/3, encode_list_indices/1, parse_list_indices/1,
 		take_every_nth/2, safe_divide/2, terminal_clear/0, print_stacktrace/0, shuffle_list/1,
+		safe_format/1, safe_format/3,
 		assert_file_exists_and_readable/1, get_system_device/1]).
 
--include_lib("arweave/include/ar.hrl").
+-include("ar.hrl").
 -include_lib("eunit/include/eunit.hrl").
+
+-define(DEFAULT_PMAP_TIMEOUT, 60_000).
 
 bool_to_int(true) -> 1;
 bool_to_int(_) -> 0.
@@ -83,6 +86,19 @@ safe_decode(E) ->
 			{error, invalid}
 	end.
 
+%% @doc Safely lookup a key in an ETS table.
+%% Returns [] if the table doesn't exist - this can happen when running some of the helper
+%% utilities like data_doctor
+safe_ets_lookup(Table, Key) ->
+	try
+		ets:lookup(Table, Key)
+	catch
+		Type:Reason ->
+			?LOG_WARNING([{event, ets_table_not_found}, {table, Table}, {key, Key},
+				{type, Type}, {reason, Reason}]),
+			[]
+	end.
+
 %% @doc Convert an erlang:timestamp() to seconds since the Unix Epoch.
 timestamp_to_seconds({MegaSecs, Secs, _MicroSecs}) ->
 	MegaSecs * 1000000 + Secs.
@@ -101,21 +117,34 @@ invert_map(Map) ->
     ).
 
 
-%% @doc Parse a string representing a remote host into our internal format.
+%%--------------------------------------------------------------------
+%% @doc Parse a string representing a remote host into our internal
+%%      format.
+%% @end
+%%--------------------------------------------------------------------
+-spec parse_peer(Hostname) -> Return when
+	Hostname :: string() | binary(),
+	Return :: [IpWithPort] | no_return(),
+	IpWithPort :: {A, A, A, A, Port},
+	A :: pos_integer(),
+	Port :: pos_integer().
+
 parse_peer("") -> throw(empty_peer_string);
-parse_peer(BitStr) when is_bitstring(BitStr) ->
-	parse_peer(bitstring_to_list(BitStr));
+parse_peer(BitStr) when is_binary(BitStr) ->
+	parse_peer(binary_to_list(BitStr));
 parse_peer(Str) when is_list(Str) ->
-    [Addr, PortStr] = parse_port_split(Str),
-    case inet:getaddr(Addr, inet) of
-		{ok, {A, B, C, D}} ->
-			{A, B, C, D, parse_port(PortStr)};
+	[Addr, PortStr] = parse_port_split(Str),
+	case inet:getaddrs(Addr, inet) of
+		{ok, [{A, B, C, D}]} ->
+			[{A, B, C, D, parse_port(PortStr)}];
+		{ok, AddrsList} when is_list(AddrsList) ->
+			[{A, B, C, D, parse_port(PortStr)} || {A, B, C, D} <- AddrsList];
 		{error, Reason} ->
 			throw({invalid_peer_string, Str, Reason})
 	end;
 parse_peer({IP, Port}) ->
 	{A, B, C, D} = parse_peer(IP),
-	{A, B, C, D, parse_port(Port)}.
+	[{A, B, C, D, parse_port(Port)}].
 
 peer_to_str(Bin) when is_binary(Bin) ->
 	binary_to_list(Bin);
@@ -138,6 +167,18 @@ parse_port_split(Str) ->
         [Addr, Port] -> [Addr, Port];
         _ -> throw({invalid_peer_string, Str})
     end.
+
+%%--------------------------------------------------------------------
+%% @doc wrapper for parse_peer/1
+%% @end
+%%--------------------------------------------------------------------
+-spec safe_parse_peer(Hostname) -> Return when
+	Hostname :: string() | binary(),
+	Return :: {ok, ReturnOk} | {error, invalid},
+	ReturnOk ::[IpWithPort] | no_return(),
+	IpWithPort :: {A, A, A, A, Port},
+	A :: pos_integer(),
+	Port :: pos_integer().
 
 safe_parse_peer(Peer) ->
 	try
@@ -173,9 +214,14 @@ unique(Res, [X|Xs]) ->
 		true -> unique(Res, Xs)
 	end.
 
-%% @doc Run a map in parallel.
-%% NOTE: Make this efficient for large lists.
+%% @doc Run a map in parallel, throw {pmap_timeout, ?DEFAULT_PMAP_TIMEOUT}
+%% if a worker takes longer than ?DEFAULT_PMAP_TIMEOUT milliseconds.
 pmap(Mapper, List) ->
+	pmap(Mapper, List, ?DEFAULT_PMAP_TIMEOUT).
+
+%% @doc Run a map in parallel, throw {pmap_timeout, Timeout} if a worker
+%% takes longer than Timeout milliseconds.
+pmap(Mapper, List, Timeout) ->
 	Master = self(),
 	ListWithRefs = [{Elem, make_ref()} || Elem <- List],
 	lists:foreach(fun({Elem, Ref}) ->
@@ -187,10 +233,50 @@ pmap(Mapper, List) ->
 		fun({_, Ref}) ->
 			receive
 				{pmap_work, Ref, Mapped} -> Mapped
+			after Timeout ->
+				throw({pmap_timeout, Timeout})
 			end
 		end,
 		ListWithRefs
 	).
+
+%% @doc Run a map in parallel, one batch at a time,
+%% throw {batch_pmap_timeout, ?DEFAULT_PMAP_TIMEOUT} if a worker
+%% takes longer than ?DEFAULT_PMAP_TIMEOUT milliseconds.
+batch_pmap(Mapper, List, BatchSize) ->
+	batch_pmap(Mapper, List, BatchSize, ?DEFAULT_PMAP_TIMEOUT).
+
+%% @doc Run a map in parallel, one batch at a time,
+%% throw {batch_pmap_timeout, Timeout} if a worker takes
+%% longer than Timeout milliseconds.
+batch_pmap(_Mapper, [], _BatchSize, _Timeout) ->
+	[];
+batch_pmap(Mapper, List, BatchSize, Timeout)
+		when BatchSize > 0 ->
+	Self = self(),
+	{Batch, Rest} =
+		case length(List) >= BatchSize of
+			true ->
+				lists:split(BatchSize, List);
+			false ->
+				{List, []}
+		end,
+	ListWithRefs = [{Elem, make_ref()} || Elem <- Batch],
+	lists:foreach(fun({Elem, Ref}) ->
+		spawn_link(fun() ->
+			Self ! {pmap_work, Ref, Mapper(Elem)}
+		end)
+	end, ListWithRefs),
+	lists:map(
+		fun({_, Ref}) ->
+			receive
+				{pmap_work, Ref, Mapped} -> Mapped
+			after Timeout ->
+				throw({batch_pmap_timeout, Timeout})
+			end
+		end,
+		ListWithRefs
+	) ++ batch_pmap(Mapper, Rest, BatchSize, Timeout).
 
 %% @doc Filter the list in parallel.
 pfilter(Fun, List) ->
@@ -288,6 +374,22 @@ parse_list_indices(_BadInput, _N) ->
 
 shuffle_list(List) ->
 	lists:sort(fun(_,_) -> rand:uniform() < 0.5 end, List).
+
+%% @doc Format a value and truncate it if it's too long - this can help avoid the node
+%% locking up when accidentally trying to log a large/complex datatype (e.g. a map of chunks).
+
+-spec safe_format(term(), non_neg_integer(), non_neg_integer()) -> string().
+safe_format(Value) ->
+	safe_format(Value, 5, 2000).
+
+safe_format(Value, Depth, Limit) ->
+	ValueStr = io_lib:format("~P", [Value, Depth]),  % Depth limited to 5
+	case length(ValueStr) > Limit of
+		true -> 
+			string:slice(ValueStr, 0, Limit) ++ "... (truncated)";
+		false -> 
+			ValueStr
+	end.
 
 %%%
 %%% Tests.

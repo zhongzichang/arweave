@@ -3,13 +3,12 @@
 -module(ar_poa).
 
 -export([get_data_path_validation_ruleset/2, get_data_path_validation_ruleset/3,
-		 validate_pre_fork_2_5/4, validate/1, validate_paths/4, validate_paths/7,
-		 get_padded_offset/1, get_padded_offset/2]).
+		 validate_pre_fork_2_5/4, validate/1, chunk_proof/2, chunk_proof/3, chunk_proof/5,
+		 validate_paths/1, get_padded_offset/1, get_padded_offset/2]).
 
 -include_lib("arweave/include/ar_poa.hrl").
 -include_lib("arweave/include/ar.hrl").
 -include_lib("arweave/include/ar_consensus.hrl").
--include_lib("arweave/include/ar_pricing.hrl").
 
 %%%===================================================================
 %%% Public interface.
@@ -19,11 +18,11 @@
 %% offset, the threshold where the offset rebases were allowed (and the validation
 %% changed in some other ways on top of that). The threshold where the specific
 %% requirements were imposed on data splits to make each chunk belong to its own
-%% 256 KiB bucket is set to ?STRICT_DATA_SPLIT_THRESHOLD. The code is then passed to
+%% 256 KiB bucket is set to ar_block:strict_data_split_threshold(). The code is then passed to
 %% ar_merkle:validate_path/5.
 get_data_path_validation_ruleset(BlockStartOffset, MerkleRebaseSupportThreshold) ->
 	get_data_path_validation_ruleset(BlockStartOffset, MerkleRebaseSupportThreshold,
-			?STRICT_DATA_SPLIT_THRESHOLD).
+			ar_block:strict_data_split_threshold()).
 
 %% @doc Return the merkle proof validation ruleset code depending on the block start
 %% offset, the threshold where the offset rebases were allowed (and the validation
@@ -46,7 +45,7 @@ get_data_path_validation_ruleset(BlockStartOffset, MerkleRebaseSupportThreshold,
 
 get_data_path_validation_ruleset(BlockStartOffset) ->
 	get_data_path_validation_ruleset(BlockStartOffset, ?MERKLE_REBASE_SUPPORT_THRESHOLD,
-			?STRICT_DATA_SPLIT_THRESHOLD).
+			ar_block:strict_data_split_threshold()).
 
 %% @doc Validate a proof of access.
 validate(Args) ->
@@ -54,16 +53,23 @@ validate(Args) ->
 			ExpectedChunkID} = Args,
 	#poa{ chunk = Chunk, unpacked_chunk = UnpackedChunk } = SPoA,
 
-	case validate_paths(SPoA, TXRoot, RecallOffset, BlockStartOffset, BlockSize) of
+	ChunkMetadata = #chunk_metadata{
+		tx_root = TXRoot,
+		tx_path = SPoA#poa.tx_path,
+		data_path = SPoA#poa.data_path
+	},
+	ChunkProof = chunk_proof(ChunkMetadata, RecallOffset, BlockStartOffset, BlockSize),
+
+	case validate_paths(ChunkProof) of
 		{false, _} ->
 			false;
-		{true, ChunkProof} ->
+		{true, ChunkProof2} ->
 			#chunk_proof{
 				chunk_id = ChunkID,
 				chunk_start_offset = ChunkStartOffset,
 				chunk_end_offset = ChunkEndOffset,
 				tx_start_offset = TXStartOffset
-			} = ChunkProof,
+			} = ChunkProof2,
 			case ExpectedChunkID of
 				not_set ->
 					validate2(Packing, {ChunkID, ChunkStartOffset,
@@ -79,69 +85,71 @@ validate(Args) ->
 			end
 	end.
 
-%% @doc Validate the TXPath and DataPath for a chunk. This will return the ChunkID but won't
-%% validate that the ChunkID is correct.
-%% 
-%% SPoA: the proof of access
-%% RecallOffset: the absoluteoffset of the recall byte - 
- validate_paths(#poa{} = SPoA, TXRoot, RecallOffset, BlockStartOffset, BlockSize) ->
+chunk_proof(#chunk_metadata{} = ChunkMetadata, SeekByte) ->
+	chunk_proof(ChunkMetadata, SeekByte, ?MERKLE_REBASE_SUPPORT_THRESHOLD).
+
+chunk_proof(#chunk_metadata{} = ChunkMetadata, SeekByte, MerkleRebaseSupportThreshold) ->
+	{BlockStartOffset, BlockEndOffset, TXRoot} = ar_block_index:get_block_bounds(SeekByte),
+
+	ChunkMetadata2 = case ChunkMetadata#chunk_metadata.tx_root of
+		not_set ->
+			ChunkMetadata#chunk_metadata{ tx_root = TXRoot };
+		TXRoot ->
+			ChunkMetadata
+	end,
+
+	ValidateDataPathRuleset = get_data_path_validation_ruleset(
+		BlockStartOffset, MerkleRebaseSupportThreshold, ar_block:strict_data_split_threshold()),
+	chunk_proof(
+		ChunkMetadata2,
+		BlockStartOffset,
+		BlockEndOffset,
+		SeekByte,
+		ValidateDataPathRuleset
+	).
+
+chunk_proof(#chunk_metadata{} = ChunkMetadata, RecallOffset, BlockStartOffset, BlockSize) ->
 	BlockRelativeOffset = get_recall_bucket_offset(RecallOffset, BlockStartOffset),
 	ValidateDataPathRuleset = get_data_path_validation_ruleset(BlockStartOffset),
 
-	Proof = #chunk_proof{
-		absolute_offset = BlockStartOffset + BlockRelativeOffset,
-		tx_root = TXRoot,
-		tx_path = SPoA#poa.tx_path,
-		data_path = SPoA#poa.data_path,
+	BlockEndOffset = BlockStartOffset + BlockSize,
+	SeekByte = BlockStartOffset + BlockRelativeOffset,
+	chunk_proof(
+		ChunkMetadata,
+		BlockStartOffset,
+		BlockEndOffset,
+		SeekByte,
+		ValidateDataPathRuleset
+	).
+
+chunk_proof(#chunk_metadata{} = ChunkMetadata,
+	BlockStartOffset, BlockEndOffset, SeekByte, ValidateDataPathRuleset) ->
+
+	#chunk_proof{
+		seek_byte = SeekByte,
+		metadata = ChunkMetadata,
 		block_start_offset = BlockStartOffset,
-		block_end_offset = BlockStartOffset + BlockSize,
+		block_end_offset = BlockEndOffset,
 		validate_data_path_ruleset = ValidateDataPathRuleset
-	},
-	validate_paths(Proof).
+	}.
 
 %% @doc Validate the TXPath and DataPath for a chunk. This will return the ChunkID but won't
 %% validate that the ChunkID is correct.
-validate_paths(TXRoot, TXPath, DataPath, AbsoluteOffset) ->
-	{BlockStartOffset, BlockEndOffset, TXRoot} =
-		ar_block_index:get_block_bounds(AbsoluteOffset),
-
-	Proof = #chunk_proof{
-		absolute_offset = AbsoluteOffset,
-		tx_root = TXRoot,
-		tx_path = TXPath,
-		data_path = DataPath,
-		block_start_offset = BlockStartOffset,
-		block_end_offset = BlockEndOffset,
-		validate_data_path_ruleset = get_data_path_validation_ruleset(BlockStartOffset)
-	},
-	validate_paths(Proof).
-
-validate_paths(
-		TXRoot, TXPath, DataPath, BlockStartOffset, BlockEndOffset, BlockRelativeOffset,
-		ValidateDataPathRuleset) ->
-	Proof = #chunk_proof{
-		absolute_offset = BlockStartOffset + BlockRelativeOffset,
-		tx_root = TXRoot,
-		tx_path = TXPath,
-		data_path = DataPath,
-		block_start_offset = BlockStartOffset,
-		block_end_offset = BlockEndOffset,
-		validate_data_path_ruleset = ValidateDataPathRuleset
-	},
-	validate_paths(Proof).
-
+-spec validate_paths(#chunk_proof{}) -> {boolean(), #chunk_proof{}}.
 validate_paths(Proof) ->
 	#chunk_proof{
-		absolute_offset = AbsoluteOffset,
-		tx_root = TXRoot,
-		tx_path = TXPath,
-		data_path = DataPath,
+		seek_byte = SeekByte,
+		metadata = #chunk_metadata{
+			tx_root = TXRoot,
+			tx_path = TXPath,
+			data_path = DataPath
+		},
 		block_start_offset = BlockStartOffset,
 		block_end_offset = BlockEndOffset,
 		validate_data_path_ruleset = ValidateDataPathRuleset
 	} = Proof,
 
-	BlockRelativeOffset = AbsoluteOffset - BlockStartOffset,
+	BlockRelativeOffset = SeekByte - BlockStartOffset,
 	BlockSize = BlockEndOffset - BlockStartOffset,
 
 	case ar_merkle:validate_path(TXRoot, BlockRelativeOffset, BlockSize, TXPath) of
@@ -149,7 +157,9 @@ validate_paths(Proof) ->
 			{false, Proof#chunk_proof{ tx_path_is_valid = invalid }};
 		{DataRoot, TXStartOffset, TXEndOffset} ->
 			Proof2 = Proof#chunk_proof{
-				data_root = DataRoot,
+				metadata = Proof#chunk_proof.metadata#chunk_metadata{
+					data_root = DataRoot
+				},
 				tx_start_offset = TXStartOffset,
 				tx_end_offset = TXEndOffset,
 				tx_path_is_valid = valid
@@ -165,6 +175,9 @@ validate_paths(Proof) ->
 						chunk_id = ChunkID,
 						chunk_start_offset = ChunkStartOffset,
 						chunk_end_offset = ChunkEndOffset,
+						metadata = Proof2#chunk_proof.metadata#chunk_metadata{
+							chunk_size = ChunkEndOffset - ChunkStartOffset
+						},
 						data_path_is_valid = valid
 					},
 					{true, Proof3}
@@ -172,9 +185,9 @@ validate_paths(Proof) ->
 	end.
 
 get_recall_bucket_offset(RecallOffset, BlockStartOffset) ->
-	case RecallOffset >= ?STRICT_DATA_SPLIT_THRESHOLD of
+	case RecallOffset >= ar_block:strict_data_split_threshold() of
 		true ->
-			get_padded_offset(RecallOffset + 1, ?STRICT_DATA_SPLIT_THRESHOLD)
+			get_padded_offset(RecallOffset + 1, ar_block:strict_data_split_threshold())
 					- (?DATA_CHUNK_SIZE) - BlockStartOffset;
 		false ->
 			RecallOffset - BlockStartOffset
@@ -253,9 +266,9 @@ validate3(Packing, Args) ->
 	end.
 
 %% @doc Return the smallest multiple of 256 KiB >= Offset
-%% counting from ?STRICT_DATA_SPLIT_THRESHOLD.
+%% counting from ar_block:strict_data_split_threshold().
 get_padded_offset(Offset) ->
-	get_padded_offset(Offset, ?STRICT_DATA_SPLIT_THRESHOLD).
+	get_padded_offset(Offset, ar_block:strict_data_split_threshold()).
 
 %% @doc Return the smallest multiple of 256 KiB >= Offset
 %% counting from StrictDataSplitThreshold.

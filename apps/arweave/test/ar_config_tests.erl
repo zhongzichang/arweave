@@ -1,7 +1,7 @@
 -module(ar_config_tests).
 
--include_lib("arweave/include/ar_consensus.hrl").
--include_lib("arweave/include/ar_config.hrl").
+-include_lib("ar_consensus.hrl").
+-include_lib("ar_config.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 parse_test_() ->
@@ -19,6 +19,7 @@ test_parse_config() ->
 	{ok, ParsedConfig} = ar_config:parse(config_fixture()),
 	ExpectedBlockHash = ar_util:decode(
 			<<"lfoR_PyKV6t7Z6Xi2QJZlZ0JWThh0Ke7Zc5Q82CSshUhFGcjiYufP234ph1mVofX">>),
+	PartitionSize = ar_block:partition_size(),
 	?assertMatch(#config{
 		init = true,
 		port = 1985,
@@ -40,19 +41,16 @@ test_parse_config() ->
 		block_gossip_peers = [{159,203,158,108,1984}, {150,150,150,150, 1983}],
 		data_dir = "some_data_dir",
 		log_dir = "log_dir",
-		storage_modules = [{?PARTITION_SIZE, 0, unpacked},
-				{?PARTITION_SIZE, 2, {spora_2_6, ExpectedMiningAddr}},
-				{?PARTITION_SIZE, 2, {composite, ExpectedMiningAddr, 1}},
-				{?PARTITION_SIZE, 2, {composite, ExpectedMiningAddr, 32}},
-				{?PARTITION_SIZE, 100, unpacked},
+		storage_modules = [{PartitionSize, 0, unpacked},
+				{PartitionSize, 2, {spora_2_6, ExpectedMiningAddr}},
+				{PartitionSize, 100, unpacked},
 				{1, 0, unpacked},
 				{1000000000000, 14, {spora_2_6, ExpectedMiningAddr}},
-				{?PARTITION_SIZE, 0, {replica_2_9, ExpectedMiningAddr}}],
+				{PartitionSize, 0, {replica_2_9, ExpectedMiningAddr}}],
 		repack_in_place_storage_modules = [
-				{{?PARTITION_SIZE, 1, unpacked}, {spora_2_6, ExpectedMiningAddr}},
-				{{?PARTITION_SIZE, 1, unpacked}, {composite, ExpectedMiningAddr, 2}},
+				{{PartitionSize, 1, unpacked}, {spora_2_6, ExpectedMiningAddr}},
 				{{1, 1, {spora_2_6, ExpectedMiningAddr}}, unpacked},
-				{{1, 1, {composite, ExpectedMiningAddr, 1}}, unpacked}],
+				{{PartitionSize,8, {replica_2_9, ExpectedMiningAddr}}, unpacked}],
 		repack_batch_size = 200,
 		polling = 10,
 		block_pollers = 100,
@@ -126,9 +124,9 @@ test_parse_config() ->
 		run_defragmentation = true,
 		defragmentation_trigger_threshold = 1_000,
 		defragmentation_modules = [
-			{?PARTITION_SIZE, 0, unpacked},
-			{?PARTITION_SIZE, 2, {spora_2_6, ExpectedMiningAddr}},
-			{?PARTITION_SIZE, 100, unpacked},
+			{PartitionSize, 0, unpacked},
+			{PartitionSize, 2, {spora_2_6, ExpectedMiningAddr}},
+			{PartitionSize, 100, unpacked},
 			{1, 0, unpacked},
 			{1000000000000, 14, {spora_2_6, ExpectedMiningAddr}}
 		],
@@ -146,78 +144,55 @@ config_fixture() ->
 test_validate_repack_in_place() ->
 	Addr1 = crypto:strong_rand_bytes(32),
 	Addr2 = crypto:strong_rand_bytes(32),
+	PartitionSize = ar_block:partition_size(),
 	?assertEqual(true,
 		ar_config:validate_config(#config{
 			storage_modules = [],
 			repack_in_place_storage_modules = []})),
 	?assertEqual(true,
 			ar_config:validate_config(#config{
-				storage_modules = [{?PARTITION_SIZE, 0, {spora_2_6, Addr1}}],
+				storage_modules = [{PartitionSize, 0, {spora_2_6, Addr1}}],
 				repack_in_place_storage_modules = []})),
 	?assertEqual(true,
 		ar_config:validate_config(#config{
-			storage_modules = [{?PARTITION_SIZE, 0, {spora_2_6, Addr1}}],
+			storage_modules = [{PartitionSize, 0, {spora_2_6, Addr1}}],
 			repack_in_place_storage_modules = [
-				{{?PARTITION_SIZE, 1, {spora_2_6, Addr1}}, {replica_2_9, Addr2}}]})),
+				{{PartitionSize, 1, {spora_2_6, Addr1}}, {replica_2_9, Addr2}}]})),
 	?assertEqual(false,
 		ar_config:validate_config(#config{
-			storage_modules = [{?PARTITION_SIZE, 0, {spora_2_6, Addr1}}],
+			storage_modules = [{PartitionSize, 0, {spora_2_6, Addr1}}],
 			repack_in_place_storage_modules = [
-				{{?PARTITION_SIZE, 0, {spora_2_6, Addr1}}, {replica_2_9, Addr2}}]})),
-	%% Repacking in place *from* replica_2_9 to any format is not currently supported.
-	?assertEqual(false,
-		ar_config:validate_config(#config{
-			storage_modules = [],
-			repack_in_place_storage_modules = [
-				{{?PARTITION_SIZE, 0, {replica_2_9, Addr1}}, {replica_2_9, Addr2}}]})),
-	?assertEqual(false,
-		ar_config:validate_config(#config{
-			storage_modules = [],
-			repack_in_place_storage_modules = [
-				{{?PARTITION_SIZE, 0, {replica_2_9, Addr1}}, {spora_2_6, Addr2}}]})),
-	?assertEqual(false,
-		ar_config:validate_config(#config{
-			storage_modules = [],
-			repack_in_place_storage_modules = [
-				{{?PARTITION_SIZE, 0, {replica_2_9, Addr2}}, unpacked}]})),
-	?assertEqual(false,
-		ar_config:validate_config(#config{
-			storage_modules = [],
-			repack_in_place_storage_modules = [
-				{{?PARTITION_SIZE, 0, {replica_2_9, Addr2}}, {composite, Addr1, 1}}]})),
-	%% Only repacking in place *to* replica_2_9 is supported.
+				{{PartitionSize, 0, {spora_2_6, Addr1}}, {replica_2_9, Addr2}}]})),
 	?assertEqual(true,
 		ar_config:validate_config(#config{
 			storage_modules = [],
 			repack_in_place_storage_modules = [
-				{{?PARTITION_SIZE, 0, unpacked}, {replica_2_9, Addr2}}]})),
+				{{PartitionSize, 0, {replica_2_9, Addr1}}, {replica_2_9, Addr2}}]})),
 	?assertEqual(true,
 		ar_config:validate_config(#config{
 			storage_modules = [],
 			repack_in_place_storage_modules = [
-				{{?PARTITION_SIZE, 0, {spora_2_6, Addr1}}, {replica_2_9, Addr2}}]})),
+				{{PartitionSize, 0, {replica_2_9, Addr1}}, {spora_2_6, Addr2}}]})),
 	?assertEqual(true,
 		ar_config:validate_config(#config{
 			storage_modules = [],
 			repack_in_place_storage_modules = [
-				{{?PARTITION_SIZE, 0, {composite, Addr1, 1}}, {replica_2_9, Addr2}}]})),
-	?assertEqual(false,
+				{{PartitionSize, 0, {replica_2_9, Addr2}}, unpacked}]})),
+	?assertEqual(true,
 		ar_config:validate_config(#config{
 			storage_modules = [],
 			repack_in_place_storage_modules = [
-				{{?PARTITION_SIZE, 0, unpacked}, {spora_2_6, Addr2}}]})),
-	?assertEqual(false,
+				{{PartitionSize, 0, unpacked}, {replica_2_9, Addr2}}]})),
+	?assertEqual(true,
 		ar_config:validate_config(#config{
 			storage_modules = [],
 			repack_in_place_storage_modules = [
-				{{?PARTITION_SIZE, 0, {spora_2_6, Addr1}}, {composite, Addr1, 1}}]})),
-	?assertEqual(false,
+				{{PartitionSize, 0, {spora_2_6, Addr1}}, {replica_2_9, Addr2}}]})),
+	?assertEqual(true,
 		ar_config:validate_config(#config{
 			storage_modules = [],
 			repack_in_place_storage_modules = [
-				{{?PARTITION_SIZE, 0, {composite, Addr1, 1}}, {spora_2_6, Addr2}}]})).
-
-
+				{{PartitionSize, 0, unpacked}, {spora_2_6, Addr2}}]})).
 
 
 test_validate_cm_pool() ->
@@ -262,32 +237,23 @@ test_validate_storage_modules() ->
 	Addr1 = crypto:strong_rand_bytes(32),
 	Addr2 = crypto:strong_rand_bytes(32),
 	LegacyPacking = {spora_2_6, Addr1},
-	Composite1Packing = {composite, Addr1, 1},
-	Composite32Packing = {composite, Addr1, 32},
+	PartitionSize = ar_block:partition_size(),
 
-	Unpacked = {?PARTITION_SIZE, 0, unpacked},
-	Legacy = {?PARTITION_SIZE, 1, LegacyPacking},
-	Composite1A = {?PARTITION_SIZE, 2, Composite1Packing},
-	Composite1B = {?PARTITION_SIZE, 4, Composite1Packing},
-	Composite32 = {?PARTITION_SIZE, 3, Composite32Packing},
+	Unpacked = {PartitionSize, 0, unpacked},
+	Legacy = {PartitionSize, 1, LegacyPacking},
+	Replica29 = {PartitionSize, 2, {replica_2_9, Addr1}},
 
 	?assertEqual(true,
 		ar_config:validate_config(
 			#config{
-				storage_modules = [Unpacked, Legacy, Composite1A, Composite1B, Composite32],
+				storage_modules = [Unpacked, Legacy, Replica29],
 				mining_addr = Addr1,
 				mine = false})),
 	?assertEqual(true,
 		ar_config:validate_config(
 			#config{
-				storage_modules = [Unpacked, Legacy, Composite1A, Composite1B, Composite32],
+				storage_modules = [Unpacked, Legacy, Replica29],
 				mining_addr = Addr2,
-				mine = true})),
-	?assertEqual(false,
-		ar_config:validate_config(
-			#config{
-				storage_modules = [Unpacked, Legacy, Composite1A, Composite32],
-				mining_addr = Addr1,
 				mine = true})),
 	?assertEqual(true,
 		ar_config:validate_config(
@@ -298,30 +264,12 @@ test_validate_storage_modules() ->
 	?assertEqual(true,
 		ar_config:validate_config(
 			#config{
-				storage_modules = [Unpacked, Composite1A, Composite1B],
-				mining_addr = Addr1,
-				mine = true})),
-	?assertEqual(true,
-		ar_config:validate_config(
-			#config{
-				storage_modules = [Unpacked, Composite32],
+				storage_modules = [Unpacked, Replica29],
 				mining_addr = Addr1,
 				mine = true})),
 	?assertEqual(false,
 		ar_config:validate_config(
 			#config{
-				storage_modules = [Legacy, Composite1A],
-				mining_addr = Addr1,
-				mine = true})),
-	?assertEqual(false,
-		ar_config:validate_config(
-			#config{
-				storage_modules = [Legacy, Composite32],
-				mining_addr = Addr1,
-				mine = true})),
-	?assertEqual(false,
-		ar_config:validate_config(
-			#config{
-				storage_modules = [Composite1A, Composite32],
+				storage_modules = [Legacy, Replica29],
 				mining_addr = Addr1,
 				mine = true})).

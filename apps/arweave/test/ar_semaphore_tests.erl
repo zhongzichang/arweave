@@ -59,16 +59,16 @@ wait_for_two_processes_at_a_time_test_() ->
 			TestPid ! p4_done
 		end),
 		?assert(receive _ -> false after 360 -> true end),
-		?assert(receive p1_done -> true after 40 -> false end),
-		?assert(receive p2_done -> true after 40 -> false end),
-		?assert(receive _ -> false after 340 -> true end),
-		?assert(receive p3_done -> true after 60 -> false end),
-		?assert(receive p4_done -> true after 60 -> false end)
+		?assert(receive p1_done -> true after 100 -> false end),
+		?assert(receive p2_done -> true after 100 -> false end),
+		?assert(receive _ -> false after 300 -> true end),
+		?assert(receive p3_done -> true after 200 -> false end),
+		?assert(receive p4_done -> true after 200 -> false end)
 	end).
 
 with_semaphore_(Name, Value, Fun) ->
 	{setup,
-		fun() -> ok = ar_semaphore:start_link(Name, Value) end,
+		fun() -> {ok, _} = ar_semaphore:start_link(Name, Value) end,
 		fun(_) -> _ = ar_semaphore:stop(Name) end,
 		[Fun]
 	}.

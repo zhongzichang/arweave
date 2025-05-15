@@ -124,7 +124,8 @@ log_prepare_solution_failure2(Solution, FailureReason, AdditionalLogData) ->
 	?LOG_ERROR([{event, failed_to_prepare_block_from_mining_solution},
 			{reason, FailureReason},
 			{solution_hash, ar_util:safe_encode(SolutionH)},
-			{packing_difficulty, PackingDifficulty} | AdditionalLogData]).
+			{packing_difficulty, PackingDifficulty} | AdditionalLogData]),
+	prometheus_gauge:inc(mining_solution, [FailureReason]).
 
 -spec get_packing_difficulty(Packing :: ar_storage_module:packing()) ->
 	PackingDifficulty :: non_neg_integer().
@@ -154,7 +155,7 @@ init([]) ->
 	%% Trap exit to avoid corrupting any open files on quit.
 	process_flag(trap_exit, true),
 	ok = ar_events:subscribe(nonce_limiter),
-	ar_chunk_storage:open_files("default"),
+	ar_chunk_storage:open_files(?DEFAULT_MODULE),
 
 	Partitions = ar_mining_io:get_partitions(infinity),
 	Packing = ar_mining_io:get_packing(),
@@ -673,7 +674,8 @@ prepare_solution(last_step_checkpoints, Candidate, Solution) ->
 prepare_solution(steps, Candidate, Solution) ->
 	#mining_candidate{ step_number = StepNumber } = Candidate,
 	[{_, TipNonceLimiterInfo}] = ets:lookup(node_state, nonce_limiter_info),
-	#nonce_limiter_info{ global_step_number = PrevStepNumber, next_seed = PrevNextSeed,
+	#nonce_limiter_info{ global_step_number = PrevStepNumber, seed = PrevSeed,
+			next_seed = PrevNextSeed,
 			next_vdf_difficulty = PrevNextVDFDifficulty } = TipNonceLimiterInfo,
 	case StepNumber > PrevStepNumber of
 		true ->
@@ -681,9 +683,16 @@ prepare_solution(steps, Candidate, Solution) ->
 					PrevStepNumber, StepNumber, PrevNextSeed, PrevNextVDFDifficulty),
 			case Steps of
 				not_found ->
+					CurrentSessionKey = ar_nonce_limiter:session_key(TipNonceLimiterInfo),
+					SolutionSessionKey = Candidate#mining_candidate.session_key,
 					LogData = [
+						{current_session_key,
+							ar_nonce_limiter:encode_session_key(CurrentSessionKey)},
+						{solution_session_key,
+							ar_nonce_limiter:encode_session_key(SolutionSessionKey)},
 						{start_step_number, PrevStepNumber},
 						{next_step_number, StepNumber},
+						{seed, ar_util:safe_encode(PrevSeed)},
 						{next_seed, ar_util:safe_encode(PrevNextSeed)},
 						{next_vdf_difficulty, PrevNextVDFDifficulty},
 						{h1, ar_util:safe_encode(Candidate#mining_candidate.h1)},
@@ -714,23 +723,55 @@ prepare_solution(proofs, Candidate, Solution) ->
 	#mining_candidate{
 		h0 = H0, h1 = H1, h2 = H2, nonce = Nonce, partition_number = PartitionNumber,
 		partition_upper_bound = PartitionUpperBound,
-		packing_difficulty = PackingDifficulty } = Candidate,
+		packing_difficulty = PackingDifficulty,
+		seed = Seed,
+		mining_address = MiningAddress,
+		nonce_limiter_output = NonceLimiterOutput,
+		chunk1 = Chunk1,
+		chunk2 = Chunk2
+	} = Candidate,
 	#mining_solution{ poa1 = PoA1, poa2 = PoA2 } = Solution,
 	{RecallByte1, RecallByte2} = get_recall_bytes(H0, PartitionNumber, Nonce,
 			PartitionUpperBound, PackingDifficulty),
-	case {H1, H2} of
-		{not_set, not_set} ->
+	ExpectedH0 = ar_block:compute_h0(NonceLimiterOutput,
+			PartitionNumber, Seed, MiningAddress,
+			PackingDifficulty),
+	{ExpectedH1, _} = ar_block:compute_h1(ExpectedH0, Nonce, Chunk1),
+	case {H0, H1, H2} of
+		{_, not_set, not_set} ->
 			%% We should never end up here..
 			log_prepare_solution_failure(Solution, h1_h2_not_set, []),
 			error;
-		{H1, not_set} ->
+		{ExpectedH0, ExpectedH1, not_set} ->
 			prepare_solution(poa1, Candidate, Solution#mining_solution{
 				solution_hash = H1, recall_byte1 = RecallByte1,
 				poa1 = may_be_empty_poa(PoA1), poa2 = #poa{} });
-		{_, H2} ->
-			prepare_solution(poa2, Candidate, Solution#mining_solution{
-				solution_hash = H2, recall_byte1 = RecallByte1, recall_byte2 = RecallByte2,
-				poa1 = may_be_empty_poa(PoA1), poa2 = may_be_empty_poa(PoA2) })
+		{ExpectedH0, _H1, not_set} ->
+			log_prepare_solution_failure(Solution, rejected, incorrect_h1, miner, []),
+			error;
+		{_H0, _H1, not_set} ->
+			log_prepare_solution_failure(Solution, rejected, incorrect_h0, miner, []),
+			error;
+		{ExpectedH0, H1, H2} ->
+			{ExpectedH2, _} =
+				case Chunk2 of
+					not_set ->
+						{H2, not_set};
+					_ ->
+						ar_block:compute_h2(ExpectedH1, Chunk2, ExpectedH0)
+				end,
+			case H2 == ExpectedH2 of
+				false ->
+					log_prepare_solution_failure(Solution, rejected, incorrect_h2, miner, []),
+					error;
+				true ->
+					prepare_solution(poa2, Candidate, Solution#mining_solution{
+						solution_hash = H2, recall_byte1 = RecallByte1, recall_byte2 = RecallByte2,
+						poa1 = may_be_empty_poa(PoA1), poa2 = may_be_empty_poa(PoA2) })
+			end;
+		_ ->
+			log_prepare_solution_failure(Solution, rejected, incorrect_h0, miner, []),
+			error
 	end;
 
 prepare_solution(poa1, Candidate, Solution) ->
