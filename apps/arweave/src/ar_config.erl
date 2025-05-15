@@ -77,7 +77,7 @@ parse_storage_module(IOList) ->
 		[PartitionNumberBin, PackingBin, <<"repack_in_place">>, ToPackingBin] ->
 			PartitionNumber = binary_to_integer(PartitionNumberBin),
 			true = PartitionNumber >= 0,
-			parse_storage_module(PartitionNumber, ?PARTITION_SIZE, PackingBin, ToPackingBin);
+			parse_storage_module(PartitionNumber, ar_block:partition_size(), PackingBin, ToPackingBin);
 		[RangeNumberBin, RangeSizeBin, PackingBin, <<"repack_in_place">>, ToPackingBin] ->
 			RangeNumber = binary_to_integer(RangeNumberBin),
 			true = RangeNumber >= 0,
@@ -87,7 +87,7 @@ parse_storage_module(IOList) ->
 		[PartitionNumberBin, PackingBin] ->
 			PartitionNumber = binary_to_integer(PartitionNumberBin),
 			true = PartitionNumber >= 0,
-			parse_storage_module(PartitionNumber, ?PARTITION_SIZE, PackingBin);
+			parse_storage_module(PartitionNumber, ar_block:partition_size(), PackingBin);
 		[RangeNumberBin, RangeSizeBin, PackingBin] ->
 			RangeNumber = binary_to_integer(RangeNumberBin),
 			true = RangeNumber >= 0,
@@ -185,6 +185,8 @@ parse_options([{<<"verify">>, Opt} | _], _) ->
 
 parse_options([{<<"verify_samples">>, N} | Rest], Config) when is_integer(N) ->
 	parse_options(Rest, Config#config{ verify_samples = N });
+parse_options([{<<"verify_samples">>, <<"all">>} | Rest], Config) ->
+	parse_options(Rest, Config#config{ verify_samples = all });
 parse_options([{<<"verify_samples">>, Opt} | _], _) ->
 	{error, {bad_type, verify_samples, number}, Opt};
 
@@ -744,16 +746,12 @@ parse_storage_module(RangeNumber, RangeSize, PackingBin) ->
 	{ok, {RangeSize, RangeNumber, Packing}}.
 
 parse_storage_module(RangeNumber, RangeSize, PackingBin, ToPackingBin) ->
-	%% We do not support repacking in place from the 2.9 replication format.
 	Packing =
 		case PackingBin of
 			<<"unpacked">> ->
 				unpacked;
-			<< MiningAddr:43/binary, ".", PackingDifficultyBin/binary >> ->
-				PackingDifficulty = binary_to_integer(PackingDifficultyBin),
-				true = PackingDifficulty >= 1
-						andalso PackingDifficulty =< ?MAX_PACKING_DIFFICULTY,
-				{composite, ar_util:decode(MiningAddr), PackingDifficulty};
+			<< MiningAddr:43/binary, ".replica.2.9" >> ->
+				{replica_2_9, ar_util:decode(MiningAddr)};
 			MiningAddr when byte_size(MiningAddr) == 43 ->
 				{spora_2_6, ar_util:decode(MiningAddr)}
 		end,
@@ -763,11 +761,6 @@ parse_storage_module(RangeNumber, RangeSize, PackingBin, ToPackingBin) ->
 				unpacked;
 			<< ToMiningAddr:43/binary, ".replica.2.9" >> ->
 				{replica_2_9, ar_util:decode(ToMiningAddr)};
-			<< ToMiningAddr:43/binary, ".", ToPackingDifficultyBin/binary >> ->
-				ToPackingDifficulty = binary_to_integer(ToPackingDifficultyBin),
-				true = ToPackingDifficulty >= 1
-						andalso ToPackingDifficulty =< ?MAX_PACKING_DIFFICULTY,
-				{composite, ar_util:decode(ToMiningAddr), ToPackingDifficulty};
 			ToMiningAddr when byte_size(ToMiningAddr) == 43 ->
 				{spora_2_6, ar_util:decode(ToMiningAddr)}
 		end,
@@ -963,25 +956,16 @@ validate_repack_in_place(Config) ->
 
 validate_repack_in_place([], _Modules) ->
 	true;
-validate_repack_in_place([{Module, ToPacking} | L], Modules) ->
-	{_BucketSize, _Bucket, Packing} = Module,
+validate_repack_in_place([{Module, _ToPacking} | L], Modules) ->
 	ID = ar_storage_module:id(Module),
 	ModuleInUse = lists:member(ID, Modules),
-	FromPackingType = ar_mining_server:get_packing_type(Packing),
-	ToPackingType = ar_mining_server:get_packing_type(ToPacking),
-	case {ModuleInUse, FromPackingType, ToPackingType} of
-		{true, _, _} ->
+	case ModuleInUse of
+		true ->
 			io:format("~nCannot use the storage module ~s "
 					"while it is being repacked in place.~n~n", [ID]),
 			false;
-		{_, replica_2_9, _} ->
-			io:format("~nCannot repack in place from replica_2_9 to any format.~n~n"),
-			false;
-		{_, _, replica_2_9} ->
-			validate_repack_in_place(L, Modules);
-		_ ->
-			io:format("~nCan only repack in place to replica_2_9.~n~n"),
-			false
+		false ->
+			validate_repack_in_place(L, Modules)
 	end.
 
 validate_cm_pool(Config) ->

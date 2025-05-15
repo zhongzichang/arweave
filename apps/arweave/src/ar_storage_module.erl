@@ -1,10 +1,10 @@
 -module(ar_storage_module).
 
--export([id/1, label/1, address_label/2, module_address/1,
-		module_packing_difficulty/1, packing_label/1, label_by_id/1, get_by_id/1,
-		get_range/1, module_range/1, module_range/2, get_packing/1, get_size/1,
+-export([get_overlap/1, id/1, label/1, address_label/2, module_address/1,
+		module_packing_difficulty/1, packing_label/1, get_by_id/1,
+		get_range/1, module_range/1, module_range/2, get_packing/1,
 		get/2, get_strict/2, get_all/1, get_all/2, get_all_packed/3, get_all_module_ranges/0,
-		has_any/1, has_range/2, get_cover/3, get_overlap/1]).
+		has_any/1, has_range/2, get_cover/3, is_repack_in_place/1]).
 
 -include("../include/ar.hrl").
 -include("../include/ar_consensus.hrl").
@@ -33,8 +33,13 @@
 %%% Public interface.
 %%%===================================================================
 
+get_overlap({replica_2_9, _Addr}) ->
+	?REPLICA_2_9_OVERLAP;
+get_overlap(_Packing) ->
+	?OVERLAP.
+
 %% @doc Return the storage module identifier.
-id("default") -> "default";
+id(?DEFAULT_MODULE) -> ?DEFAULT_MODULE;
 id({BucketSize, Bucket, Packing}) ->
 	PackingString =
 		case Packing of
@@ -51,21 +56,14 @@ id({BucketSize, Bucket, Packing}) ->
 	id(BucketSize, Bucket, PackingString).
 
 %% @doc Return the obscure unique label for the given storage module.
-label({BucketSize, Bucket, Packing} = StorageModule) ->
-	StoreID = ar_storage_module:id(StorageModule),
+label(?DEFAULT_MODULE) ->
+	?DEFAULT_MODULE;
+label(StoreID) ->
 	case ets:lookup(?MODULE, {label, StoreID}) of
 		[] ->
-			PackingLabel =
-				case Packing of
-					{spora_2_6, Addr} ->
-						ar_storage_module:address_label(Addr, spora_2_6);
-					{composite, Addr, PackingDifficulty} ->
-						ar_storage_module:address_label(Addr, {composite, PackingDifficulty});
-					{replica_2_9, Addr} ->
-						ar_storage_module:address_label(Addr, replica_2_9);
-					_ ->
-						atom_to_list(Packing)
-				end,
+			StorageModule = get_by_id(StoreID),
+			{BucketSize, Bucket, Packing} = StorageModule,
+			PackingLabel = packing_label(Packing),
 			Label = id(BucketSize, Bucket, PackingLabel),
 			ets:insert(?MODULE, {{label, StoreID}, Label}),
 			Label;
@@ -124,22 +122,10 @@ packing_label({replica_2_9, Addr}) ->
 packing_label(Packing) ->
 	Packing.
 
-%% @doc Return the obscure unique label for the given store ID.
-label_by_id("default") ->
-	"default";
-label_by_id(StoreID) ->
-	case get_by_id(StoreID) of
-		not_found ->
-			%% Occurs in tests on application shutdown.
-			?LOG_WARNING([{event, store_id_for_label_not_found},
-					{store_id, StoreID}]),
-			"error";
-		M ->
-			label(M)
-	end.
-
 %% @doc Return the storage module with the given identifier or not_found.
 %% Search across both attached modules and repacked in-place modules.
+get_by_id(?DEFAULT_MODULE) ->
+	?DEFAULT_MODULE;
 get_by_id(ID) ->
 	{ok, Config} = application:get_env(arweave, config),
 	RepackInPlaceModules = [element(1, El)
@@ -168,7 +154,7 @@ get_all_module_ranges() ->
 		ModuleStoreIDs ++ RepackInPlaceModulesStoreIDs].
 
 %% @doc Return {StartOffset, EndOffset} the given module is responsible for.
-get_range("default") ->
+get_range(?DEFAULT_MODULE) ->
 	{0, infinity};
 get_range(ID) ->
 	Module = get_by_id(ID),
@@ -183,34 +169,24 @@ get_range(ID) ->
 	{non_neg_integer(), non_neg_integer()}.
 module_range(Module) ->
 	{_BucketSize, _Bucket, Packing} = Module,
-	module_range(Module, get_overlap(Packing)).
+	module_range(Module, ar_storage_module:get_overlap(Packing)).
 
 module_range(Module, Overlap) ->
 	{BucketSize, Bucket, _Packing} = Module,
 	{BucketSize * Bucket, (Bucket + 1) * BucketSize + Overlap}.
 
 %% @doc Return the packing configured for the given module.
-get_packing("default") ->
+get_packing(?DEFAULT_MODULE) ->
 	unpacked;
+get_packing({_BucketSize, _Bucket, Packing}) ->
+	Packing;
 get_packing(ID) ->
 	Module = get_by_id(ID),
 	case Module of
 		not_found ->
 			not_found;
 		_ ->
-			{_BucketSize, _Bucket, Packing} = Module,
-			Packing
-	end.
-
-%% @doc Return the bucket size configured for the given module.
-get_size(ID) ->
-	Module = get_by_id(ID),
-	case Module of
-		not_found ->
-			not_found;
-		_ ->
-			{BucketSize, _Bucket, _Packing} = Module,
-			BucketSize
+			get_packing(Module)
 	end.
 
 %% @doc Return a configured storage module covering the given Offset, preferably
@@ -276,10 +252,10 @@ has_range(Start, End) ->
 %% 2. returns [{7, 10, sm1}, {10, 13, sm_2}]
 %% 3. returns [{7, 10, sm1}, {10, 20, sm_2}, {20, 25, sm_3}]
 %% 4. returns [{7, 10, sm1}, {10, 20, sm_4}, {20, 25, sm_3}]
-get_cover(Start, End, MaybeStoreID) ->
+get_cover(Start, End, MaybeModule) ->
 	{ok, Config} = application:get_env(arweave, config),
 	SortedStorageModules = sort_storage_modules_by_left_bound(
-			Config#config.storage_modules, MaybeStoreID),
+			Config#config.storage_modules, MaybeModule),
 	case get_cover2(Start, End, SortedStorageModules) of
 		[] ->
 			not_found;
@@ -289,20 +265,31 @@ get_cover(Start, End, MaybeStoreID) ->
 			Cover
 	end.
 
+is_repack_in_place(ID) ->
+	{ok, Config} = application:get_env(arweave, config),
+	lists:any(
+		fun({Module, _TargetPacking}) ->
+			ar_storage_module:id(Module) == ID
+		end,
+		Config#config.repack_in_place_storage_modules).
+
 %%%===================================================================
 %%% Private functions.
 %%%===================================================================
 
-id(BucketSize, Bucket, PackingString) when BucketSize == ?PARTITION_SIZE ->
-	binary_to_list(iolist_to_binary(io_lib:format("storage_module_~B_~s",
-			[Bucket, PackingString])));
 id(BucketSize, Bucket, PackingString) ->
-	binary_to_list(iolist_to_binary(io_lib:format("storage_module_~B_~B_~s",
-			[BucketSize, Bucket, PackingString]))).
+	case BucketSize == ar_block:partition_size() of
+		true ->
+			binary_to_list(iolist_to_binary(io_lib:format("storage_module_~B_~s",
+					[Bucket, PackingString])));
+		false ->
+			binary_to_list(iolist_to_binary(io_lib:format("storage_module_~B_~B_~s",
+					[BucketSize, Bucket, PackingString])))
+	end.
 
 get(Offset, Packing, [{BucketSize, Bucket, Packing2} | StorageModules], StorageModule) ->
 	case Offset =< BucketSize * Bucket
-			orelse Offset > BucketSize * (Bucket + 1) + get_overlap(Packing2) of
+			orelse Offset > BucketSize * (Bucket + 1) + ar_storage_module:get_overlap(Packing2) of
 		true ->
 			get(Offset, Packing, StorageModules, StorageModule);
 		false ->
@@ -332,14 +319,9 @@ get_strict(Offset, Packing,
 get_strict(_Offset, _Packing, []) ->
 	not_found.
 
-get_overlap({replica_2_9, _Addr}) ->
-	?REPLICA_2_9_OVERLAP;
-get_overlap(_Packing) ->
-	?OVERLAP.
-
 get_all(Offset, [{BucketSize, Bucket, Packing} = StorageModule | StorageModules], FoundModules) ->
 	case Offset =< BucketSize * Bucket
-			orelse Offset > BucketSize * (Bucket + 1) + get_overlap(Packing) of
+			orelse Offset > BucketSize * (Bucket + 1) + ar_storage_module:get_overlap(Packing) of
 		true ->
 			get_all(Offset, StorageModules, FoundModules);
 		false ->
@@ -363,7 +345,7 @@ get_all_packed(_Offset, _Packing, []) ->
 
 get_all(Start, End, [{BucketSize, Bucket, Packing} = StorageModule | StorageModules], FoundModules) ->
 	case End =< BucketSize * Bucket
-			orelse Start >= BucketSize * (Bucket + 1) + get_overlap(Packing) of
+			orelse Start >= BucketSize * (Bucket + 1) + ar_storage_module:get_overlap(Packing) of
 		true ->
 			get_all(Start, End, StorageModules, FoundModules);
 		false ->
@@ -376,7 +358,7 @@ has_any(_Offset, []) ->
 	false;
 has_any(Offset, [{BucketSize, Bucket, Packing} | StorageModules]) ->
 	case Offset > Bucket * BucketSize
-			andalso Offset =< (Bucket + 1) * BucketSize + get_overlap(Packing) of
+			andalso Offset =< (Bucket + 1) * BucketSize + ar_storage_module:get_overlap(Packing) of
 		true ->
 			true;
 		false ->
@@ -408,7 +390,7 @@ has_range(PartitionStart, PartitionEnd, [{_Start, End} | Intervals])
 has_range(_PartitionStart, PartitionEnd, [{_Start, End} | Intervals]) ->
 	has_range(End, PartitionEnd, Intervals).
 
-sort_storage_modules_by_left_bound(StorageModules, MaybeStoreID) ->
+sort_storage_modules_by_left_bound(StorageModules, MaybeModule) ->
 	lists:sort(
 		fun({BucketSize1, Bucket1, _} = M1, {BucketSize2, Bucket2, _} = M2) ->
 			Start1 = BucketSize1 * Bucket1,
@@ -419,9 +401,7 @@ sort_storage_modules_by_left_bound(StorageModules, MaybeStoreID) ->
 				true ->
 					case Start1 == Start2 of
 						true ->
-							StoreID1 = ar_storage_module:id(M1),
-							StoreID2 = ar_storage_module:id(M2),
-							StoreID1 == MaybeStoreID orelse StoreID2 /= MaybeStoreID;
+							M1 == MaybeModule orelse M2 /= MaybeModule;
 						false ->
 							true
 					end
@@ -458,29 +438,44 @@ get_cover2(Start, End, [{BucketSize, Bucket, _Packing} = StorageModule | Storage
 %%%===================================================================
 
 label_test() ->
-	?assertEqual("storage_module_0_1",
-		label({?PARTITION_SIZE, 0, {spora_2_6, <<"a">>}})),
-	?assertEqual("storage_module_0_1",
-		label({?PARTITION_SIZE, 0, {spora_2_6, <<"a">>}})),
-	?assertEqual("storage_module_2_1",
-		label({?PARTITION_SIZE, 2, {spora_2_6, <<"a">>}})),
-	?assertEqual("storage_module_0_2",
-		label({?PARTITION_SIZE, 0, {spora_2_6, <<"b">>}})),
-	?assertEqual("storage_module_524288_3_2",
-		label({524288, 3, {spora_2_6, <<"b">>}})),
-	?assertEqual("storage_module_2_unpacked",
-		label({?PARTITION_SIZE, 2, unpacked})),
-	%% force a _ in the encoded address
-	?assertEqual("storage_module_2_3",
-		label({?PARTITION_SIZE, 2, {spora_2_6, <<"s÷">>}})),
-	?assertEqual("storage_module_524288_2_3",
-		label({524288, 2, {spora_2_6, <<"s÷">>}})),
-	?assertEqual("storage_module_524288_3_4",
-		label({524288, 3, {composite, <<"b">>, 1}})),
-	?assertEqual("storage_module_524288_3_4",
-		label({524288, 3, {composite, <<"b">>, 1}})),
-	?assertEqual("storage_module_524288_3_5",
-		label({524288, 3, {composite, <<"b">>, 2}})).
+	{ok, Config} = application:get_env(arweave, config),
+	try
+		application:set_env(arweave, config, Config#config{storage_modules = [
+			{ar_block:partition_size(), 0, {spora_2_6, <<"a">>}},
+			{ar_block:partition_size(), 2, {spora_2_6, <<"a">>}},
+			{ar_block:partition_size(), 0, {spora_2_6, <<"b">>}},
+			{524288, 3, {spora_2_6, <<"b">>}},
+			{ar_block:partition_size(), 2, unpacked},
+			{ar_block:partition_size(), 2, {spora_2_6, <<"s÷">>}},
+			{524288, 2, {spora_2_6, <<"s÷">>}},
+			{524288, 3, {composite, <<"b">>, 1}},
+			{524288, 3, {composite, <<"b">>, 1}},
+			{524288, 3, {composite, <<"b">>, 2}}
+		]}),
+		?assertEqual("storage_module_0_spora_2_6_1",
+			label(id({ar_block:partition_size(), 0, {spora_2_6, <<"a">>}}))),
+		?assertEqual("storage_module_2_spora_2_6_1",
+			label(id({ar_block:partition_size(), 2, {spora_2_6, <<"a">>}}))),
+		?assertEqual("storage_module_0_spora_2_6_2",
+			label(id({ar_block:partition_size(), 0, {spora_2_6, <<"b">>}}))),
+		?assertEqual("storage_module_524288_3_spora_2_6_2",
+			label(id({524288, 3, {spora_2_6, <<"b">>}}))),
+		?assertEqual("storage_module_2_unpacked",
+			label(id({ar_block:partition_size(), 2, unpacked}))),
+		%% force a _ in the encoded address
+		?assertEqual("storage_module_2_spora_2_6_3",
+			label(id({ar_block:partition_size(), 2, {spora_2_6, <<"s÷">>}}))),
+		?assertEqual("storage_module_524288_2_spora_2_6_3",
+			label(id({524288, 2, {spora_2_6, <<"s÷">>}}))),
+		?assertEqual("storage_module_524288_3_composite_4",
+			label(id({524288, 3, {composite, <<"b">>, 1}}))),
+		?assertEqual("storage_module_524288_3_composite_4",
+			label(id({524288, 3, {composite, <<"b">>, 1}}))),
+		?assertEqual("storage_module_524288_3_composite_5",
+			label(id({524288, 3, {composite, <<"b">>, 2}})))
+	after
+		application:set_env(arweave, config, Config)
+	end.
 
 has_any_test() ->
 	?assertEqual(false, has_any(0, [])),
@@ -516,7 +511,7 @@ sort_storage_modules_by_left_bound_test() ->
 			sort_storage_modules_by_left_bound([{10, 1, p}, {10, 0, p}, {10, 1, p2}], none)),
 	?assertEqual([{10, 0, p}, {10, 1, p2}, {10, 1, p}],
 			sort_storage_modules_by_left_bound([{10, 1, p}, {10, 0, p}, {10, 1, p2}],
-					"storage_module_10_1_p2")).
+					{10, 1, p2})).
 
 get_cover2_test() ->
 	?assertEqual(not_found, get_cover2(0, 1, [])),

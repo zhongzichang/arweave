@@ -2,10 +2,10 @@
 
 -behaviour(gen_server).
 
--export([name/1, register_workers/1,  initialize_context/2, is_entropy_packing/1,
-	footprint_end/2, map_entropies/9, entropy_offsets/1,
+-export([name/1, register_workers/1,  initialize_context/2,
+	map_entropies/8, entropy_offsets/2,
 	generate_entropies/2, generate_entropies/4, generate_entropy_keys/2, 
-	reset_entropy_offset/1, shift_entropy_offset/2]).
+	shift_entropy_offset/2]).
 
 -export([start_link/2, init/1, handle_cast/2, handle_call/3, handle_info/2, terminate/2]).
 
@@ -41,7 +41,7 @@ start_link(Name, {StoreID, Packing}) ->
 
 %% @doc Return the name of the server serving the given StoreID.
 name(StoreID) ->
-	list_to_atom("ar_entropy_gen_" ++ ar_storage_module:label_by_id(StoreID)).
+	list_to_atom("ar_entropy_gen_" ++ ar_storage_module:label(StoreID)).
 
 register_workers(Module) ->
 	{ok, Config} = application:get_env(arweave, config),
@@ -64,16 +64,20 @@ register_workers(Module) ->
 	),
 	 
 	RepackInPlaceWorkers = lists:filtermap(
-		fun({StorageModule, Packing}) ->
+		fun({StorageModule, ToPacking}) ->
 				StoreID = ar_storage_module:id(StorageModule),
+				ConfiguredPacking = ar_storage_module:get_packing(StorageModule),
 				%% Note: the config validation will prevent a StoreID from being used in both
 				%% `storage_modules` and `repack_in_place_storage_modules`, so there's
 				%% no risk of a `Name` clash with the workers spawned above.
-				case is_entropy_packing(Packing) of
-					 true ->
+				IsEntropyPacking = (
+					is_entropy_packing(ConfiguredPacking) orelse is_entropy_packing(ToPacking)
+				),
+				case IsEntropyPacking of
+					true ->
 						Worker = ?CHILD_WITH_ARGS(
 							Module, worker, Module:name(StoreID),
-							[Module:name(StoreID), {StoreID, Packing}]),
+							[Module:name(StoreID), {StoreID, ToPacking}]),
 						{true, Worker};
 					 false ->
 						false
@@ -109,39 +113,24 @@ is_entropy_packing({replica_2_9, _}) ->
 is_entropy_packing(_) ->
 	false.
 
-footprint_end(BucketEndOffset, ModuleEnd) ->
-	%% get_entropy_partition will use bucket *start* offset to determine the partition.
-	Partition = ar_replica_2_9:get_entropy_partition(BucketEndOffset),
-	%% A set of generated entropies covers slighly more than 3.6TB of
-	%% chunks, however we only want to use the first 3.6TB
-	%% (+ chunk padding) of it.
-	PartitionEnd = (Partition + 1) * ?PARTITION_SIZE,
-	PaddedPartitionEnd =
-		ar_chunk_storage:get_chunk_bucket_end(PartitionEnd),
-	%% In addition to limiting this iteration to the PaddedPartitionEnd,
-	%% we also want to limit it to the current storage module's range.
-	%% This allows us to handle both the storage module range as well
-	%% as the small overlap region.
-	min(PaddedPartitionEnd, ModuleEnd).
-
 %% @doc Return a list of all BucketEndOffsets covered by the entropy needed to encipher
 %% the chunk at the given offset. The list returned may include offsets that occur before
 %% the provided offset. This is expected if Offset does not refer to a sector 0 chunk.
--spec entropy_offsets(Offset :: non_neg_integer()) -> [non_neg_integer()].
-entropy_offsets(Offset) ->
+-spec entropy_offsets(non_neg_integer(), non_neg_integer()) -> [non_neg_integer()].
+entropy_offsets(Offset, ModuleEnd) ->
 	BucketEndOffset = ar_chunk_storage:get_chunk_bucket_end(Offset),
 	BucketEndOffset2 = reset_entropy_offset(BucketEndOffset),
 	Partition = ar_replica_2_9:get_entropy_partition(BucketEndOffset),
-	PartitionEnd = (Partition + 1) * ?PARTITION_SIZE,
-	PaddedPartitionEnd = ar_chunk_storage:get_chunk_bucket_end(PartitionEnd),
-	entropy_offsets(BucketEndOffset2, PaddedPartitionEnd).
+	{_, EntropyPartitionEnd} = ar_replica_2_9:get_entropy_partition_range(Partition),
+	End = min(EntropyPartitionEnd, ModuleEnd),
+	entropy_offsets2(BucketEndOffset2, End).
 
-entropy_offsets(BucketEndOffset, PaddedPartitionEnd)
+entropy_offsets2(BucketEndOffset, PaddedPartitionEnd)
 	when BucketEndOffset > PaddedPartitionEnd ->
 	[];
-entropy_offsets(BucketEndOffset, PaddedPartitionEnd) ->
+entropy_offsets2(BucketEndOffset, PaddedPartitionEnd) ->
 	NextOffset = shift_entropy_offset(BucketEndOffset, 1),
-	[BucketEndOffset | entropy_offsets(NextOffset, PaddedPartitionEnd)].
+	[BucketEndOffset | entropy_offsets2(NextOffset, PaddedPartitionEnd)].
 
 %% @doc If we are not at the beginning of the entropy, shift the offset to
 %% the left. store_entropy_footprint will traverse the entire 2.9 partition shifting
@@ -181,7 +170,6 @@ generate_entropies(RewardAddr, BucketEndOffset) ->
 map_entropies(_Entropies,
 			[],
 			_RangeStart,
-			_RangeEnd,
 			_Keys,
 			_RewardAddr,
 			_Fun,
@@ -192,25 +180,9 @@ map_entropies(_Entropies,
 	%% some entropy left. In this case we stop the recursion early and wait for the writes
 	%% to complete.
 	Acc;
-map_entropies(_Entropies,
-			[BucketEndOffset | _EntropyOffsets],
-			_RangeStart,
-			RangeEnd,
-			_Keys,
-			_RewardAddr,
-			_Fun,
-			_Args,
-			Acc)
-		when BucketEndOffset > RangeEnd ->
-	%% The amount of entropy generated per partition is slightly more than the amount needed.
-	%% So at the end of a partition we will have finished processing chunks, but still have
-	%% some entropy left. In this case we stop the recursion early and wait for the writes
-	%% to complete.
-	Acc;
 map_entropies(Entropies,
 			[BucketEndOffset | EntropyOffsets],
 			RangeStart,
-			RangeEnd,
 			Keys,
 			RewardAddr,
 			Fun,
@@ -220,15 +192,13 @@ map_entropies(Entropies,
 	case take_and_combine_entropy_slices(Entropies) of
 		{ChunkEntropy, Rest} ->
 			%% Sanity checks
-			true =
-				ar_replica_2_9:get_entropy_partition(BucketEndOffset)
-				== ar_replica_2_9:get_entropy_partition(RangeEnd),
 			sanity_check_replica_2_9_entropy_keys(BucketEndOffset, RewardAddr, Keys),
 			%% End sanity checks
 
 			Acc2 = case BucketEndOffset > RangeStart of
 				true ->
-					erlang:apply(Fun, [ChunkEntropy, BucketEndOffset] ++ Args ++ [Acc]);
+					erlang:apply(Fun,
+						[ChunkEntropy, BucketEndOffset, RewardAddr] ++ Args ++ [Acc]);
 				false ->
 					%% Don't write entropy before the start of the range.
 					Acc
@@ -239,7 +209,6 @@ map_entropies(Entropies,
 				Rest,
 				EntropyOffsets,
 				RangeStart,
-				RangeEnd,
 				Keys,
 				RewardAddr,
 				Fun,
@@ -253,8 +222,9 @@ init({StoreID, Packing}) ->
 		{name, name(StoreID)}, {store_id, StoreID},
 		{packing, ar_serialize:encode_packing(Packing, true)}]),
 
-	%% Senity checks
-	{replica_2_9, _} = Packing,
+	ConfiguredPacking = ar_storage_module:get_packing(StoreID),
+	%% Sanity checks
+	true = is_entropy_packing(ConfiguredPacking) orelse is_entropy_packing(Packing),
 	%% End sanity checks
 
 	{ModuleStart, ModuleEnd} = ar_storage_module:get_range(StoreID),
@@ -262,7 +232,7 @@ init({StoreID, Packing}) ->
 
 	%% Provided Packing will only differ from the StoreID packing when this
 	%% module is configured to repack in place.
-	IsRepackInPlace = Packing /= ar_storage_module:get_packing(StoreID),
+	IsRepackInPlace = Packing /= ConfiguredPacking,
 	State = case IsRepackInPlace of
 		true ->
 			#state{};
@@ -320,7 +290,7 @@ handle_cast(prepare_entropy, State) ->
 
 handle_cast({generate_entropies, RewardAddr, BucketEndOffset, ReplyTo}, State) ->
 	Entropies = generate_entropies(RewardAddr, BucketEndOffset),
-	ReplyTo ! {entropy, BucketEndOffset, Entropies},
+	ReplyTo ! {entropy, BucketEndOffset, RewardAddr, Entropies},
 	{noreply, State};
 
 handle_cast(Cast, State) ->
@@ -350,10 +320,11 @@ terminate(Reason, State) ->
 do_prepare_entropy(State) ->
 	#state{ 
 		cursor = Start, module_start = ModuleStart, module_end = ModuleEnd,
-		packing = {replica_2_9, RewardAddr},
+		packing = Packing,
 		store_id = StoreID
 	} = State,
 
+	{replica_2_9, RewardAddr} = Packing,
 	BucketEndOffset = ar_chunk_storage:get_chunk_bucket_end(Start),
 
 	%% Sanity checks:
@@ -385,14 +356,12 @@ do_prepare_entropy(State) ->
 				false
 		end,
 
-	Start2 = advance_entropy_offset(BucketEndOffset, StoreID),
-	State2 = State#state{ cursor = Start2 },
 	CheckIsRecorded =
 		case CheckRangeEnd of
 			complete ->
 				complete;
 			false ->
-				ar_entropy_storage:is_entropy_recorded(BucketEndOffset, StoreID)
+				ar_entropy_storage:is_entropy_recorded(BucketEndOffset, Packing, StoreID)
 		end,
 
 	StoreEntropy =
@@ -409,20 +378,20 @@ do_prepare_entropy(State) ->
 						{error, Reason};
 					_ ->
 						EntropyKeys = generate_entropy_keys(RewardAddr, BucketEndOffset),
-						EntropyOffsets = entropy_offsets(BucketEndOffset),
+						EntropyOffsets = entropy_offsets(BucketEndOffset, ModuleEnd),
 						ar_entropy_storage:store_entropy_footprint(
 							StoreID, Entropies, EntropyOffsets,
-							ModuleStart, footprint_end(BucketEndOffset, ModuleEnd),
-							EntropyKeys, RewardAddr)
+							ModuleStart, EntropyKeys, RewardAddr)
 				end
 		end,
+	NextCursor = advance_entropy_offset(BucketEndOffset, Packing, StoreID),
 	case StoreEntropy of
 		complete ->
 			ar_device_lock:set_device_lock_metric(StoreID, prepare, complete),
 			State#state{ prepare_status = complete };
 		is_recorded ->
 			gen_server:cast(self(), prepare_entropy),
-			State2;
+			State#state{ cursor = NextCursor };
 		{error, Error} ->
 			?LOG_WARNING([{event, failed_to_store_entropy},
 					{cursor, Start},
@@ -432,16 +401,16 @@ do_prepare_entropy(State) ->
 			State;
 		ok ->
 			gen_server:cast(self(), prepare_entropy),
-			case store_cursor(Start2, StoreID) of
+			case store_cursor(NextCursor, StoreID) of
 				ok ->
 					ok;
 				{error, Error} ->
 					?LOG_WARNING([{event, failed_to_store_prepare_entropy_cursor},
-							{chunk_cursor, Start2},
+							{chunk_cursor, NextCursor},
 							{store_id, StoreID},
 							{reason, io_lib:format("~p", [Error])}])
 			end,
-			State2
+			State#state{ cursor = NextCursor }
 	end.
 
 
@@ -504,10 +473,8 @@ sanity_check_replica_2_9_entropy_keys(
 										SubChunkStartOffset + SubChunkSize,
 										Keys).
 
-advance_entropy_offset(BucketEndOffset, StoreID) ->
-	Interval = ar_sync_record:get_next_unsynced_interval(
-		BucketEndOffset, infinity, ar_chunk_storage_replica_2_9_1_entropy, StoreID),
-	case Interval of
+advance_entropy_offset(BucketEndOffset, Packing, StoreID) ->
+	case ar_entropy_storage:get_next_unsynced_interval(BucketEndOffset, Packing, StoreID) of
 		not_found ->
 			BucketEndOffset + ?DATA_CHUNK_SIZE;
 		{_, Start} ->
@@ -568,76 +535,62 @@ store_cursor(Cursor, StoreID) ->
 %%% Tests.
 %%%===================================================================
 
-reset_entropy_offset_test() ->
-	?assertEqual(786432, ar_replica_2_9:get_sector_size()),
-	case ?STRICT_DATA_SPLIT_THRESHOLD of
-		786432 ->
-			ok;
-		_ ->
-			throw(unexpected_strict_data_split_threshold)
-	end,
-	%% Slice index of 0 means no shift (all offsets at or below the strict data split
-	%% threshold are not padded)
-	assert_reset_entropy_offset(262144, 0),
-	assert_reset_entropy_offset(262144, 1),
-	assert_reset_entropy_offset(262144, ?DATA_CHUNK_SIZE - 1),
-	assert_reset_entropy_offset(262144, ?DATA_CHUNK_SIZE),
-	assert_reset_entropy_offset(262144, ?DATA_CHUNK_SIZE + 1),
-	assert_reset_entropy_offset(524288, ?DATA_CHUNK_SIZE * 2),
-	assert_reset_entropy_offset(786432, ?DATA_CHUNK_SIZE * 3),
-	%% Slice index of 1 shift down a sector
-	assert_reset_entropy_offset(262144, ?DATA_CHUNK_SIZE * 3 + 1),
-	assert_reset_entropy_offset(262144, ?DATA_CHUNK_SIZE * 4 - 1),
-	assert_reset_entropy_offset(262144, ?DATA_CHUNK_SIZE * 4),
-	assert_reset_entropy_offset(524288, ?DATA_CHUNK_SIZE * 4 + 1),
-	assert_reset_entropy_offset(524288, ?DATA_CHUNK_SIZE * 5 - 1),
-	assert_reset_entropy_offset(524288, ?DATA_CHUNK_SIZE * 5),
-	assert_reset_entropy_offset(786432, ?DATA_CHUNK_SIZE * 5 + 1),
-	assert_reset_entropy_offset(786432, ?DATA_CHUNK_SIZE * 6),
-	%% Slice index of 2 shift down 2 sectors
-	assert_reset_entropy_offset(262144, ?DATA_CHUNK_SIZE * 7),
-	assert_reset_entropy_offset(524288, ?DATA_CHUNK_SIZE * 8),
-	%% First chunk of new partition, restart slice index at 0, so no shift
-	assert_reset_entropy_offset(?DATA_CHUNK_SIZE * 9, ?DATA_CHUNK_SIZE * 8 + 1),
-	assert_reset_entropy_offset(?DATA_CHUNK_SIZE * 9, ?DATA_CHUNK_SIZE * 9 - 1),
-	assert_reset_entropy_offset(?DATA_CHUNK_SIZE * 9, ?DATA_CHUNK_SIZE * 9),
-	assert_reset_entropy_offset(?DATA_CHUNK_SIZE * 10, ?DATA_CHUNK_SIZE * 9 + 1),
-	assert_reset_entropy_offset(?DATA_CHUNK_SIZE * 10, ?DATA_CHUNK_SIZE * 10),
-	assert_reset_entropy_offset(?DATA_CHUNK_SIZE * 11, ?DATA_CHUNK_SIZE * 11),
-	%% Slice index of 1 shift down a sector
-	assert_reset_entropy_offset(?DATA_CHUNK_SIZE * 9, ?DATA_CHUNK_SIZE * 12),
-	assert_reset_entropy_offset(?DATA_CHUNK_SIZE * 10, ?DATA_CHUNK_SIZE * 13),
-	assert_reset_entropy_offset(?DATA_CHUNK_SIZE * 11, ?DATA_CHUNK_SIZE * 14),
-	%% Slice index of 2 shift down 2 sectors
-	assert_reset_entropy_offset(?DATA_CHUNK_SIZE * 9, ?DATA_CHUNK_SIZE * 15),
-	assert_reset_entropy_offset(?DATA_CHUNK_SIZE * 10, ?DATA_CHUNK_SIZE * 16),
-	%% First chunk of new partition, restart slice index at 0, so no shift
-	assert_reset_entropy_offset(?DATA_CHUNK_SIZE * 17, ?DATA_CHUNK_SIZE * 17).
+entropy_offsets_test_() ->
+	ar_test_node:test_with_mocked_functions([
+		{ar_block, partition_size, fun() -> 2_000_000 end},
+		{ar_block, strict_data_split_threshold, fun() -> 700_000 end}
+	],
+	fun test_entropy_offsets/0, 30).
 
-assert_reset_entropy_offset(ExpectedShiftedOffset, Offset) ->
-	BucketEndOffset = ar_chunk_storage:get_chunk_bucket_end(Offset),
-	?assertEqual(ExpectedShiftedOffset,
-				 reset_entropy_offset(BucketEndOffset),
-				 iolist_to_binary(io_lib:format("Offset: ~p, BucketEndOffset: ~p",
-												[Offset, BucketEndOffset]))).
-
-entropy_offsets_test() ->
+test_entropy_offsets() ->
 	SectorSize = ar_replica_2_9:get_sector_size(),
 	?assertEqual(3 * ?DATA_CHUNK_SIZE, SectorSize),
 
-	%% Any Offset from any of the chunks in the result should yield the same entropy offsets.
-	?assertEqual([262144, 1048576, 1835008], entropy_offsets(0)),
-	?assertEqual([262144, 1048576, 1835008], entropy_offsets(1000)),
-	?assertEqual([262144, 1048576, 1835008], entropy_offsets(262144)),
-	?assertEqual([262144, 1048576, 1835008], entropy_offsets(786433)),
-	?assertEqual([262144, 1048576, 1835008], entropy_offsets(1048576)),
-	?assertEqual([262144, 1048576, 1835008], entropy_offsets(1835008)),
-	?assertEqual([262144, 1048576, 1835008], entropy_offsets(1835007)),
+	Module0 = {ar_block:partition_size(), 0, unpacked},
+	Module1 = {ar_block:partition_size(), 1, unpacked},
 
-	?assertEqual([524288, 1310720, 2097152], entropy_offsets(524288)),
-	?assertEqual([524288, 1310720, 2097152], entropy_offsets(2097152)),
-	?assertEqual([786432, 1572864], entropy_offsets(786432)),
+	{_ModuleStart0, ModuleEnd0} = ar_storage_module:module_range(Module0),
+	{_ModuleStart1, ModuleEnd1} = ar_storage_module:module_range(Module1),
+	
+	PaddedModuleEnd0 = ar_chunk_storage:get_chunk_bucket_end(ModuleEnd0),
+	PaddedModuleEnd1 = ar_chunk_storage:get_chunk_bucket_end(ModuleEnd1),
 
-	?assertEqual([2359296, 3145728, 3932160], entropy_offsets(2097153)),
-	?assertEqual([2621440, 3407872, 4194304], entropy_offsets(2359297)),
-	?assertEqual([2883584,3670016], entropy_offsets(2621441)).
+	?assertEqual(2097152, PaddedModuleEnd0),
+	?assertEqual(4194304, PaddedModuleEnd1),
+	
+	?assertEqual([262144, 1048576, 1835008], entropy_offsets(0, PaddedModuleEnd0)), %% bucket end: 262144
+	?assertEqual([262144, 1048576, 1835008], entropy_offsets(1000, PaddedModuleEnd0)), %% bucket end: 262144
+	?assertEqual([262144, 1048576, 1835008], entropy_offsets(262144, PaddedModuleEnd0)), %% bucket end: 262144
+
+	?assertEqual([524288, 1310720, 2097152], entropy_offsets(524288, PaddedModuleEnd0)), %% bucket end: 524288
+
+	?assertEqual([524288, 1310720, 2097152], entropy_offsets(699999, PaddedModuleEnd0)), %% bucket end: 524288
+	?assertEqual([524288, 1310720, 2097152], entropy_offsets(700000, PaddedModuleEnd0)), %% bucket end: 524288
+	?assertEqual([786432, 1572864], entropy_offsets(700001, PaddedModuleEnd0)), %% bucket end: 786432
+
+	?assertEqual([786432, 1572864], entropy_offsets(786432, PaddedModuleEnd0)), %% bucket end: 786432
+	?assertEqual([786432, 1572864], entropy_offsets(786433, PaddedModuleEnd0)), %% bucket end: 786432
+	?assertEqual([262144, 1048576, 1835008], entropy_offsets(1048576, PaddedModuleEnd0)), %% bucket end: 1048576	
+	?assertEqual([262144, 1048576, 1835008], entropy_offsets(1835007, PaddedModuleEnd0)), %% bucket end: 1835008
+	?assertEqual([262144, 1048576, 1835008], entropy_offsets(1835008, PaddedModuleEnd0)), %% bucket end: 1835008
+	?assertEqual([262144, 1048576, 1835008], entropy_offsets(1835009, PaddedModuleEnd0)), %% bucket end: 1835008
+
+	%% entropy partition is determined by the bucket *start* offset. So offsets that are in 
+	%% recall partition 1 may still be in entropy partition 0 (e.g. 2000001, 2097152)
+	?assertEqual([262144, 1048576, 1835008], entropy_offsets(1999999, PaddedModuleEnd0)), %% bucket end: 1835008
+	?assertEqual([262144, 1048576, 1835008], entropy_offsets(2000000, PaddedModuleEnd0)), %% bucket end: 1835008
+	?assertEqual([262144, 1048576, 1835008], entropy_offsets(2000001, PaddedModuleEnd0)), %% bucket end: 1835008
+	?assertEqual([524288, 1310720, 2097152], entropy_offsets(2097152, PaddedModuleEnd0)), %% bucket end: 2097152
+	?assertEqual([524288, 1310720, 2097152], entropy_offsets(2097153, PaddedModuleEnd0)), %% bucket end: 2097152
+
+	%% Even when ModuleEnd is high, we should limit entropy to the current entropy partition.
+	?assertEqual([524288, 1310720, 2097152], entropy_offsets(2097152, PaddedModuleEnd1)), %% bucket end: 2097152
+
+	%% Retstrict offsets to module end.
+	?assertEqual([524288, 1310720], entropy_offsets(2097152, 2_000_000)), %% bucket end: 2097152
+
+	%% Entropy partition 1
+	?assertEqual([2359296, 3145728, 3932160], entropy_offsets(2359297, PaddedModuleEnd1)), %% bucket end: 2359296
+	?assertEqual([2621440, 3407872, 4194304], entropy_offsets(2621441, PaddedModuleEnd1)), %% bucket end: 2621440
+
+	ok.

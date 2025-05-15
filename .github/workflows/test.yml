@@ -6,7 +6,7 @@ on:
 
 jobs:
   build:
-    runs-on: [self-hosted, ubuntu]
+    runs-on: [self-hosted, ubuntu, amd64]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -147,7 +147,7 @@ jobs:
   ####################################################################
   canary:
     needs: build
-    runs-on: [self-hosted, ubuntu]
+    runs-on: [self-hosted, ubuntu, amd64]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -185,7 +185,7 @@ jobs:
   ####################################################################
   eunit-tests-long-running:
     needs: canary
-    runs-on: [self-hosted, ubuntu]
+    runs-on: [self-hosted, ubuntu, amd64]
     strategy:
       max-parallel: 4
       matrix:
@@ -244,7 +244,7 @@ jobs:
   ####################################################################
   eunit-tests-modules:
     needs: canary
-    runs-on: [self-hosted, ubuntu]
+    runs-on: [self-hosted, ubuntu, amd64]
     strategy:
       max-parallel: 4
       matrix:
@@ -259,6 +259,7 @@ jobs:
             ar_deep_hash,
             ar_device_lock,
             ar_diff_dag,
+            ar_entropy_gen,
             ar_entropy_storage,
             ar_ets_intervals,
             ar_events,
@@ -281,6 +282,7 @@ jobs:
             ar_peers,
             ar_pricing,
             ar_repack,
+            ar_repack_fsm,
             ar_replica_2_9,
             ar_retarget,
             ar_serialize,
@@ -339,7 +341,7 @@ jobs:
   ####################################################################
   eunit-tests-suite:
     needs: canary
-    runs-on: [self-hosted, ubuntu]
+    runs-on: [self-hosted, ubuntu, amd64]
     strategy:
       max-parallel: 4
       matrix:

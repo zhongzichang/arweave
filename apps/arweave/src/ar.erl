@@ -371,7 +371,7 @@ show_help() ->
 				"flags are disallowed. See the node output for details."},
 			{"verify_samples (num)", io_lib:format("Number of chunks to sample and unpack "
 				"during 'verify'. Default is ~B.", [?SAMPLE_CHUNK_COUNT])},
-			{"shutdown_tcp_connection_timeout", io_lib:format("shutdown tcp connection timeout in seconds.",
+			{"shutdown_tcp_connection_timeout", io_lib:format("shutdown tcp connection timeout in seconds. "
 				"Default is ~Bs.", [?SHUTDOWN_TCP_CONNECTION_TIMEOUT])}
 		]
 	),
@@ -411,6 +411,8 @@ parse_cli_args(["verify", _ | _], C) ->
 	io:format("Invalid verify mode. Valid modes are 'purge' or 'log'.~n"),
 	timer:sleep(1000),
 	erlang:halt();
+parse_cli_args(["verify_samples", "all" | Rest], C) ->
+	parse_cli_args(Rest, C#config{ verify_samples = all });
 parse_cli_args(["verify_samples", N | Rest], C) ->
 	parse_cli_args(Rest, C#config{ verify_samples = list_to_integer(N) });
 parse_cli_args(["peer", Peer | Rest], C = #config{ peers = Ps }) ->

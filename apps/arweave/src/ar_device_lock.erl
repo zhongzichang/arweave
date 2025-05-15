@@ -90,7 +90,7 @@ set_device_lock_metric(StoreID, Mode, Status) ->
 		complete -> 2;
 		_ -> -2		
 	end,
-	StoreIDLabel = ar_storage_module:label_by_id(StoreID),
+	StoreIDLabel = ar_storage_module:label(StoreID),
 	prometheus_gauge:set(device_lock_status, [StoreIDLabel, Mode], StatusCode).
 
 %%%===================================================================
@@ -193,7 +193,7 @@ get_system_device(StorageModule) ->
 		_ -> Device
 	end.
 
-do_acquire_lock(Mode, "default", State) ->
+do_acquire_lock(Mode, ?DEFAULT_MODULE, State) ->
 	%% "default" storage module is a special case. It can only be in sync mode.
 	case Mode of
 		sync ->

@@ -44,11 +44,11 @@ register_read_workers() ->
 	{ok, Config} = application:get_env(arweave, config),
 	StoreIDs = [
 		ar_storage_module:id(StorageModule) || StorageModule <- Config#config.storage_modules
-	] ++ ["default"],
+	] ++ [?DEFAULT_MODULE],
 	{Workers, WorkerMap} = 
 		lists:foldl(
 			fun(StoreID, {AccWorkers, AccWorkerMap}) ->
-				Label = ar_storage_module:label_by_id(StoreID),
+				Label = ar_storage_module:label(StoreID),
 				Name = list_to_atom("ar_data_sync_worker_" ++ Label),
 
 				Worker = ?CHILD_WITH_ARGS(ar_data_sync_worker, worker, Name, [Name, read]),
@@ -318,5 +318,5 @@ test_register_workers() ->
 		fun(StoreID) ->
 			?assertEqual(true, ready_for_work(StoreID))
 		end,
-		StoreIDs ++ ["default"]
+		StoreIDs ++ [?DEFAULT_MODULE]
 	).

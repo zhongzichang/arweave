@@ -1,7 +1,8 @@
 -module(ar_replica_2_9).
 
--export([get_entropy_partition/1, get_entropy_key/3, get_sector_size/0, 
-    get_slice_index/1, get_partition_offset/1]).
+-export([get_entropy_partition/1, get_entropy_partition_range/1, get_entropy_key/3,
+    get_sector_size/0, get_slice_index/1, get_partition_offset/1, sub_chunks_per_entropy/0,
+    get_entropy_partition_size/0]).
 
 -include_lib("arweave/include/ar.hrl").
 -include_lib("arweave/include/ar_consensus.hrl").
@@ -66,7 +67,7 @@
            be enciphered with a sub-chunk when packing to the replica_2_9 format.
 
     entropy partition: contains all the entropies needed to encipher all the chunks in a
-                       recall partition. A recall partition is 3.6 TB (?PARTITION_SIZE),
+                       recall partition. A recall partition is 3.6 TB (ar_block:partition_size()),
                        but an entropy partition is slightly larger since enciphering a chunk
                        (256 KiB) requires slices from 32 different entropies (256 MiB).
                        Some of the entropies in a partition can be reused by neighboring
@@ -91,13 +92,64 @@
 
 %% @doc Return the 2.9 partition number the chunk with the given absolute end offset is
 %% mapped to. This partition number is a part of the 2.9 replication key. It is NOT
-%% the same as the ?PARTITION_SIZE (3.6 TB) recall partition.
+%% the same as the ar_block:partition_size() (3.6 TB) recall partition.
 -spec get_entropy_partition(
 		AbsoluteChunkEndOffset :: non_neg_integer()
 ) -> non_neg_integer().
 get_entropy_partition(AbsoluteChunkEndOffset) ->
     BucketStart = get_entropy_bucket_start(AbsoluteChunkEndOffset),
     ar_node:get_partition_number(BucketStart).
+
+get_entropy_partition_range(PartitionNumber) ->
+    %% The goal of this function is to return the minimum and maximum byte offsets that, when
+    %% fed to ar_replica_2_9:get_entropy_partition/1 will yield the provided PartitinNumber.
+    %% 
+    %% To do this we do a rough reversal of the steps taken by
+    %% ar_replica_2_9:get_entropy_partition/1:
+    %% 
+    %% get_entropy_partition(AbsoluteChunkEndOffset) ->
+    %%    BucketStart = get_entropy_bucket_start(AbsoluteChunkEndOffset),
+    %%    ar_node:get_partition_number(BucketStart).
+    %% 
+    %% I say "rough reverseal" because several of the steps are not reversible (e.g. 
+    %% ar_util:floor_int/2 discards data and so it not perfectly reversible). 
+    %% 
+    %% 1. Reverse ar_node:get_partition_number(BucketStart) to get the pick offsets
+    %%    representing the byte boundaries of the recall partition.
+    StartRecall = PartitionNumber * ar_block:partition_size(),
+    EndRecall = (PartitionNumber + 1) * ar_block:partition_size(),
+    %% 2. The next 3 steps reverse ar_replica_2_9:get_entropy_bucket_start/1 to yield the
+    %%    first and last bytes of the entropy partition.
+    %% 
+    %%    Get the first bucket boundary greater than the recall boundaries. This represents
+    %%    the bucket end offset of the bucket which contains the first/last byte of the
+    %%    recall partition. 
+    %% 
+    %%    Note: by passing 0 into get_padded_offset/2 we ignore the strict data split
+    %%    threshold and focus on just finding the nearest 256 KiB aligned boundary greater
+    %%    than the recall boundaries.
+    StartBucket1 = ar_poa:get_padded_offset(StartRecall, 0),
+    EndBucket1 = ar_poa:get_padded_offset(EndRecall, 0),
+    %% 3. ar_replica_2_9:get_entropy_partition/1 allocates this straddling bucket to the 
+    %%    previous partition. So the start of the entropy partition is the first byte which
+    %%    falls in the *next* bucket, and the end of the entropy partition is the last byte
+    %%    which falls in *this* bucket. To get those bytes we'll advance to the next bucket...
+    StartBucket2 = StartBucket1 + ?DATA_CHUNK_SIZE,
+    EndBucket2 = EndBucket1 + ?DATA_CHUNK_SIZE,
+    %% 4. ... and then get the first byte which falls in that bucket
+    StartByte1 = ar_chunk_storage:get_chunk_byte_from_bucket_end(StartBucket2) + 1,
+    EndByte1 = ar_chunk_storage:get_chunk_byte_from_bucket_end(EndBucket2),
+
+    %% 5. Handle the special case of partition 0. Since it has no preceding partition its
+    %%    byte start is 0.
+    StartByte2 = case PartitionNumber of
+        0 ->
+            0;
+        _ ->
+            StartByte1
+    end,
+
+    {StartByte2, EndByte1}.
 
 %% @doc Return the key used to generate the entropy for the 2.9 replication format.
 %% RewardAddr: The address of the miner that mined the chunk.
@@ -130,22 +182,32 @@ get_sector_size() ->
 ) -> non_neg_integer().
 get_slice_index(AbsoluteChunkEndOffset) ->
     PartitionRelativeOffset = get_partition_offset(AbsoluteChunkEndOffset),
-    SubChunksPerEntropy = ?REPLICA_2_9_ENTROPY_SIZE div ?COMPOSITE_PACKING_SUB_CHUNK_SIZE,
 	SectorSize = get_sector_size(),
-	(PartitionRelativeOffset div SectorSize) rem SubChunksPerEntropy.
+	(PartitionRelativeOffset div SectorSize) rem sub_chunks_per_entropy().
 
+%% @doc Return the number of sub-chunks per entropy. We'll generally create 32x entropies
+%% in order to fully encipher this many chunks.
+-spec sub_chunks_per_entropy() -> pos_integer().
+sub_chunks_per_entropy() ->
+	?REPLICA_2_9_ENTROPY_SIZE div ?COMPOSITE_PACKING_SUB_CHUNK_SIZE.
+
+%% @doc Return the size of the entropy partition.
+-spec get_entropy_partition_size() -> pos_integer().    
+get_entropy_partition_size() ->
+    ?REPLICA_2_9_ENTROPY_COUNT * ?REPLICA_2_9_ENTROPY_SIZE.
 
 %%%===================================================================
 %%% Private functions.
 %%%===================================================================
 
 %% @doc Return the start offset of the bucket containing the given chunk offset.
-%% A chunk bucket a 0-based, 256-KiB wide, 256-KiB aligned range that fully contains a chunk.
+%% A chunk bucket is a 0-based, 256-KiB wide, 256-KiB aligned range. A chunk belongs to
+%% the bucket that contains the first byte of the chunk.
 -spec get_entropy_bucket_start(non_neg_integer()) -> non_neg_integer().
 get_entropy_bucket_start(AbsoluteChunkEndOffset) ->
 	PaddedEndOffset = ar_block:get_chunk_padded_offset(AbsoluteChunkEndOffset),
 	PickOffset = max(0, PaddedEndOffset - ?DATA_CHUNK_SIZE),
-	BucketStart = PickOffset - PickOffset rem ?DATA_CHUNK_SIZE,
+	BucketStart = ar_util:floor_int(PickOffset, ?DATA_CHUNK_SIZE),
 
     true = BucketStart == ar_chunk_storage:get_chunk_bucket_start(PaddedEndOffset),
     
@@ -156,7 +218,7 @@ get_entropy_bucket_start(AbsoluteChunkEndOffset) ->
 get_partition_offset(AbsoluteChunkEndOffset) ->
     BucketStart = get_entropy_bucket_start(AbsoluteChunkEndOffset),
     Partition = get_entropy_partition(AbsoluteChunkEndOffset),
-    PartitionStart = Partition * ?PARTITION_SIZE,
+    PartitionStart = Partition * ar_block:partition_size(),
     BucketStart - PartitionStart.
 
 %% @doc Returns the index of the entropy containing the slice for specified chunk's sub-chunk. 
@@ -181,9 +243,6 @@ get_entropy_index(AbsoluteChunkEndOffset, SubChunkStartOffset) ->
     %% falls)
     SubChunkBucket = SubChunkStartOffset div ?COMPOSITE_PACKING_SUB_CHUNK_SIZE,
     ChunkBucket * ?COMPOSITE_PACKING_SUB_CHUNK_COUNT + SubChunkBucket.
-
-get_entropy_partition_size() ->
-    ?REPLICA_2_9_ENTROPY_COUNT * ?REPLICA_2_9_ENTROPY_SIZE.
 
 %%%===================================================================
 %%% Tests.
@@ -252,31 +311,85 @@ get_entropy_key_test() ->
             ar_util:encode(get_entropy_key(Addr, 262144 * 5 + 3 * SectorSize, 0))),
 
     %% Test the edges of recall partition vs. entropy partition.
-    ?assertEqual(0, get_entropy_partition(?PARTITION_SIZE)),    
+    ?assertEqual(0, get_entropy_partition(ar_block:partition_size())),    
     ?assertEqual(1, get_entropy_partition(EntropyPartitionSize)),
-    ?assertEqual(1, get_entropy_partition(2 * ?PARTITION_SIZE)),
-    ?assertEqual(2, get_entropy_partition(?PARTITION_SIZE + EntropyPartitionSize)),
-    ?assertEqual(2, get_entropy_partition(3 * ?PARTITION_SIZE)),
-    ?assertEqual(3, get_entropy_partition(2 * ?PARTITION_SIZE + EntropyPartitionSize)),
-    ?assertEqual(10, get_entropy_partition(11 * ?PARTITION_SIZE)),
-    ?assertEqual(11, get_entropy_partition(10 * ?PARTITION_SIZE + EntropyPartitionSize)),
+    ?assertEqual(1, get_entropy_partition(2 * ar_block:partition_size())),
+    ?assertEqual(2, get_entropy_partition(ar_block:partition_size() + EntropyPartitionSize)),
+    ?assertEqual(2, get_entropy_partition(3 * ar_block:partition_size())),
+    ?assertEqual(3, get_entropy_partition(2 * ar_block:partition_size() + EntropyPartitionSize)),
+    ?assertEqual(10, get_entropy_partition(11 * ar_block:partition_size())),
+    ?assertEqual(11, get_entropy_partition(10 * ar_block:partition_size() + EntropyPartitionSize)),
     %% This sub-chunk offset isn't used in practice, just adding a bounds check.
     ?assertMatch(
         {'EXIT', {{badmatch, false}, _}},  catch get_entropy_index(0, 32 * SubChunkSize)).
+
+get_entropy_partition_range_test_() ->
+    [
+        ar_test_node:test_with_mocked_functions([
+                {ar_block, partition_size, fun() -> 2_000_000 end},
+                {ar_block, strict_data_split_threshold, fun() -> 700_000 end}
+            ],
+            fun test_get_entropy_partition_range_after_strict/0, 30),
+        ar_test_node:test_with_mocked_functions([
+                {ar_block, partition_size, fun() -> 2_000_000 end},
+                {ar_block, strict_data_split_threshold, fun() -> 5_000_000 end}
+            ],
+            fun test_get_entropy_partition_range_before_strict/0, 30)
+    ].
+
+test_get_entropy_partition_range_after_strict() ->
+    Start0 = 0,
+    End0 = 2272864,
+    ?assertEqual(0, get_entropy_partition(Start0)),
+    ?assertEqual(0, get_entropy_partition(End0)),
+	?assertEqual({Start0, End0}, get_entropy_partition_range(0)),
+
+    Start1 = 2272865,
+    End1 = 4370016,
+    ?assertEqual(1, get_entropy_partition(Start1)),
+    ?assertEqual(1, get_entropy_partition(End1)),
+	?assertEqual({Start1, End1}, get_entropy_partition_range(1)),
+
+    Start2 = 4370017,
+    End2 = 6205024,
+    ?assertEqual(2, get_entropy_partition(Start2)),
+    ?assertEqual(2, get_entropy_partition(End2)),
+	?assertEqual({Start2, End2}, get_entropy_partition_range(2)),
+	ok.
+
+test_get_entropy_partition_range_before_strict() ->
+    Start0 = 0,
+    End0 = 2359295,
+    ?assertEqual(0, get_entropy_partition(Start0)),
+    ?assertEqual(0, get_entropy_partition(End0)),
+	?assertEqual({Start0, End0}, get_entropy_partition_range(0)),
+    
+    Start1 = 2359296,
+    End1 = 4456447,
+    ?assertEqual(1, get_entropy_partition(Start1)),
+    ?assertEqual(1, get_entropy_partition(End1)),
+	?assertEqual({Start1, End1}, get_entropy_partition_range(1)),
+    
+    Start2 = 4456448,
+    End2 = 6048576,
+    ?assertEqual(2, get_entropy_partition(Start2)),
+    ?assertEqual(2, get_entropy_partition(End2)),
+	?assertEqual({Start2, End2}, get_entropy_partition_range(2)),
+	ok.
+
 
 %% @doc Walk sequentially through all chunks in a couple partitions and verify their slice
 %% indices
 slice_index_walk_test() ->
     ?assertEqual(3 * 8192, ?REPLICA_2_9_ENTROPY_SIZE),
-    ?assertEqual(3 * 262144, ?STRICT_DATA_SPLIT_THRESHOLD),
+    ?assertEqual(3 * 262144, ar_block:strict_data_split_threshold()),
     ?assertEqual(3 * 262144, get_sector_size()),
     ?assertEqual(9 * 262144, get_entropy_partition_size()),
 
     %% Entropies per partition.
     ?assertEqual(96, ?REPLICA_2_9_ENTROPY_COUNT),
     %% Sub-chunks per entropy.
-    SubChunkCount = ?REPLICA_2_9_ENTROPY_SIZE div ?COMPOSITE_PACKING_SUB_CHUNK_SIZE,
-    ?assertEqual(3, SubChunkCount),
+    ?assertEqual(3, sub_chunks_per_entropy()),
 
     %% --------------------------------------------------------------------------
     %% Before the strict data split threshold:
@@ -366,10 +479,10 @@ slice_index_walk_test() ->
         16*262144+1, 17*262144-1, 17*262144
     ]),
 
-    ?assertEqual(SubChunkCount - 1,
-            get_slice_index(?PARTITION_SIZE)),
+    ?assertEqual(sub_chunks_per_entropy() - 1,
+            get_slice_index(ar_block:partition_size())),
     ?assertEqual(0,
-            get_slice_index(?PARTITION_SIZE + 1)),
+            get_slice_index(ar_block:partition_size() + 1)),
 
     ok.
 
@@ -384,11 +497,11 @@ assert_slice_index(ExpectedIndex, [AbsoluteChunkByteOffset | Rest]) ->
     assert_slice_index(ExpectedIndex, Rest).
 
 
-% @doc Walk through every sub-chunk of each chunk and verify its entropy index and
-% entropy sub-chunk index.
+%% @doc Walk through every sub-chunk of each chunk and verify its entropy index and
+%% entropy sub-chunk index.
 entropy_index_walk_test() ->
     ?assertEqual(3 * 8192, ?REPLICA_2_9_ENTROPY_SIZE),
-    ?assertEqual(3 * 262144, ?STRICT_DATA_SPLIT_THRESHOLD),
+    ?assertEqual(3 * 262144, ar_block:strict_data_split_threshold()),
     ?assertEqual(3 * 262144, get_sector_size()),
     ?assertEqual(96, ?REPLICA_2_9_ENTROPY_COUNT),
     ?assertEqual(9 * 262144, get_entropy_partition_size()),
