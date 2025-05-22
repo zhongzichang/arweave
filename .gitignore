@@ -15,6 +15,7 @@ lib
 bin/arweave-dev
 /result
 .rebar3
+rebar.lock
 apps/arweave/c_src/**/*.o
 apps/arweave/c_src/tests/tests
 data_test_*
