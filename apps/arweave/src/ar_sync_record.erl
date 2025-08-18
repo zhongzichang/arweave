@@ -116,7 +116,7 @@ add_async(Event, End, Start, ID, StoreID) ->
 add_async(Event, End, Start, Packing, ID, StoreID) ->
 	GenServerID = name(StoreID),
 	gen_server:cast(GenServerID, {add_async, Event, End, Start, Packing, ID}).
-	
+
 %% @doc Remove the given interval from the record
 %% with the given ID. Store the changes on disk before
 %% returning ok.
@@ -368,8 +368,13 @@ handle_call(Request, _From, State) ->
 
 handle_cast(store_state, State) ->
 	{_, State2} = store_state(State),
-	timer:apply_after(
-		?STORE_SYNC_RECORD_FREQUENCY_MS, gen_server, cast, [self(), store_state]),
+	{ok, _} = ar_timer:apply_after(
+		?STORE_SYNC_RECORD_FREQUENCY_MS,
+		gen_server,
+		cast,
+		[self(), store_state],
+		#{ skip_on_shutdown => false }
+	),
 	{noreply, State2};
 
 handle_cast({add_async, Event, End, Start, ID}, State) ->
@@ -590,7 +595,7 @@ replay_write_ahead_log(SyncRecordByID, SyncRecordByIDType, N, WAL, StateDB, Stor
 					emit_add_range(Start, End, ID, Module),
 					SyncRecordByID2 = maps:put(ID, SyncRecord2, SyncRecordByID),
 					replay_write_ahead_log(
-						SyncRecordByID2, SyncRecordByIDType, N + 1, 
+						SyncRecordByID2, SyncRecordByIDType, N + 1,
 						WAL, StateDB, StoreID, Module);
 				{add, Packing} ->
 					{End, Start, ID} = Params,

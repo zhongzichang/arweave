@@ -1,11 +1,12 @@
 -module(ar_vdf).
 
--export([compute/3, compute2/3, verify/8, verify2/8,
+-export([compute/3, compute_legacy/3, compute2/3, verify/8, verify2/8,
 		debug_sha_verify_no_reset/6, debug_sha_verify/8, debug_sha2/3,
 		step_number_to_salt_number/1, checkpoint_buffer_to_checkpoints/1]).
 
--include_lib("arweave/include/ar_vdf.hrl").
--include_lib("arweave/include/ar.hrl").
+-include("ar_vdf.hrl").
+-include("ar.hrl").
+-include("ar_config.hrl").
 
 step_number_to_salt_number(0) ->
 	0;
@@ -16,8 +17,33 @@ step_number_to_salt_number(StepNumber) ->
 compute(StartStepNumber, PrevOutput, IterationCount) ->
 	Salt = step_number_to_salt_number(StartStepNumber - 1),
 	SaltBinary = << Salt:256 >>,
-	ar_vdf_nif:vdf_sha2_nif(SaltBinary, PrevOutput, ?VDF_CHECKPOINT_COUNT_IN_STEP - 1, 0,
-			IterationCount).
+	{ok, Config} = application:get_env(arweave, config),
+	case Config#config.vdf of
+		openssl ->
+			ar_vdf_nif:vdf_sha2_nif(SaltBinary, PrevOutput, ?VDF_CHECKPOINT_COUNT_IN_STEP - 1, 0,
+					IterationCount);
+		fused ->
+			ar_vdf_nif:vdf_sha2_fused_nif(SaltBinary, PrevOutput, ?VDF_CHECKPOINT_COUNT_IN_STEP - 1, 0,
+					IterationCount);
+		hiopt_m4 ->
+			ar_vdf_nif:vdf_sha2_hiopt_nif(SaltBinary, PrevOutput, ?VDF_CHECKPOINT_COUNT_IN_STEP - 1, 0,
+					IterationCount);
+		_ ->
+			ar_vdf_nif:vdf_sha2_nif(SaltBinary, PrevOutput, ?VDF_CHECKPOINT_COUNT_IN_STEP - 1, 0,
+					IterationCount)
+	end.
+
+compute_legacy(StartStepNumber, PrevOutput, IterationCount) ->
+	Salt = step_number_to_salt_number(StartStepNumber - 1),
+	SaltBinary = << Salt:256 >>,
+	{ok, Output, CheckpointBuffer} = ar_vdf_nif:vdf_sha2_nif(
+			SaltBinary,
+			PrevOutput,
+			?VDF_CHECKPOINT_COUNT_IN_STEP - 1,
+			0,
+			IterationCount),
+	Checkpoints = [Output | checkpoint_buffer_to_checkpoints(CheckpointBuffer)],
+	{ok, Output, Checkpoints}.
 
 -ifdef(AR_TEST).
 %% Slow down VDF calculation on tests since it will complete too fast otherwise.

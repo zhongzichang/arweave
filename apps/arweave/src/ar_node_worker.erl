@@ -120,7 +120,7 @@ init([]) ->
 									?LOG_INFO([{event, failed_to_read_local_state},
 											{reason, io_lib:format("~p", [Error])}]),
 									timer:sleep(1000),
-									erlang:halt()
+									init:stop(1)
 							end
 					end
 			end;
@@ -192,7 +192,7 @@ block_index_not_found([]) ->
 			"via the trusted peers.~n"),
 	?LOG_INFO([{event, local_state_empty}]),
 	timer:sleep(1000),
-	erlang:halt();
+	init:stop(1);
 block_index_not_found(BI) ->
 	{Last, _, _} = hd(BI),
 	{First, _, _} = lists:last(BI),
@@ -201,7 +201,7 @@ block_index_not_found(BI) ->
 	?LOG_INFO([{event, local_state_missing_target},
 			{first, ar_util:encode(First)}, {last, ar_util:encode(Last)}]),
 	timer:sleep(1000),
-	erlang:halt().
+	init:stop(1).
 
 
 validate_trusted_peers(#config{ peers = [] }) ->
@@ -214,7 +214,7 @@ validate_trusted_peers(Config) ->
 			ar:console("The specified trusted peers are not valid.~n", []),
 			?LOG_INFO([{event, no_valid_trusted_peers}]),
 			timer:sleep(2000),
-			erlang:halt();
+			init:stop(1);
 		_ ->
 			application:set_env(arweave, config, Config#config{ peers = ValidPeers }),
 			case lists:member(time_syncing, Config#config.disable) of
@@ -279,10 +279,20 @@ validate_clock_sync(Peers) ->
 		end
 	end,
 	Responses = ar_util:pmap(ValidatePeerClock, [P || P <- Peers, not is_pid(P)]),
-	case lists:all(fun(R) -> R end, Responses) of
-		true ->
+	case checker(Responses) of
+		% If more valid nodes are present than invalid nodes, it should be
+		% good
+		{X, #{true := True, false := False}}
+			when X>0, True>False ->
+				ok;
+
+		% If all nodes are valid, then its good
+		{_, #{ true := _ }} ->
 			ok;
-		false ->
+
+		% Else there is a problem somewhere. Too many peers
+		% with clock issues will only cause problems.
+		_ ->
 			ar:console(
 				"~n\tInvalid peers. A valid peer must be part of the"
 				" network ~s and its clock must deviate from ours by no"
@@ -290,7 +300,7 @@ validate_clock_sync(Peers) ->
 			),
 			?LOG_INFO([{event, invalid_peer}]),
 			timer:sleep(1000),
-			erlang:halt()
+			init:stop(1)
 	end.
 
 log_peer_clock_diff(Peer, Delta) ->
@@ -822,6 +832,11 @@ maybe_rebase(#{ pending_rebase := {PrevH, H} } = State) ->
 							{prev_h, ar_util:encode(PrevH)},
 							{solution_h, ar_util:encode(SolutionH)},
 							{expected_new_height, PrevB#block.height + 1}]),
+					ar:console("Rebasing block ~s (solution ~s, previous block ~s, height ~B).",
+							[
+								ar_util:encode(H), ar_util:encode(SolutionH),
+								ar_util:encode(PrevH), PrevB#block.height + 1
+							]),
 					handle_found_solution(Args, PrevB, State, true)
 				end;
 		{B, {Status, Timestamp}} ->
@@ -1082,8 +1097,7 @@ may_be_get_double_signing_proof2(Iterator, RootHash, LockedRewards, Height) ->
 					false ->
 						false;
 					true ->
-						CDiff1 == CDiff2
-							orelse (CDiff1 > PrevCDiff2 andalso CDiff2 > PrevCDiff1)
+						ar_block:get_double_signing_condition(CDiff1, PrevCDiff1, CDiff2, PrevCDiff2)
 				end,
 			case ValidCDiffs of
 				false ->
@@ -1496,18 +1510,6 @@ apply_validated_block2(State, B, PrevBlocks, Orphans, RecentBI, BlockTXPairs) ->
 log_applied_block(B) ->
 	Partition1 = ar_node:get_partition_number(B#block.recall_byte),
 	Partition2 = ar_node:get_partition_number(B#block.recall_byte2),
-	case Partition1 of
-		undefined ->
-			ok;
-		_ ->
-			prometheus_gauge:inc(partition_count, [Partition1])
-	end,
-	case Partition2 of
-		undefined ->
-			ok;
-		_ ->
-			prometheus_gauge:inc(partition_count, [Partition2])
-	end,
 	NumChunks = case {Partition1, Partition2} of
 		{undefined, undefined} ->
 			0;
@@ -1930,7 +1932,6 @@ handle_found_solution(Args, PrevB, State, IsRebase) ->
 			nonce_limiter_info = PrevNonceLimiterInfo,
 			height = PrevHeight } = PrevB,
 	Height = PrevHeight + 1,
-
 	Now = os:system_time(second),
 	MaxDeviation = ar_block:get_max_timestamp_deviation(),
 	Timestamp =
@@ -2074,12 +2075,29 @@ handle_found_solution(Args, PrevB, State, IsRebase) ->
 						{false, rebase_threshold}
 				end
 		end,
-	%% Check steps and step checkpoints.
-	HaveSteps =
+
+	PrevCDiff = PrevB#block.cumulative_diff,
+	CDiff = ar_difficulty:next_cumulative_diff(PrevCDiff, Diff, Height),
+	NoDoubleSigning =
 		case CorrectRebaseThreshold of
 			{false, Reason5} ->
+				{false, Reason5};
+			true ->
+				case check_no_double_signing(CDiff, PrevCDiff, MiningAddress, Height) of
+					false ->
+						{false, double_signing};
+					true ->
+						true
+				end
+		end,
+
+	%% Check steps and step checkpoints.
+	HaveSteps =
+		case NoDoubleSigning of
+			{false, Reason6} ->
 				?LOG_WARNING([{event, ignore_mining_solution},
-					{reason, Reason5}, {solution, ar_util:encode(SolutionH)}]),
+						{reason, Reason6},
+						{solution, ar_util:encode(SolutionH)}]),
 				false;
 			true ->
 				ar_nonce_limiter:get_steps(PrevStepNumber, StepNumber, PrevNextSeed,
@@ -2143,8 +2161,6 @@ handle_found_solution(Args, PrevB, State, IsRebase) ->
 					Denomination2),
 			ScheduledPricePerGiBMinute2 = ar_pricing:redenominate(ScheduledPricePerGiBMinute,
 					Denomination, Denomination2),
-			CDiff = ar_difficulty:next_cumulative_diff(PrevB#block.cumulative_diff, Diff,
-					Height),
 			UnsignedB = pack_block_with_transactions(#block{
 				nonce = Nonce,
 				previous_block = PrevH,
@@ -2261,6 +2277,31 @@ assert_key_type(RewardKey, Height) ->
 			end
 	end.
 
+check_no_double_signing(CDiff, PrevCDiff, MiningAddress, Height) ->
+	Blocks = ar_block_cache:get_blocks_by_miner(block_cache, MiningAddress),
+	not lists:any(
+		fun(B) ->
+			case ar_block:get_double_signing_condition(
+					B#block.cumulative_diff,
+					B#block.previous_cumulative_diff,
+					CDiff,
+					PrevCDiff) of
+				true ->
+					?LOG_WARNING([{event, avoiding_double_signing},
+							{block, ar_util:encode(B#block.indep_hash)},
+							{height, B#block.height},
+							{new_height, Height},
+							{cdiff, B#block.cumulative_diff},
+							{prev_cdiff, B#block.previous_cumulative_diff},
+							{new_cdiff, CDiff},
+							{new_prev_cdiff, PrevCDiff}]),
+					true;
+				false ->
+					false
+			end
+		end,
+		Blocks).
+
 update_solution_cache(H, Args, State) ->
 	%% Maintain a cache of mining solutions for potential reuse in rebasing.
 	%%
@@ -2303,7 +2344,7 @@ may_be_report_double_signing(B, State) ->
 					previous_solution_hash = PrevSolutionH2,
 					reward_key = {_, Key},
 					signature = Signature2 } = CacheB,
-			case CDiff1 == CDiff2 orelse (CDiff1 > PrevCDiff2 andalso CDiff2 > PrevCDiff1) of
+			case ar_block:get_double_signing_condition(CDiff1, PrevCDiff1, CDiff2, PrevCDiff2) of
 				true ->
 					Preimage1 = << PrevSolutionH1/binary,
 							(ar_block:generate_signed_hash(B))/binary >>,
@@ -2334,3 +2375,30 @@ cache_double_signing_proof(Proof, State) ->
 			Map2 = maps:put(Addr, {os:system_time(second), Proof}, Map),
 			State#{ double_signing_proofs => Map2 }
 	end.
+
+%%--------------------------------------------------------------------
+%% @hidden
+%% @doc A simple list term checker. The idea is to get some information
+%% regarding the content of a list (e.g. number of same item).
+%% @end
+%%--------------------------------------------------------------------
+-spec checker(List) -> Return when
+	List :: [term()],
+	Return :: {Length, Counter},
+	Length :: pos_integer(),
+	Counter :: #{ term() => pos_integer() }.
+
+checker(List) ->
+	checker(List, length(List), #{}).
+
+checker([], Length, Buffer) ->
+	{Length, Buffer};
+checker([H|T], Length, Buffer) ->
+	V = maps:get(H, Buffer, 0),
+	checker(T, Length, Buffer#{ H => V+1 }).
+
+checker_test() ->
+	?assertEqual({0, #{}}, checker([])),
+	?assertEqual({3, #{ true => 3 }}, checker([true, true, true])),
+	?assertEqual({3, #{ true => 2, false => 1}}, checker([true, true, false])),
+	?assertEqual({3, #{ true => 1, false => 2}}, checker([true, false, false])).

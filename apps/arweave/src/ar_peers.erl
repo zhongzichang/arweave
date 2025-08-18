@@ -385,11 +385,17 @@ init([]) ->
 			load_peers(),
 			gen_server:cast(?MODULE, rank_peers),
 			gen_server:cast(?MODULE, ping_peers),
-			timer:apply_interval(?GET_MORE_PEERS_FREQUENCY_MS, ?MODULE, discover_peers, []);
+			_ = ar_timer:apply_interval(
+				?GET_MORE_PEERS_FREQUENCY_MS,
+				?MODULE,
+				discover_peers,
+				[],
+				#{ skip_on_shutdown => true }
+			);
 		_ ->
 			ok
 	end,
-	
+
 	{ok, #state{}}.
 
 handle_call(Request, _From, State) ->
@@ -467,8 +473,9 @@ handle_info(Message, State) ->
 	?LOG_WARNING([{event, unhandled_info}, {module, ?MODULE}, {message, Message}]),
 	{noreply, State}.
 
-terminate(_Reason, _State) ->
-	store_peers().
+terminate(Reason, _State) ->
+	store_peers(),
+	?LOG_INFO([{module, ?MODULE},{pid, self()},{callback, terminate},{reason, Reason}]).
 
 %%%===================================================================
 %%% Private functions.
@@ -792,7 +799,7 @@ check_peer(Peer, IsPeerScopeValid) ->
 update_rating(Peer, IsSuccess) ->
 	update_rating(Peer, undefined, undefined, 1, IsSuccess).
 update_rating(Peer, LatencyMilliseconds, DataSize, Concurrency, false)
-  		when LatencyMilliseconds =/= undefined; DataSize =/= undefined ->
+		when LatencyMilliseconds =/= undefined; DataSize =/= undefined ->
 	%% Don't credit peers for failed requests.
 	update_rating(Peer, undefined, undefined, Concurrency, false);
 update_rating(Peer, 0, _DataSize, Concurrency, IsSuccess) ->

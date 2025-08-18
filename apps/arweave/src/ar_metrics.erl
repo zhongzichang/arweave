@@ -289,9 +289,10 @@ register() ->
 	]),
 	prometheus_gauge:new([
 		{name, mining_server_chunk_cache_size},
-		{labels, [partition]},
-		{help, "The number of chunks (measured in 8192-byte sub-chunks) "
-			"fetched during mining and not processed yet."}
+		{labels, [partition, type]},
+		{help, "The amount of data (measured in bytes) "
+			"fetched during mining and not processed yet. "
+		  "The type label can be 'total', 'reserved'."}
 	]),
 	prometheus_gauge:new([
 		{name, mining_server_task_queue_len},
@@ -401,12 +402,6 @@ register() ->
 		{help, "A count of the number of 1-chunk and 2-chunk blocks in the last 21,600 blocks. "
 				"The 'chunks' label is 1 for the count of 1-chunk blocks, and 2 for the count of "
 				"2-chunk blocks."}
-	]),
-	prometheus_gauge:new([
-		{name, partition_count},
-		{labels, [partition]},
-		{help, "A count of how often each partition is used in a block proof-of-access proof. "
-				"The 'partition' label is the partition number."}
 	]),
 	prometheus_gauge:new([
 		{name, log_diff},

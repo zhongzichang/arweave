@@ -746,8 +746,9 @@ handle_info(Message, State) ->
 	?LOG_WARNING([{event, unhandled_info}, {module, ?MODULE}, {message, Message}]),
 	{noreply, State}.
 
-terminate(_Reason, #state{ worker = W }) ->
+terminate(Reason, #state{ worker = W }) ->
 	W ! stop,
+	?LOG_INFO([{module, ?MODULE},{pid, self()},{callback, terminate},{reason, Reason}]),
 	ok.
 
 %%%===================================================================
@@ -903,7 +904,7 @@ apply_chain(#nonce_limiter_info{ global_step_number = StepNumber },
 			" to apply quickly; step number: ~B, previous step number: ~B.",
 			[StepNumber, PrevStepNumber]),
 	timer:sleep(1000),
-	erlang:halt();
+	init:stop(1);
 %% @doc Apply the pre-validated / trusted nonce_limiter_info. Since the info is trusted
 %% we don't validate it here.
 apply_chain(Info, PrevInfo) ->
@@ -983,7 +984,7 @@ compute(StepNumber, PrevOutput, VDFDifficulty) ->
 	debug_double_check(
 		"compute",
 		{ok, Output, Checkpoints},
-		fun ar_vdf:debug_sha2/3,
+		fun ar_vdf:compute_legacy/3,
 		[StepNumber, PrevOutput, VDFDifficulty]).
 
 verify(StartStepNumber, PrevOutput, NumCheckpointsBetweenHashes, Hashes, ResetStepNumber,
@@ -1462,8 +1463,9 @@ test_reorg_after_join() ->
 	ar_test_node:connect_to_peer(peer1),
 	ar_test_node:mine(),
 	ar_test_node:assert_wait_until_height(peer1, 1),
-	ar_test_node:join_on(#{ node => main, join_on => peer1 }),
+	ar_test_node:disconnect_from(peer1),
 	ar_test_node:start_peer(peer1, B0),
+	ar_test_node:join_on(#{ node => main, join_on => peer1 }),
 	ar_test_node:mine(peer1),
 	ar_test_node:assert_wait_until_height(peer1, 1),
 	ar_test_node:mine(peer1),

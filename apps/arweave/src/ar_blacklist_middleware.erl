@@ -24,7 +24,7 @@ execute(Req, Env) ->
 					{ok, Req, Env};
 				false ->
 					case increment_ip_addr(IPAddr, Req) of
-						block -> {stop, blacklisted(Req)};
+						{block, Limit} -> {stop, blacklisted(Limit, Req)};
 						pass -> {ok, Req, Env}
 					end
 			end
@@ -35,13 +35,13 @@ start_link() ->
 
 start() ->
 	?LOG_INFO([{start, ?MODULE}, {pid, self()}]),
-	{ok, _} =
-		timer:apply_after(
-			?BAN_CLEANUP_INTERVAL,
-			?MODULE,
-			cleanup_ban,
-			[ets:whereis(?MODULE)]
-		).
+	{ok, _} = ar_timer:apply_after(
+		?BAN_CLEANUP_INTERVAL,
+		?MODULE,
+		cleanup_ban,
+		[ets:whereis(?MODULE)],
+		#{ skip_on_shutdown => false }
+	).
 
 %% Ban a peer completely for TTLSeconds seoncds. Since we cannot trust the port,
 %% we ban the whole IP address.
@@ -71,22 +71,26 @@ cleanup_ban(TableID) ->
 			RemoveKeys = ets:foldl(Folder, [], ?MODULE),
 			Delete = fun(Key) -> ets:delete(?MODULE, Key) end,
 			lists:foreach(Delete, RemoveKeys),
-			{ok, _} =
-				timer:apply_after(
-					?BAN_CLEANUP_INTERVAL,
-					?MODULE,
-					cleanup_ban,
-					[TableID]
-				);
+			_ = ar_timer:apply_after(
+				?BAN_CLEANUP_INTERVAL,
+				?MODULE,
+				cleanup_ban,
+				[TableID],
+				#{ skip_on_shutdown => true }
+			);
 		_ ->
 			table_owner_died
 	end.
 
 %private functions
-blacklisted(Req) ->
+blacklisted(Limit, Req) ->
 	cowboy_req:reply(
 		429,
-		#{<<"connection">> => <<"close">>},
+		#{
+			<<"connection">> => <<"close">>,
+			<<"retry-after">> => integer_to_binary(?THROTTLE_PERIOD div 1000),
+			<<"x-rate-limit-limit">> => integer_to_binary(Limit)
+		},
 		<<"Too Many Requests">>,
 		Req
 	).
@@ -104,13 +108,13 @@ reset_rate_limit(TableID, IPAddr, Path) ->
 	end.
 
 increment_ip_addr(IPAddr, Req) ->
-	case ets:whereis(?MODULE) of 
+	case ets:whereis(?MODULE) of
 		undefined -> pass;
 		_ -> update_ip_addr(IPAddr, Req, 1)
 	end.
 
 decrement_ip_addr(IPAddr, Req) ->
-	case ets:whereis(?MODULE) of 
+	case ets:whereis(?MODULE) of
 		undefined -> pass;
 		_ -> update_ip_addr(IPAddr, Req, -1)
 	end.
@@ -122,17 +126,18 @@ update_ip_addr(IPAddr, Req, Delta) ->
 	Key = {rate_limit, IPAddr, PathKey},
 	case ets:update_counter(?MODULE, Key, {2, Delta}, {Key, 0}) of
 		1 ->
-			timer:apply_after(
+			_ = ar_timer:apply_after(
 				?THROTTLE_PERIOD,
 				?MODULE,
 				reset_rate_limit,
-				[ets:whereis(?MODULE), IPAddr, PathKey]
+				[ets:whereis(?MODULE), IPAddr, PathKey],
+				#{ skip_on_shutdown => true }
 			),
 			pass;
 		Count when Count =< RequestLimit ->
 			pass;
 		_ ->
-			block
+			{block, Limit}
 	end.
 
 requesting_ip_addr(Req) ->

@@ -727,8 +727,14 @@ init({?DEFAULT_MODULE = StoreID, _}) ->
 	State = init_kv(StoreID),
 	move_disk_pool_index(State),
 	move_data_root_index(State),
-	timer:apply_interval(?RECORD_DISK_POOL_CHUNKS_COUNT_FREQUENCY_MS, ar_data_sync,
-			record_disk_pool_chunks_count, []),
+	{ok, _} = ar_timer:apply_interval(
+		?RECORD_DISK_POOL_CHUNKS_COUNT_FREQUENCY_MS,
+		ar_data_sync,
+		record_disk_pool_chunks_count,
+		[],
+		#{ skip_on_shutdown => false }
+	),
+
 	StateMap = read_data_sync_state(),
 	CurrentBI = maps:get(block_index, StateMap),
 	%% Maintain a map of pending, recently uploaded, and orphaned data roots.
@@ -761,8 +767,13 @@ init({?DEFAULT_MODULE = StoreID, _}) ->
 	?LOG_INFO([{event, ar_data_sync_start}, {store_id, StoreID},
 		{range_start, State2#sync_data_state.range_start},
 		{range_end, State2#sync_data_state.range_end}]),
-	timer:apply_interval(?REMOVE_EXPIRED_DATA_ROOTS_FREQUENCY_MS, ?MODULE,
-			remove_expired_disk_pool_data_roots, []),
+	{ok, _} = ar_timer:apply_interval(
+		?REMOVE_EXPIRED_DATA_ROOTS_FREQUENCY_MS,
+		?MODULE,
+		remove_expired_disk_pool_data_roots,
+		[],
+		#{ skip_on_shutdown => false }
+	),
 	lists:foreach(
 		fun(_DiskPoolJobNumber) ->
 			gen_server:cast(self(), process_disk_pool_item)
@@ -785,7 +796,13 @@ init({?DEFAULT_MODULE = StoreID, _}) ->
 	ar:console("~nSetting the data chunk cache size limit to ~B chunks.~n", [Limit]),
 	ets:insert(ar_data_sync_state, {chunk_cache_size_limit, Limit}),
 	ets:insert(ar_data_sync_state, {chunk_cache_size, 0}),
-	timer:apply_interval(200, ?MODULE, record_chunk_cache_size_metric, []),
+	{ok, _} = ar_timer:apply_interval(
+		200,
+		?MODULE,
+		record_chunk_cache_size_metric,
+		[],
+		#{ skip_on_shutdown => false }
+	),
 	gen_server:cast(self(), process_store_chunk_queue),
 	{ok, State2};
 init({StoreID, RepackInPlacePacking}) ->
@@ -793,7 +810,7 @@ init({StoreID, RepackInPlacePacking}) ->
 	%% Trap exit to avoid corrupting any open files on quit..
 	process_flag(trap_exit, true),
 	[ok, ok] = ar_events:subscribe([node_state, disksup]),
-	
+
 	State = init_kv(StoreID),
 
 	{RangeStart, RangeEnd} = ar_storage_module:get_range(StoreID),
@@ -843,7 +860,7 @@ handle_cast({join, RecentBI}, State) ->
 					"in the most recent blocks. If you have just started a new weave using "
 					"the init option, restart from the local state "
 					"or specify some peers.~n~n"),
-			erlang:halt();
+			init:stop(1);
 		{_, {_H, Offset, _TXRoot}} ->
 			PreviousWeaveSize = element(2, hd(CurrentBI)),
 			{ok, OrphanedDataRoots} = remove_orphaned_data(State, Offset, PreviousWeaveSize),
@@ -882,7 +899,7 @@ handle_cast({cut, Start}, #sync_data_state{ store_id = StoreID,
 							"`enable remove_orphaned_storage_module_data`.~n",
 							[StoreID, Start]),
 					timer:sleep(2000),
-					erlang:halt();
+					init:stop(1);
 				true ->
 					ok = delete_chunk_metadata_range(Start, End, State),
 					ok = ar_chunk_storage:cut(Start, StoreID),
@@ -976,7 +993,7 @@ handle_cast({collect_peer_intervals, Start, End}, State) when Start >= End ->
 	%% We've finished collecting intervals for the whole storage_module range. Schedule
 	%% the collection process to restart in ?COLLECT_SYNC_INTERVALS_FREQUENCY_MS.
 	?LOG_DEBUG([{event, collect_peer_intervals_done},
-		{function, collect_peer_intervals}, 
+		{function, collect_peer_intervals},
 		{store_id, State#sync_data_state.store_id},
 		{s, Start}, {e, End}]),
 	ar_util:cast_after(?COLLECT_SYNC_INTERVALS_FREQUENCY_MS, self(), collect_peer_intervals),
@@ -1067,7 +1084,9 @@ handle_cast({collect_peer_intervals, Start, End}, State) ->
 					%% All checks have passed, find and enqueue intervals for one
 					%% sync bucket worth of chunks starting at offset Start
 					?LOG_DEBUG([{event, fetch_peer_intervals},
-							{function, collect_peer_intervals}, {s, Start}, {e, End2}]),
+							{function, collect_peer_intervals},
+							{store_id, StoreID},
+							{s, Start}, {e, End2}]),
 					ar_peer_intervals:fetch(Start, End2, StoreID)
 			end
 	end,
@@ -1527,9 +1546,9 @@ handle_info(Message,  #sync_data_state{ store_id = StoreID } = State) ->
 	{noreply, State}.
 
 terminate(Reason, #sync_data_state{ store_id = StoreID } = State) ->
+	store_sync_state(State),
 	?LOG_INFO([{event, terminate}, {store_id, StoreID},
 			{reason, io_lib:format("~p", [Reason])}]),
-	store_sync_state(State),
 	ok.
 
 %%%===================================================================
@@ -2024,7 +2043,7 @@ validate_fetched_chunk(Args) ->
 		false ->
 			case ar_block_index:get_block_bounds(Offset - 1) of
 				{BlockStart, BlockEnd, TXRoot} ->
-					
+
 					ChunkOffset = Offset - BlockStart - 1,
 					case validate_proof2(TXRoot, TXPath, DataPath, BlockStart, BlockEnd,
 							ChunkOffset, ChunkSize, RequestOrigin) of

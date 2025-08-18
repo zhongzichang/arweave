@@ -36,9 +36,17 @@ unblock_peer_connections() ->
 	ets:delete(?MODULE, block_peer_connections),
 	ok.
 
-req(#{ peer := {_, _} } = Args) ->
+req(Args) ->
+	case ar_shutdown_manager:state() of
+		running ->
+			req2(Args);
+		shutdown ->
+			{error, shutdown}
+	end.
+
+req2(#{ peer := {_, _} } = Args) ->
 	req(Args, false);
-req(#{ peer := Peer } = Args) ->
+req2(#{ peer := Peer } = Args) ->
 	{ok, Config} = application:get_env(arweave, config),
 	case Config#config.port == element(5, Peer) of
 		true ->
@@ -189,6 +197,10 @@ handle_info({gun_error, PID, Reason},
 			{noreply, State#state{ status_by_pid = StatusByPID2, pid_by_peer = PIDByPeer2 }}
 	end;
 
+% missing pattern from gun 2.2+
+handle_info({gun_down, Pid, Protocol, Reason, Streams}, State) ->
+	handle_info({gun_down, Pid, Protocol, Reason, [], Streams}, State);
+
 handle_info({gun_down, PID, Protocol, Reason, _KilledStreams, _UnprocessedStreams},
 			#state{ pid_by_peer = PIDByPeer, status_by_pid = StatusByPID } = State) ->
 	case maps:get(PID, StatusByPID, not_found) of
@@ -241,8 +253,8 @@ handle_info(Message, State) ->
 	{noreply, State}.
 
 terminate(Reason, #state{ status_by_pid = StatusByPID }) ->
-	?LOG_INFO([{event, http_client_terminating}, {reason, io_lib:format("~p", [Reason])}]),
 	maps:map(fun(PID, _Status) -> gun:shutdown(PID) end, StatusByPID),
+	?LOG_INFO([{event, http_client_terminating}, {reason, io_lib:format("~p", [Reason])}]),
 	ok.
 
 %%% ==================================================================
@@ -250,11 +262,31 @@ terminate(Reason, #state{ status_by_pid = StatusByPID }) ->
 %%% ==================================================================
 
 open_connection(#{ peer := Peer } = Args) ->
+	{ok, Config} = application:get_env(arweave, config),
 	{IPOrHost, Port} = get_ip_port(Peer),
 	ConnectTimeout = maps:get(connect_timeout, Args,
 			maps:get(timeout, Args, ?HTTP_REQUEST_CONNECT_TIMEOUT)),
-	gun:open(IPOrHost, Port, #{ http_opts => #{ keepalive => 60000 },
-			retry => 0, connect_timeout => ConnectTimeout }).
+	GunOpts = #{
+		retry => 0,
+		connect_timeout => ConnectTimeout,
+		http_opts => #{
+			closing_timeout => Config#config.'http_client.http.closing_timeout',
+			keepalive => Config#config.'http_client.http.keepalive'
+		},
+		tcp_opts => [
+			{delay_send, Config#config.'http_client.tcp.delay_send'},
+			{keepalive, Config#config.'http_client.tcp.keepalive'},
+			{linger, {
+					Config#config.'http_client.tcp.linger',
+					Config#config.'http_client.tcp.linger_timeout'
+				}
+			},
+			{nodelay, Config#config.'http_client.tcp.nodelay'},
+			{send_timeout_close, Config#config.'http_client.tcp.send_timeout_close'},
+			{send_timeout, Config#config.'http_client.tcp.send_timeout'}
+		]
+	},
+	gun:open(IPOrHost, Port, GunOpts).
 
 get_ip_port({_, _} = Peer) ->
 	Peer;

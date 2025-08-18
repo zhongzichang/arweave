@@ -55,16 +55,10 @@ get_bucket_peers(Bucket) ->
 
 get_bucket_peers(Bucket, Cursor, Peers) ->
 	case ets:next(?MODULE, Cursor) of
-		'$end_of_table' ->
-			UniquePeers = sets:to_list(sets:from_list(Peers)),
-			PickedPeers = pick_peers(UniquePeers, ?QUERY_BEST_PEERS_COUNT),
-			PickedPeers;
 		{Bucket, _Share, Peer} = Key ->
 			get_bucket_peers(Bucket, Key, [Peer | Peers]);
-		_ ->
-			UniquePeers = sets:to_list(sets:from_list(Peers)),
-			PickedPeers = pick_peers(UniquePeers, ?QUERY_BEST_PEERS_COUNT),
-			PickedPeers
+		_ -> % matches `end_of_table` or an unexpected value
+			ar_util:unique(Peers)
 	end.
 
 %% @doc Return a list of peers where 80% of the peers are randomly chosen
@@ -78,8 +72,13 @@ pick_peers(Peers, N) ->
 %%%===================================================================
 
 init([]) ->
-	{ok, _} = timer:apply_interval(
-		?DATA_DISCOVERY_COLLECT_PEERS_FREQUENCY_MS, ?MODULE, collect_peers, []),
+	{ok, _} = ar_timer:apply_interval(
+		?DATA_DISCOVERY_COLLECT_PEERS_FREQUENCY_MS,
+		?MODULE,
+		collect_peers,
+		[],
+		#{ skip_on_shutdown => false }
+	),
 	gen_server:cast(?MODULE, update_network_data_map),
 	ok = ar_events:subscribe(peer),
 	{ok, #state{
@@ -175,7 +174,8 @@ handle_info(Message, State) ->
 	?LOG_WARNING([{event, unhandled_info}, {module, ?MODULE}, {message, Message}]),
 	{noreply, State}.
 
-terminate(_Reason, _State) ->
+terminate(Reason, _State) ->
+	?LOG_INFO([{module, ?MODULE},{pid, self()},{callback, terminate},{reason, Reason}]),
 	ok.
 
 %%%===================================================================

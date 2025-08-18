@@ -39,8 +39,10 @@
 
 -ifdef(AR_TEST).
 -define(POST_2_8_COMPOSITE_PACKING_DELAY_BLOCKS, 0).
+-define(MINIMUM_CACHE_LIMIT_BYTES, 100 * ?MiB).
 -else.
 -define(POST_2_8_COMPOSITE_PACKING_DELAY_BLOCKS, 10).
+-define(MINIMUM_CACHE_LIMIT_BYTES, 1).
 -endif.
 
 -define(FETCH_POA_FROM_PEERS_TIMEOUT_MS, 10000).
@@ -331,7 +333,8 @@ handle_info(Message, State) ->
 	?LOG_WARNING([{event, unhandled_info}, {module, ?MODULE}, {message, Message}]),
 	{noreply, State}.
 
-terminate(_Reason, _State) ->
+terminate(Reason, _State) ->
+	?LOG_INFO([{module, ?MODULE},{pid, self()},{callback, terminate},{reason, Reason}]),
 	ok.
 
 %%%===================================================================
@@ -462,7 +465,7 @@ calculate_cache_limits(NumActivePartitions, PackingDifficulty) ->
 	RecallRangeSize = ar_block:get_recall_range_size(PackingDifficulty),
 
 	MinimumCacheLimitBytes = max(
-		1,
+		?MINIMUM_CACHE_LIMIT_BYTES,
 		(IdealStepsPerPartition * IdealRangesPerStep * RecallRangeSize * NumActivePartitions)
 	),
 
@@ -505,11 +508,11 @@ maybe_update_cache_limits(Limits, State) ->
 
 	ar:console(
 		"~nSetting the mining chunk cache size limit to ~B MiB "
-		"(~B sub-chunks per partition).~n",
+		"(~B MiB per partition).~n",
 			[OverallCacheLimitBytes div ?MiB, PartitionCacheLimitBytes div ?MiB]),
 	?LOG_INFO([{event, update_mining_cache_limits},
 		{overall_limit_mb, OverallCacheLimitBytes div ?MiB},
-		{per_partition_sub_chunks, PartitionCacheLimitBytes div ?MiB},
+		{per_partition_limit_mb, PartitionCacheLimitBytes div ?MiB},
 		{vdf_queue_limit_steps, VDFQueueLimit}]),
 		case OverallCacheLimitBytes < MinimumCacheLimitBytes of
 		true ->
@@ -1020,7 +1023,8 @@ may_be_empty_poa(#poa{} = PoA) ->
 fetch_poa_from_peers(_RecallByte, PackingDifficulty) when PackingDifficulty >= 1 ->
 	not_found;
 fetch_poa_from_peers(RecallByte, _PackingDifficulty) ->
-	Peers = ar_data_discovery:get_bucket_peers(RecallByte div ?NETWORK_DATA_BUCKET_SIZE),
+	BucketPeers = ar_data_discovery:get_bucket_peers(RecallByte div ?NETWORK_DATA_BUCKET_SIZE),
+	Peers = ar_data_discovery:pick_peers(BucketPeers, ?QUERY_BEST_PEERS_COUNT),
 	From = self(),
 	lists:foreach(
 		fun(Peer) ->
@@ -1328,52 +1332,52 @@ test_calculate_cache_limits_default() ->
 		mining_cache_size_mb = undefined
 	}),
 	?assertEqual(
-		{4 * ?MiB, 4 * ?MiB, 4 * ?MiB, 4, 16_000},
-		calculate_cache_limits(1, 0)
+		{400 * ?MiB, 400 * ?MiB, 4 * ?MiB, 4, 16_000},
+		calculate_cache_limits(100, 0)
 	),
 	?assertEqual(
-		{8 * ?MiB, 8 * ?MiB, 4 * ?MiB, 4, 16_000},
-		calculate_cache_limits(2, 0)
+		{800 * ?MiB, 800 * ?MiB, 4 * ?MiB, 4, 16_000},
+		calculate_cache_limits(200, 0)
 	),
 	?assertEqual(
 		{4_000 * ?MiB, 4_000 * ?MiB, 4 * ?MiB, 4, 16_000},
 		calculate_cache_limits(1000, 0)
 	),
 	?assertEqual(
-		{1 * ?MiB, 1 * ?MiB, 1 * ?MiB, 4, 16_000},
-		calculate_cache_limits(1, 1)
+		{100 * ?MiB, 100 * ?MiB, 1 * ?MiB, 4, 16_000},
+		calculate_cache_limits(100, 1)
 	),
 	?assertEqual(
-		{2 * ?MiB, 2 * ?MiB, 1 * ?MiB, 4, 16_000},
-		calculate_cache_limits(2, 1)
+		{200 * ?MiB, 200 * ?MiB, 1 * ?MiB, 4, 16_000},
+		calculate_cache_limits(200, 1)
 	),
 	?assertEqual(
 		{1_000 * ?MiB, 1_000 * ?MiB, 1 * ?MiB, 4, 16_000},
 		calculate_cache_limits(1000, 1)
 	),
 	?assertEqual(
-		{512 * ?KiB, 512 * ?KiB, 512 * ?KiB, 4, 16_000},
-		calculate_cache_limits(1, 2)
+		{100 * ?MiB, 100 * ?MiB, 512 * ?KiB, 4, 16_000},
+		calculate_cache_limits(200, 2)
 	),
 	?assertEqual(
-		{1 * ?MiB, 1 * ?MiB, 512 * ?KiB, 4, 16_000},
-		calculate_cache_limits(2, 2)
+		{200 * ?MiB, 200 * ?MiB, 512 * ?KiB, 4, 16_000},
+		calculate_cache_limits(400, 2)
 	),
 	?assertEqual(
 		{500 * ?MiB, 500 * ?MiB, 512 * ?KiB, 4, 16_000},
 		calculate_cache_limits(1000, 2)
 	),
 	?assertEqual(
-		{32 * ?KiB, 32 * ?KiB, 32 * ?KiB, 4, 16_000},
-		calculate_cache_limits(1, 32)
+		{200 * ?MiB, 200 * ?MiB, 32 * ?KiB, 4, 16_000},
+		calculate_cache_limits(6_400, 32)
 	),
 	?assertEqual(
-		{64 * ?KiB, 64 * ?KiB, 32 * ?KiB, 4, 16_000},
-		calculate_cache_limits(2, 32)
+		{400 * ?MiB, 400 * ?MiB, 32 * ?KiB, 4, 16_000},
+		calculate_cache_limits(12_800, 32)
 	),
 	?assertEqual(
-		{32_000 * ?KiB, 32_000 * ?KiB, 32 * ?KiB, 4, 16_000},
-		calculate_cache_limits(1000, 32)
+		{625 * ?MiB, 625 * ?MiB, 32 * ?KiB, 4, 16_000},
+		calculate_cache_limits(20_000, 32)
 	).
 
 test_calculate_cache_limits_custom_low() ->
@@ -1382,11 +1386,11 @@ test_calculate_cache_limits_custom_low() ->
 		mining_cache_size_mb = 1
 	}),
 	?assertEqual(
-		{4 * ?MiB, 1 * ?MiB, 1 * ?MiB, 1, 4_000},
+		{?MINIMUM_CACHE_LIMIT_BYTES, 1 * ?MiB, 1 * ?MiB, 1, 4_000},
 		calculate_cache_limits(1, 0)
 	),
 	?assertEqual(
-		{8 * ?MiB, 1 * ?MiB, 512 * ?KiB, 1, 4_000},
+		{?MINIMUM_CACHE_LIMIT_BYTES, 1 * ?MiB, 512 * ?KiB, 1, 4_000},
 		calculate_cache_limits(2, 0)
 	),
 	?assertEqual(
@@ -1394,11 +1398,11 @@ test_calculate_cache_limits_custom_low() ->
 		calculate_cache_limits(1000, 0)
 	),
 	?assertEqual(
-		{1 * ?MiB, 1 * ?MiB, 1 * ?MiB, 4, 16_000},
+		{?MINIMUM_CACHE_LIMIT_BYTES, 1 * ?MiB, 1 * ?MiB, 4, 16_000},
 		calculate_cache_limits(1, 1)
 	),
 	?assertEqual(
-		{2 * ?MiB, 1 * ?MiB, 512 * ?KiB, 2, 8_000},
+		{?MINIMUM_CACHE_LIMIT_BYTES, 1 * ?MiB, 512 * ?KiB, 2, 8_000},
 		calculate_cache_limits(2, 1)
 	),
 	?assertEqual(
@@ -1406,11 +1410,11 @@ test_calculate_cache_limits_custom_low() ->
 		calculate_cache_limits(1000, 1)
 	),
 	?assertEqual(
-		{512 * ?KiB, 1 * ?MiB, 1 * ?MiB, 8, 32_000},
+		{?MINIMUM_CACHE_LIMIT_BYTES, 1 * ?MiB, 1 * ?MiB, 8, 32_000},
 		calculate_cache_limits(1, 2)
 	),
 	?assertEqual(
-		{1 * ?MiB, 1 * ?MiB, 512 * ?KiB, 4, 16_000},
+		{?MINIMUM_CACHE_LIMIT_BYTES, 1 * ?MiB, 512 * ?KiB, 4, 16_000},
 		calculate_cache_limits(2, 2)
 	),
 	?assertEqual(
@@ -1418,16 +1422,16 @@ test_calculate_cache_limits_custom_low() ->
 		calculate_cache_limits(1000, 2)
 	),
 	?assertEqual(
-		{32 * ?KiB, 1 * ?MiB, 1 * ?MiB, 128, 512_000},
+		{?MINIMUM_CACHE_LIMIT_BYTES, 1 * ?MiB, 1 * ?MiB, 128, 512_000},
 		calculate_cache_limits(1, 32)
 	),
 	?assertEqual(
-		{64 * ?KiB, 1 * ?MiB, 512 * ?KiB, 64, 256_000},
+		{?MINIMUM_CACHE_LIMIT_BYTES, 1 * ?MiB, 512 * ?KiB, 64, 256_000},
 		calculate_cache_limits(2, 32)
 	),
 	?assertEqual(
-		{32_000 * ?KiB, 1 * ?MiB, (1 * ?MiB) div 1_000, 1, 4_000},
-		calculate_cache_limits(1000, 32)
+		{2_000 * ?MiB, 1 * ?MiB, (1 * ?MiB) div 64_000, 1, 4_000},
+		calculate_cache_limits(64_000, 32)
 	).
 
 test_calculate_cache_limits_custom_high() ->
@@ -1436,11 +1440,11 @@ test_calculate_cache_limits_custom_high() ->
 		mining_cache_size_mb = 500_000
 	}),
 	?assertEqual(
-		{4 * ?MiB, 512_000_000 * ?KiB, 512_000_000 * ?KiB, 500_000, 2_000_000_000},
+		{?MINIMUM_CACHE_LIMIT_BYTES, 512_000_000 * ?KiB, 512_000_000 * ?KiB, 500_000, 2_000_000_000},
 		calculate_cache_limits(1, 0)
 	),
 	?assertEqual(
-		{8 * ?MiB, 512_000_000 * ?KiB, 256_000_000 * ?KiB, 250_000, 1_000_000_000},
+		{?MINIMUM_CACHE_LIMIT_BYTES, 512_000_000 * ?KiB, 256_000_000 * ?KiB, 250_000, 1_000_000_000},
 		calculate_cache_limits(2, 0)
 	),
 	?assertEqual(
@@ -1448,11 +1452,11 @@ test_calculate_cache_limits_custom_high() ->
 		calculate_cache_limits(1000, 0)
 	),
 	?assertEqual(
-		{1 * ?MiB, 512_000_000 * ?KiB, 512_000_000 * ?KiB, 2_000_000, 8_000_000_000},
+		{?MINIMUM_CACHE_LIMIT_BYTES, 512_000_000 * ?KiB, 512_000_000 * ?KiB, 2_000_000, 8_000_000_000},
 		calculate_cache_limits(1, 1)
 	),
 	?assertEqual(
-		{2 * ?MiB, 512_000_000 * ?KiB, 256_000_000 * ?KiB, 1_000_000, 4_000_000_000},
+		{?MINIMUM_CACHE_LIMIT_BYTES, 512_000_000 * ?KiB, 256_000_000 * ?KiB, 1_000_000, 4_000_000_000},
 		calculate_cache_limits(2, 1)
 	),
 	?assertEqual(
@@ -1460,11 +1464,11 @@ test_calculate_cache_limits_custom_high() ->
 		calculate_cache_limits(1000, 1)
 	),
 	?assertEqual(
-		{512 * ?KiB, 512_000_000 * ?KiB, 512_000_000 * ?KiB, 4_000_000, 16_000_000_000},
+		{?MINIMUM_CACHE_LIMIT_BYTES, 512_000_000 * ?KiB, 512_000_000 * ?KiB, 4_000_000, 16_000_000_000},
 		calculate_cache_limits(1, 2)
 	),
 	?assertEqual(
-		{1 * ?MiB, 512_000_000 * ?KiB, 256_000_000 * ?KiB, 2_000_000, 8_000_000_000},
+		{?MINIMUM_CACHE_LIMIT_BYTES, 512_000_000 * ?KiB, 256_000_000 * ?KiB, 2_000_000, 8_000_000_000},
 		calculate_cache_limits(2, 2)
 	),
 	?assertEqual(
@@ -1472,14 +1476,14 @@ test_calculate_cache_limits_custom_high() ->
 		calculate_cache_limits(1000, 2)
 	),
 	?assertEqual(
-		{32 * ?KiB, 512_000_000 * ?KiB, 512_000_000 * ?KiB, 64_000_000, 256_000_000_000},
+		{?MINIMUM_CACHE_LIMIT_BYTES, 512_000_000 * ?KiB, 512_000_000 * ?KiB, 64_000_000, 256_000_000_000},
 		calculate_cache_limits(1, 32)
 	),
 	?assertEqual(
-		{64 * ?KiB, 512_000_000 * ?KiB, 256_000_000 * ?KiB, 32_000_000, 128_000_000_000},
+		{?MINIMUM_CACHE_LIMIT_BYTES, 512_000_000 * ?KiB, 256_000_000 * ?KiB, 32_000_000, 128_000_000_000},
 		calculate_cache_limits(2, 32)
 	),
 	?assertEqual(
-		{32_000 * ?KiB, 512_000_000 * ?KiB, 512_000 * ?KiB, 64_000, 256_000_000},
+		{?MINIMUM_CACHE_LIMIT_BYTES, 512_000_000 * ?KiB, 512_000 * ?KiB, 64_000, 256_000_000},
 		calculate_cache_limits(1000, 32)
 	).
