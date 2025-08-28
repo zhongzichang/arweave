@@ -209,37 +209,33 @@ handle_info({event, sync_record, {global_remove_range, Start, End}},
 handle_info({event, sync_record, _}, State) ->
 	{noreply, State};
 
-handle_info({event, solution, {rejected, #{ solution_hash := SolutionH, reason := Reason, source := Source }}}, State) ->
+handle_info({event, solution, {rejected, #{ solution_hash := SolutionH, reason := Reason }}}, State) ->
 	URL = State#state.url,
 	Headers = State#state.headers,
 	Payload = #{ event => solution_rejected,
 		solution_hash => ar_util:encode(SolutionH),
-		reason => Reason,
-		source => Source },
+		reason => Reason },
 	call_webhook(URL, Headers, Payload, solution_rejected),
 	{noreply, State};
-handle_info({event, solution, {stale, #{ solution_hash := SolutionH, source := Source }}}, State) ->
+handle_info({event, solution, {stale, #{ solution_hash := SolutionH }}}, State) ->
 	URL = State#state.url,
 	Headers = State#state.headers,
 	Payload = #{ event => solution_stale,
-		solution_hash => ar_util:encode(SolutionH),
-		source => Source },
+		solution_hash => ar_util:encode(SolutionH) },
 	call_webhook(URL, Headers, Payload, solution_stale),
 	{noreply, State};
-handle_info({event, solution, {partial, #{ solution_hash := SolutionH, source := Source }}}, State) ->
+handle_info({event, solution, {partial, #{ solution_hash := SolutionH }}}, State) ->
 	URL = State#state.url,
 	Headers = State#state.headers,
 	Payload = #{ event => solution_partial,
-		solution_hash => ar_util:encode(SolutionH),
-		source => Source },
+		solution_hash => ar_util:encode(SolutionH) },
 	call_webhook(URL, Headers, Payload, solution_partial),
 	{noreply, State};
-handle_info({event, solution, {accepted, #{ indep_hash := H, source := Source, is_rebase := IsRebase }}}, State) ->
+handle_info({event, solution, {accepted, #{ indep_hash := H, is_rebase := IsRebase }}}, State) ->
 	URL = State#state.url,
 	Headers = State#state.headers,
 	Payload = #{ event => solution_accepted,
 		indep_hash => ar_util:encode(H),
-		source => Source,
 		is_rebase => IsRebase },
 	call_webhook(URL, Headers, Payload, solution_accepted),
 	{noreply, State};
