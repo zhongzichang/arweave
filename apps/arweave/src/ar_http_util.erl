@@ -21,41 +21,26 @@ get_tx_content_type(#tx { tags = Tags }) ->
 			none
 	end.
 
-arweave_peer(#{ proxy_header := undefined, peer := {{IpV4_1, IpV4_2, IpV4_3, IpV4_4}, _TcpPeerPort} }) ->
-	ArweavePeerPort =
-		case cowboy_req:header(<<"x-p2p-port">>, Req) of
-			undefined -> ?DEFAULT_HTTP_IFACE_PORT;
-			Binary -> binary_to_integer(Binary)
-		end,
+arweave_peer(Req) ->
+	ArweavePeerPort = get_peer_port(Req),
+	#{ proxy_header := ProxyHeader, peer := {PeerIpV4, _TcpPeerPort} } = Req,
+	{IpV4_1, IpV4_2, IpV4_3, IpV4_4} = case ProxyHeader of
+		#{src_address := undefined} -> PeerIpV4;
+		#{src_address := SourceIpV4} -> SourceIpV4;
+		_ -> PeerIpV4
+	end,
 	{IpV4_1, IpV4_2, IpV4_3, IpV4_4, ArweavePeerPort}.
 
-arweave_peer(#{ proxy_header := #{src_address := undefined}, peer := {{IpV4_1, IpV4_2, IpV4_3, IpV4_4}, _TcpPeerPort} }) ->
-	ArweavePeerPort =
-		case cowboy_req:header(<<"x-p2p-port">>, Req) of
-			undefined -> ?DEFAULT_HTTP_IFACE_PORT;
-			Binary -> binary_to_integer(Binary)
-		end,
-	{IpV4_1, IpV4_2, IpV4_3, IpV4_4, ArweavePeerPort}.
-
-arweave_peer(#{ proxy_header := #{src_address := {IpV4_1, IpV4_2, IpV4_3, IpV4_4}} }) ->
-	ArweavePeerPort =
-		case cowboy_req:header(<<"x-p2p-port">>, Req) of
-			undefined -> ?DEFAULT_HTTP_IFACE_PORT;
-			Binary -> binary_to_integer(Binary)
-		end,
-	{IpV4_1, IpV4_2, IpV4_3, IpV4_4, ArweavePeerPort}.
-
-arweave_peer(#{ peer := {{IpV4_1, IpV4_2, IpV4_3, IpV4_4}, _TcpPeerPort} }) ->
-	ArweavePeerPort =
-		case cowboy_req:header(<<"x-p2p-port">>, Req) of
-			undefined -> ?DEFAULT_HTTP_IFACE_PORT;
-			Binary -> binary_to_integer(Binary)
-		end,
-	{IpV4_1, IpV4_2, IpV4_3, IpV4_4, ArweavePeerPort}.
 
 %%%===================================================================
 %%% Private functions.
 %%%===================================================================
+
+get_peer_port(Req) ->
+	case cowboy_req:header(<<"x-p2p-port">>, Req) of
+		undefined -> ?DEFAULT_HTTP_IFACE_PORT;
+		Binary -> binary_to_integer(Binary)
+	end.
 
 is_valid_content_type(ContentType) ->
 	case re:run(
