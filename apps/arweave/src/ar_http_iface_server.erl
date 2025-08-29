@@ -120,7 +120,8 @@ start_http_iface_listener(Config) ->
 			dispatch => Dispatch
 		},
 		metrics_callback => fun prometheus_cowboy2_instrumenter:observe/1,
-		stream_handlers => [cowboy_metrics_h, cowboy_stream_h]
+		stream_handlers => [cowboy_metrics_h, cowboy_stream_h],
+		proxy_header => true
 	},
 	case TlsCertfilePath of
 		not_set ->

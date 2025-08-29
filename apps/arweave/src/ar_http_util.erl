@@ -21,8 +21,31 @@ get_tx_content_type(#tx { tags = Tags }) ->
 			none
 	end.
 
-arweave_peer(Req) ->
-	{{IpV4_1, IpV4_2, IpV4_3, IpV4_4}, _TcpPeerPort} = cowboy_req:peer(Req),
+arweave_peer(#{ proxy_header := undefined, peer := {{IpV4_1, IpV4_2, IpV4_3, IpV4_4}, _TcpPeerPort} }) ->
+	ArweavePeerPort =
+		case cowboy_req:header(<<"x-p2p-port">>, Req) of
+			undefined -> ?DEFAULT_HTTP_IFACE_PORT;
+			Binary -> binary_to_integer(Binary)
+		end,
+	{IpV4_1, IpV4_2, IpV4_3, IpV4_4, ArweavePeerPort}.
+
+arweave_peer(#{ proxy_header := #{src_address := undefined}, peer := {{IpV4_1, IpV4_2, IpV4_3, IpV4_4}, _TcpPeerPort} }) ->
+	ArweavePeerPort =
+		case cowboy_req:header(<<"x-p2p-port">>, Req) of
+			undefined -> ?DEFAULT_HTTP_IFACE_PORT;
+			Binary -> binary_to_integer(Binary)
+		end,
+	{IpV4_1, IpV4_2, IpV4_3, IpV4_4, ArweavePeerPort}.
+
+arweave_peer(#{ proxy_header := #{src_address := {IpV4_1, IpV4_2, IpV4_3, IpV4_4}} }) ->
+	ArweavePeerPort =
+		case cowboy_req:header(<<"x-p2p-port">>, Req) of
+			undefined -> ?DEFAULT_HTTP_IFACE_PORT;
+			Binary -> binary_to_integer(Binary)
+		end,
+	{IpV4_1, IpV4_2, IpV4_3, IpV4_4, ArweavePeerPort}.
+
+arweave_peer(#{ peer := {{IpV4_1, IpV4_2, IpV4_3, IpV4_4}, _TcpPeerPort} }) ->
 	ArweavePeerPort =
 		case cowboy_req:header(<<"x-p2p-port">>, Req) of
 			undefined -> ?DEFAULT_HTTP_IFACE_PORT;
