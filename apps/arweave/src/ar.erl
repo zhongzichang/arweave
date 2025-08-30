@@ -379,7 +379,7 @@ show_help() ->
 				"during 'verify'. Default is ~B.", [?SAMPLE_CHUNK_COUNT])},
 			{"vdf (mode)", io_lib:format("VDF implementation (openssl (default), openssllite,"
 				" fused, hiopt_m4). Default is openssl.", [])},
-
+			{"proxy_header", "Enable proxy protocol."},
 			% Shutdown management
 			{"network.tcp.shutdown.connection_timeout", io_lib:format(
 				"Configure shutdown TCP connection timeout (seconds). "
@@ -599,6 +599,14 @@ parse_cli_args(["local_peer", Peer | Rest], C = #config{ local_peers = Peers }) 
 	case ar_util:safe_parse_peer(Peer) of
 		{ok, ValidPeer} when is_list(ValidPeer) ->
 			parse_cli_args(Rest, C#config{ local_peers = ValidPeer ++ Peers });
+		{error, _} ->
+			io:format("Peer ~p is invalid.~n", [Peer]),
+			parse_cli_args(Rest, C)
+	end;
+parse_cli_args(["proxy_peer", Peer | Rest], C = #config{ proxy_peers = Peers }) ->
+	case ar_util:safe_parse_peer(Peer) of
+		{ok, ValidPeer} when is_list(ValidPeer) ->
+			parse_cli_args(Rest, C#config{ proxy_peers = ValidPeer ++ Peers });
 		{error, _} ->
 			io:format("Peer ~p is invalid.~n", [Peer]),
 			parse_cli_args(Rest, C)
@@ -872,6 +880,8 @@ parse_cli_args(["rocksdb_flush_interval", Seconds | Rest], C) ->
 	parse_cli_args(Rest, C#config{ rocksdb_flush_interval_s = list_to_integer(Seconds) });
 parse_cli_args(["rocksdb_wal_sync_interval", Seconds | Rest], C) ->
 	parse_cli_args(Rest, C#config{ rocksdb_wal_sync_interval_s = list_to_integer(Seconds) });
+parse_cli_args(["proxy_header" | Rest], C) ->
+	parse_cli_args(Rest, C#config{ proxy_header = true });
 
 %% tcp shutdown procedure
 parse_cli_args(["network.tcp.connection_timeout", Delay|Rest], C) ->

@@ -183,6 +183,7 @@
 	peers = [],
 	block_gossip_peers = [],
 	local_peers = [],
+	proxy_peers = [],
 	sync_from_local_peers_only = false,
 	data_dir = ".",
 	log_dir = ?LOG_DIR,
@@ -279,6 +280,7 @@
 	rocksdb_wal_sync_interval_s = ?DEFAULT_ROCKSDB_WAL_SYNC_INTERVAL_S,
 	%% openssl (will be removed), fused, hiopt_m4
 	vdf = openssl,
+	proxy_header = false,
 
 	% Shutdown procedures
 	shutdown_tcp_connection_timeout = ?SHUTDOWN_TCP_CONNECTION_TIMEOUT,

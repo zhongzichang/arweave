@@ -145,6 +145,16 @@ parse_options([{<<"local_peers">>, Peers} | Rest], Config) when is_list(Peers) -
 parse_options([{<<"local_peers">>, Peers} | _], _) ->
 	{error, {bad_type, local_peers, array}, Peers};
 
+parse_options([{<<"proxy_peers">>, Peers} | Rest], Config) when is_list(Peers) ->
+	case parse_peers(Peers, []) of
+		{ok, ParsedPeers} ->
+			parse_options(Rest, Config#config{ proxy_peers = ParsedPeers });
+		error ->
+			{error, bad_proxy_peers, Peers}
+	end;
+parse_options([{<<"proxy_peers">>, Peers} | _], _) ->
+	{error, {bad_type, proxy_peers, array}, Peers};
+
 parse_options([{<<"start_from_latest_state">>, true} | Rest], Config) ->
 	parse_options(Rest, Config#config{ start_from_latest_state = true });
 parse_options([{<<"start_from_latest_state">>, false} | Rest], Config) ->
@@ -732,6 +742,13 @@ parse_options([{<<"data_sync_request_packed_chunks">>, Bool} | Rest], Config)
 parse_options([{<<"data_sync_request_packed_chunks">>, InvalidValue} | _Rest], _Config) ->
 	{error, {bad_type, data_sync_request_packed_chunks, boolean}, InvalidValue};
 
+parse_options([{<<"proxy_header">>, true} | Rest], Config) ->
+	parse_options(Rest, Config#config{ proxy_header = true });
+parse_options([{<<"proxy_header">>, false} | Rest], Config) ->
+	parse_options(Rest, Config);
+parse_options([{<<"proxy_header">>, Opt} | _], _) ->
+	{error, {bad_type, proxy_header, boolean}, Opt};
+
 %% shutdown procedure
 parse_options([{<<"network.tcp.shutdown.connection_timeout">>, Delay} | Rest], Config)
 	when is_integer(Delay) andalso Delay > 0 ->
@@ -1108,6 +1125,8 @@ log_config_value(peers, FieldValue) ->
 log_config_value(block_gossip_peers, FieldValue) ->
 	format_peers(FieldValue);
 log_config_value(local_peers, FieldValue) ->
+	format_peers(FieldValue);
+log_config_value(proxy_peers, FieldValue) ->
 	format_peers(FieldValue);
 log_config_value(mining_addr, FieldValue) ->
 	format_binary(FieldValue);
