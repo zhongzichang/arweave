@@ -420,58 +420,6 @@ handle(<<"GET">>, [<<"tx">>, EncodedID, <<"offset">>], Req, _Pid) ->
 			end
 	end;
 
-handle(<<"POST">>, [<<"chunk">>], Req, Pid) ->
-	Joined =
-		case ar_node:is_joined() of
-			false ->
-				not_joined(Req);
-			true ->
-				ok
-		end,
-	Semaphore =
-		case Joined of
-			ok ->
-				case ar_semaphore:acquire(post_chunk, 5000) of
-					ok ->
-						ok;
-					{error, timeout} ->
-						{503, #{}, jiffy:encode(#{ error => timeout }), Req}
-				end;
-			Reply ->
-				Reply
-		end,
-	DataRootKnown =
-		case Semaphore of
-			ok ->
-				case get_data_root_from_headers(Req) of
-					not_set ->
-						ok;
-					{ok, {DataRoot, DataSize}} ->
-						case ar_data_sync:has_data_root(DataRoot, DataSize) of
-							true ->
-								ok;
-							false ->
-								{400, #{}, jiffy:encode(#{ error => data_root_not_found }),
-										Req}
-						end
-				end;
-			Reply2 ->
-				Reply2
-		end,
-	ParseChunk =
-		case DataRootKnown of
-			ok ->
-				parse_chunk(Req, Pid);
-			Reply3 ->
-				Reply3
-		end,
-	case ParseChunk of
-		{ok, {Proof, Req2}} ->
-			handle_post_chunk(Proof, Req2);
-		Reply4 ->
-			Reply4
-	end;
-
 %% Accept an announcement of a block. Reply 412 (no previous block),
 %% 200 (optionally specifying missing transactions and chunk in the response)
 %% or 208 (already processing the block).
