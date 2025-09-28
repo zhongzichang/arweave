@@ -1119,12 +1119,17 @@ apply_external_update2(Update, State) ->
 			case CurrentStepNumber >= StepNumber of
 				true ->
 					%% Inform the peer we are ahead.
-					?LOG_DEBUG([{event, apply_external_vdf},
-							{result, ahead_of_server},
-							{vdf_server, ar_util:format_peer(Peer)},
-							{session_key, encode_session_key(SessionKey)},
-							{client_step_number, CurrentStepNumber},
-							{server_step_number, StepNumber}]),
+					case CurrentStepNumber > StepNumber of
+						true ->
+							?LOG_DEBUG([{event, apply_external_vdf},
+									{result, ahead_of_server},
+									{vdf_server, ar_util:format_peer(Peer)},
+									{session_key, encode_session_key(SessionKey)},
+									{client_step_number, CurrentStepNumber},
+									{server_step_number, StepNumber}]);
+						false ->
+							ok
+					end,
 					{reply, #nonce_limiter_update_response{
 							step_number = CurrentStepNumber }, State};
 				false ->
@@ -1454,7 +1459,7 @@ get_entropy_reset_point_test() ->
 	?assertEqual(ResetFreq * 4, get_entropy_reset_point(ResetFreq * 3, ResetFreq * 4 + 1)).
 
 reorg_after_join_test_() ->
-	{timeout, 120, fun test_reorg_after_join/0}.
+	{timeout, ?TEST_NODE_TIMEOUT, fun test_reorg_after_join/0}.
 
 test_reorg_after_join() ->
 	[B0] = ar_weave:init(),
@@ -1472,7 +1477,7 @@ test_reorg_after_join() ->
 	ar_test_node:wait_until_height(main, 2).
 
 reorg_after_join2_test_() ->
-	{timeout, 120, fun test_reorg_after_join2/0}.
+	{timeout, ?TEST_NODE_TIMEOUT, fun test_reorg_after_join2/0}.
 
 test_reorg_after_join2() ->
 	[B0] = ar_weave:init(),

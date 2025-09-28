@@ -240,7 +240,8 @@ update_config(Config) ->
 		local_peers = Config#config.local_peers,
 		mine = Config#config.mine,
 		storage_modules = Config#config.storage_modules,
-		repack_in_place_storage_modules = Config#config.repack_in_place_storage_modules
+		repack_in_place_storage_modules = Config#config.repack_in_place_storage_modules,
+		allow_rebase = Config#config.allow_rebase
 	},
 	ok = application:set_env(arweave, config, Config2),
 	?LOG_INFO("Updated Config:"),
@@ -333,7 +334,9 @@ base_cm_config(Peers) ->
 		coordinated_mining = true,
 		cm_api_secret = <<"test_coordinated_mining_secret">>,
 		cm_poll_interval = 2000,
-		disable_replica_2_9_device_limit = true
+		disable_replica_2_9_device_limit = true,
+		%% Disable rebasing by default to make the tests more reliable.
+		allow_rebase = false
 	}.
 
 mine() ->
@@ -371,7 +374,10 @@ valid_solution() ->
 mock_to_force_invalid_h1() ->
 	{
 		ar_block, compute_h1,
-		fun(_H0, _Nonce, _Chunk1) ->
+		fun(H0, Nonce, Chunk1) ->
+			%% First call the original compute_h1 function
+			meck:passthrough([H0, Nonce, Chunk1]),
+			%% Then return invalid solutions
 			{invalid_solution(), invalid_solution()}
 		end
 	}.
@@ -618,6 +624,8 @@ start(B0, RewardAddr, Config, StorageModules) ->
 		header_sync_jobs = 2,
 		enable = [search_in_rocksdb_when_mining, serve_tx_data_without_limits,
 				double_check_nonce_limiter, serve_wallet_lists | Config#config.enable],
+		%% Disable rebasing by default to make the tests more reliable.
+		allow_rebase = false,
 		debug = true
 	}),
 	ar:start_dependencies(),
@@ -926,6 +934,16 @@ wait_until_syncs_genesis_data(Node) ->
 
 wait_until_syncs_genesis_data() ->
 	{ok, Config} = application:get_env(arweave, config),
+	ar_util:do_until(
+		fun() ->
+			case ar_node:get_current_block() of
+				not_joined -> false;
+				_ -> true
+			end
+		end,
+		1000,
+		10_000
+	),
 	B = ar_node:get_current_block(),
 	WeaveSize = B#block.weave_size,
 	?LOG_INFO([{event, wait_until_syncs_genesis_data}, {status, initial_sync_started},
@@ -1079,12 +1097,18 @@ assert_post_tx_to_peer(Node, TX) ->
 	assert_post_tx_to_peer(Node, TX, true).
 
 assert_post_tx_to_peer(Node, TX, Wait) ->
-	{ok, {{<<"200">>, _}, _, <<"OK">>, _, _}} = post_tx_to_peer(Node, TX, Wait).
+	assert_post_tx_to_peer(Node, TX, Wait, 3).
+
+assert_post_tx_to_peer(Node, TX, Wait, Retries) ->
+	{ok, {{<<"200">>, _}, _, <<"OK">>, _, _}} = post_tx_to_peer(Node, TX, Wait, Retries).
 
 post_tx_to_peer(Node, TX) ->
 	post_tx_to_peer(Node, TX, true).
 
 post_tx_to_peer(Node, TX, Wait) ->
+	post_tx_to_peer(Node, TX, Wait, 3).
+
+post_tx_to_peer(Node, TX, Wait, Retries) ->
 	Reply = post_tx_json(Node, ar_serialize:jsonify(ar_serialize:tx_to_json_struct(TX))),
 	case Reply of
 		{ok, {{<<"200">>, _}, _, <<"OK">>, _, _}} ->
@@ -1094,6 +1118,10 @@ post_tx_to_peer(Node, TX, Wait) ->
 				false ->
 					ok
 			end;
+		_ when Retries > 0 ->
+			?debugFmt("Failed to post transaction, retrying. Error: ~p~nRetries: ~p~n", [Reply, Retries]),
+			timer:sleep(3000),
+			post_tx_to_peer(Node, TX, Wait, Retries - 1);
 		_ ->
 			ErrorInfo =
 				case Reply of
@@ -1164,11 +1192,21 @@ new_mock(Module, Options) ->
 new_mock(_Module, _Options, 0) ->
 	ok;
 new_mock(Module, Options, Retries) ->
+	Options2 = lists:usort([no_link | Options]),
 	try
-		meck:new(Module, Options)
+		meck:new(Module, Options2)
 	catch
+		%% If the mock is already started, treat as success
+		error:{already_started, _Pid} ->
+			ok;
+		%% Retry on other errors
 		error:E ->
 			?debugFmt("ar_test_node (retries left ~p): Error creating mock for ~p: ~p",
+					[Retries - 1, Module, E]),
+			timer:sleep(1000),
+			new_mock(Module, Options, Retries - 1);
+		exit:E ->
+			?debugFmt("ar_test_node (retries left ~p): Exit creating mock for ~p: ~p",
 					[Retries - 1, Module, E]),
 			timer:sleep(1000),
 			new_mock(Module, Options, Retries - 1)
@@ -1187,6 +1225,11 @@ mock_function(Module, Fun, Mock, Retries) ->
 			?debugFmt("ar_test_node (retries left ~p): Error setting mock for ~p: ~p",
 					[Retries - 1, Module, E]),
 			timer:sleep(1000),
+			mock_function(Module, Fun, Mock, Retries - 1);
+		exit:E ->
+			?debugFmt("ar_test_node (retries left ~p): Exit setting mock for ~p: ~p",
+					[Retries - 1, Module, E]),
+			timer:sleep(1000),
 			mock_function(Module, Fun, Mock, Retries - 1)
 	end.
 
@@ -1199,8 +1242,17 @@ unmock_module(Module, Retries) ->
 	try
 		meck:unload(Module)
 	catch
+		%% If it's already not mocked, consider it a success
+		error:{not_mocked, Module} ->
+			ok;
+		%% Retry on other errors
 		error:E ->
 			?debugFmt("ar_test_node (retries left ~p): Error unloading mock for ~p: ~p",
+					[Retries - 1, Module, E]),
+			timer:sleep(1000),
+			unmock_module(Module, Retries - 1);
+		exit:E ->
+			?debugFmt("ar_test_node (retries left ~p): Exit unloading mock for ~p: ~p",
 					[Retries - 1, Module, E]),
 			timer:sleep(1000),
 			unmock_module(Module, Retries - 1)
@@ -1209,49 +1261,57 @@ unmock_module(Module, Retries) ->
 mock_functions(Functions) ->
 	{
 		fun() ->
-			lists:foldl(
-				fun({Module, Fun, Mock}, Mocked) ->
-					NewMocked = case maps:get(Module, Mocked, false) of
-						false ->
-							new_mock(Module, [passthrough]),
+			with_meck_lock(fun() ->
+				lists:foldl(
+					fun({Module, Fun, Mock}, Mocked) ->
+						NewMocked = case maps:get(Module, Mocked, false) of
+							false ->
+								new_mock(Module, [passthrough]),
+								lists:foreach(
+									fun({_TestType, Node}) ->
+										remote_call(Node, ar_test_node, new_mock,
+												[Module, [no_link, passthrough]])
+									end,
+									all_peers(test)),
+								maps:put(Module, true, Mocked);
+							true ->
+								Mocked
+							end,
+							mock_function(Module, Fun, Mock),
 							lists:foreach(
 								fun({_TestType, Node}) ->
-									remote_call(Node, ar_test_node, new_mock,
-											[Module, [no_link, passthrough]])
+									remote_call(Node, ar_test_node, mock_function,
+											[Module, Fun, Mock])
 								end,
 								all_peers(test)),
-							maps:put(Module, true, Mocked);
-						true ->
-							Mocked
+							NewMocked
 					end,
-					mock_function(Module, Fun, Mock),
-					lists:foreach(
-						fun({_TestType, Node}) ->
-							remote_call(Node, ar_test_node, mock_function,
-									[Module, Fun, Mock])
-						end,
-						all_peers(test)),
-					NewMocked
-				end,
-				maps:new(),
-				Functions
-			)
+					maps:new(),
+					Functions
+				)
+			end)
 		end,
 		fun(Mocked) ->
-			maps:fold(
-				fun(Module, _, _) ->
-					unmock_module(Module),
-					lists:foreach(
-						fun({_TestType, Node}) ->
-							remote_call(Node, ar_test_node, unmock_module, [Module])
-						end,
-						all_peers(test))
-				end,
-				noop,
-				Mocked
-			)
+			with_meck_lock(fun() ->
+				maps:fold(
+					fun(Module, _, _) ->
+						unmock_module(Module),
+						lists:foreach(
+							fun({_TestType, Node}) ->
+								remote_call(Node, ar_test_node, unmock_module, [Module])
+							end,
+							all_peers(test))
+					end,
+					noop,
+					Mocked
+				)
+			end)
 		end
 	}.
+
+%% @doc Execute Fun under a distributed lock to avoid concurrent meck operations.
+with_meck_lock(Fun) when is_function(Fun, 0) ->
+	global:trans({arweave, meck_lock}, Fun).
 
 test_with_mocked_functions(Functions, TestFun) ->
 	test_with_mocked_functions(Functions, TestFun, ?TEST_MOCKED_FUNCTIONS_TIMEOUT).

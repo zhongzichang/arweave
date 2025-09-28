@@ -45,6 +45,14 @@
 -define(MINIMUM_CACHE_LIMIT_BYTES, 1).
 -endif.
 
+%% The number of concurrent VDF steps per partition that will fit in the cache. The higher this
+%% number the more memory the cache can use (roughly ?IDEAL_STEPS_PER_PARTITION * 5 MiB per
+%% partition). Also the higher the number the more the miner is able to respond to temporary
+%% hashrate slowdowns (e.g. a system process temporarily consumes all CPU) or temporary VDF
+%% step spikes (e.g. the node validates an block with an advanced VDF step and unlocks many
+%% VDF steps at once) without losing hashrate.
+-define(IDEAL_STEPS_PER_PARTITION, 20).
+
 -define(FETCH_POA_FROM_PEERS_TIMEOUT_MS, 10000).
 
 %%%===================================================================
@@ -306,6 +314,10 @@ handle_info({event, nonce_limiter, {computed_output, Args}}, State) ->
 				SessionKey, StepNumber, Output, PartitionUpperBound, not_set, State)
 	end;
 
+handle_info({event, nonce_limiter, {valid, _}}, State) ->
+	%% Silently ignore validation messages
+	{noreply, State};
+
 handle_info({event, nonce_limiter, Message}, State) ->
 	?LOG_DEBUG([{event, mining_debug_skipping_nonce_limiter}, {message, Message}]),
 	{noreply, State};
@@ -459,14 +471,12 @@ update_cache_limits(NumActivePartitions, State) ->
 	maybe_update_cache_limits(Limits, State).
 
 calculate_cache_limits(NumActivePartitions, PackingDifficulty) ->
-	%% This allows the cache to store enough chunks for 4 concurrent VDF steps per partition.
-	IdealStepsPerPartition = 4,
 	IdealRangesPerStep = 2,
 	RecallRangeSize = ar_block:get_recall_range_size(PackingDifficulty),
 
 	MinimumCacheLimitBytes = max(
 		?MINIMUM_CACHE_LIMIT_BYTES,
-		(IdealStepsPerPartition * IdealRangesPerStep * RecallRangeSize * NumActivePartitions)
+		(?IDEAL_STEPS_PER_PARTITION * IdealRangesPerStep * RecallRangeSize * NumActivePartitions)
 	),
 
 	{ok, Config} = application:get_env(arweave, config),
@@ -731,7 +741,6 @@ prepare_solution(proofs, Candidate, Solution) ->
 		seed = Seed,
 		mining_address = MiningAddress,
 		nonce_limiter_output = NonceLimiterOutput,
-		chunk1 = Chunk1,
 		chunk2 = Chunk2
 	} = Candidate,
 	#mining_solution{ poa1 = PoA1, poa2 = PoA2 } = Solution,
@@ -740,38 +749,27 @@ prepare_solution(proofs, Candidate, Solution) ->
 	ExpectedH0 = ar_block:compute_h0(NonceLimiterOutput,
 			PartitionNumber, Seed, MiningAddress,
 			PackingDifficulty),
-	{ExpectedH1, _} = ar_block:compute_h1(ExpectedH0, Nonce, Chunk1),
 	case {H0, H1, H2} of
 		{_, not_set, not_set} ->
 			%% We should never end up here..
 			log_prepare_solution_failure(Solution, rejected, h1_h2_not_set, miner, []),
 			error;
-		{ExpectedH0, ExpectedH1, not_set} ->
+		{ExpectedH0, _H1, not_set} ->
 			prepare_solution(poa1, Candidate, Solution#mining_solution{
 				solution_hash = H1, recall_byte1 = RecallByte1,
 				poa1 = may_be_empty_poa(PoA1), poa2 = #poa{} });
-		{ExpectedH0, _H1, not_set} ->
-			log_prepare_solution_failure(Solution, rejected, incorrect_h1, miner, []),
-			error;
 		{_H0, _H1, not_set} ->
 			log_prepare_solution_failure(Solution, rejected, incorrect_h0, miner, []),
 			error;
-		{ExpectedH0, H1, H2} ->
-			{ExpectedH2, _} =
-				case Chunk2 of
-					not_set ->
-						{H2, not_set};
-					_ ->
-						ar_block:compute_h2(ExpectedH1, Chunk2, ExpectedH0)
-				end,
-			case H2 == ExpectedH2 of
-				false ->
-					log_prepare_solution_failure(Solution, rejected, incorrect_h2, miner, []),
-					error;
+		{ExpectedH0, _H1, _H2} ->
+			case is_h2_valid(Chunk2, H0, H1, H2) of
 				true ->
 					prepare_solution(poa2, Candidate, Solution#mining_solution{
 						solution_hash = H2, recall_byte1 = RecallByte1, recall_byte2 = RecallByte2,
-						poa1 = may_be_empty_poa(PoA1), poa2 = may_be_empty_poa(PoA2) })
+						poa1 = may_be_empty_poa(PoA1), poa2 = may_be_empty_poa(PoA2) });
+				false ->
+					log_prepare_solution_failure(Solution, rejected, incorrect_h2, miner, []),
+					error
 			end;
 		_ ->
 			log_prepare_solution_failure(Solution, rejected, incorrect_h0, miner, []),
@@ -784,12 +782,18 @@ prepare_solution(poa1, Candidate, Solution) ->
 		mining_address = MiningAddress, packing_difficulty = PackingDifficulty,
 		replica_format = ReplicaFormat
 	} = Solution,
-	#mining_candidate{ chunk1 = Chunk1, nonce = Nonce,
+	#mining_candidate{ h0 = H0, h1 = H1, chunk1 = Chunk1, nonce = Nonce,
 			partition_number = PartitionNumber } = Candidate,
 
 	case prepare_poa(poa1, Candidate, CurrentPoA1) of
 		{ok, PoA1} ->
-			Solution#mining_solution{ poa1 = PoA1 };
+			case is_h1_valid(Chunk1, PoA1, H0, H1, Nonce) of
+				true ->
+					Solution#mining_solution{ poa1 = PoA1 };
+				false ->
+					log_prepare_solution_failure(Solution, rejected, incorrect_h1, miner, []),
+					error
+			end;
 		{error, Error} ->
 			Modules = ar_storage_module:get_all(RecallByte1 + 1),
 			ModuleIDs = [ar_storage_module:id(Module) || Module <- Modules],
@@ -947,6 +951,26 @@ may_be_leave_it_to_exit_peer(Solution, FailureReason, AdditionalLogData) ->
 			error
 	end.
 
+is_h1_valid(Chunk, PoA, H0, H1, Nonce) ->
+	Chunk1 = case Chunk of
+		not_set ->
+			PoA#poa.chunk;
+		_ ->
+			Chunk
+	end,
+	{ExpectedH1, _} = ar_block:compute_h1(H0, Nonce, Chunk1),
+	H1 == ExpectedH1.
+
+is_h2_valid(Chunk, H0, H1, H2) ->
+	{ExpectedH2, _} =
+		case Chunk of
+			not_set ->
+				{H2, not_set};
+			_ ->
+				ar_block:compute_h2(H1, Chunk, H0)
+		end,
+	H2 == ExpectedH2.
+
 post_solution(error, _State) ->
 	?LOG_WARNING([{event, found_solution_but_could_not_build_a_block}]),
 	error;
@@ -974,7 +998,8 @@ post_solution(not_set, Solution, State) ->
 					{recall_byte1, RecallByte1},
 					{recall_byte2, RecallByte2},
 					{solution_h, ar_util:safe_encode(H)},
-					{nonce_limiter_output, ar_util:safe_encode(NonceLimiterOutput)}]),
+					{nonce_limiter_output, ar_util:safe_encode(NonceLimiterOutput)},
+					{diff_pair, DiffPair}]),
 			ar:console("WARNING: we failed to validate our solution. Check logs for more "
 					"details~n");
 		{false, Reason} ->
@@ -988,7 +1013,8 @@ post_solution(not_set, Solution, State) ->
 					{recall_byte1, RecallByte1},
 					{recall_byte2, RecallByte2},
 					{solution_h, ar_util:safe_encode(H)},
-					{nonce_limiter_output, ar_util:safe_encode(NonceLimiterOutput)}]),
+					{nonce_limiter_output, ar_util:safe_encode(NonceLimiterOutput)},
+					{diff_pair, DiffPair}]),
 			ar:console("WARNING: the solution we found is invalid. Check logs for more "
 					"details~n");
 		{true, PoACache, PoA2Cache} ->
@@ -1248,7 +1274,13 @@ validate_solution(Solution, DiffPair) ->
 							%% This can happen if the difficulty has increased between the
 							%% time the H1 solution was found and now. In this case,
 							%% there is no H2 solution, so we flag the solution invalid.
-							{false, h1_diff_check};
+							{Diff1, _} = DiffPair,
+							{false, {h1_diff_check,
+								ar_util:safe_encode(H0),
+								ar_util:safe_encode(H1),
+								binary:decode_unsigned(H1),
+								ar_node_utils:scaled_diff(Diff1, PackingDifficulty)
+							}};
 						false ->
 							#mining_solution{
 								recall_byte2 = RecallByte2, poa2 = PoA2 } = Solution,
@@ -1256,7 +1288,14 @@ validate_solution(Solution, DiffPair) ->
 							case ar_node_utils:h2_passes_diff_check(H2, DiffPair,
 									PackingDifficulty) of
 								false ->
-									{false, h2_diff_check};
+									{_, Diff2} = DiffPair,
+									{false, {h2_diff_check,
+										ar_util:safe_encode(H0),
+										ar_util:safe_encode(H1),
+										ar_util:safe_encode(H2),
+										binary:decode_unsigned(H2),
+										ar_node_utils:scaled_diff(Diff2, PackingDifficulty)
+									}};
 								true ->
 									SolutionHash = H2,
 									RecallByte2 = ar_block:get_recall_byte(RecallRange2Start,
@@ -1332,51 +1371,111 @@ test_calculate_cache_limits_default() ->
 		mining_cache_size_mb = undefined
 	}),
 	?assertEqual(
-		{400 * ?MiB, 400 * ?MiB, 4 * ?MiB, 4, 16_000},
+		{
+			?IDEAL_STEPS_PER_PARTITION * 100 * ?MiB,
+			?IDEAL_STEPS_PER_PARTITION * 100 * ?MiB,
+			?IDEAL_STEPS_PER_PARTITION * ?MiB,
+			?IDEAL_STEPS_PER_PARTITION,
+			?IDEAL_STEPS_PER_PARTITION * 4000},
 		calculate_cache_limits(100, 0)
 	),
 	?assertEqual(
-		{800 * ?MiB, 800 * ?MiB, 4 * ?MiB, 4, 16_000},
+		{
+			?IDEAL_STEPS_PER_PARTITION * 200 * ?MiB,
+			?IDEAL_STEPS_PER_PARTITION * 200 * ?MiB,
+			?IDEAL_STEPS_PER_PARTITION * ?MiB,
+			?IDEAL_STEPS_PER_PARTITION,
+			?IDEAL_STEPS_PER_PARTITION * 4000},
 		calculate_cache_limits(200, 0)
 	),
 	?assertEqual(
-		{4_000 * ?MiB, 4_000 * ?MiB, 4 * ?MiB, 4, 16_000},
+		{
+			?IDEAL_STEPS_PER_PARTITION * 1000 * ?MiB,
+			?IDEAL_STEPS_PER_PARTITION * 1000 * ?MiB,
+			?IDEAL_STEPS_PER_PARTITION * ?MiB,
+			?IDEAL_STEPS_PER_PARTITION,
+			?IDEAL_STEPS_PER_PARTITION * 4000},
 		calculate_cache_limits(1000, 0)
 	),
 	?assertEqual(
-		{100 * ?MiB, 100 * ?MiB, 1 * ?MiB, 4, 16_000},
+		{
+			?IDEAL_STEPS_PER_PARTITION * 25 * ?MiB,
+			?IDEAL_STEPS_PER_PARTITION * 25 * ?MiB,
+			?IDEAL_STEPS_PER_PARTITION * 256 * ?KiB,
+			?IDEAL_STEPS_PER_PARTITION,
+			?IDEAL_STEPS_PER_PARTITION * 4000},
 		calculate_cache_limits(100, 1)
 	),
 	?assertEqual(
-		{200 * ?MiB, 200 * ?MiB, 1 * ?MiB, 4, 16_000},
+		{
+			?IDEAL_STEPS_PER_PARTITION * 50 * ?MiB,
+			?IDEAL_STEPS_PER_PARTITION * 50 * ?MiB,
+			?IDEAL_STEPS_PER_PARTITION * 256 * ?KiB,
+			?IDEAL_STEPS_PER_PARTITION,
+			?IDEAL_STEPS_PER_PARTITION * 4000},
 		calculate_cache_limits(200, 1)
 	),
 	?assertEqual(
-		{1_000 * ?MiB, 1_000 * ?MiB, 1 * ?MiB, 4, 16_000},
+		{
+			?IDEAL_STEPS_PER_PARTITION * 250 * ?MiB,
+			?IDEAL_STEPS_PER_PARTITION * 250 * ?MiB,
+			?IDEAL_STEPS_PER_PARTITION * 256 * ?KiB,
+			?IDEAL_STEPS_PER_PARTITION,
+			?IDEAL_STEPS_PER_PARTITION * 4000},
 		calculate_cache_limits(1000, 1)
 	),
 	?assertEqual(
-		{100 * ?MiB, 100 * ?MiB, 512 * ?KiB, 4, 16_000},
+		{
+			?IDEAL_STEPS_PER_PARTITION * 25 * ?MiB,
+			?IDEAL_STEPS_PER_PARTITION * 25 * ?MiB,
+			?IDEAL_STEPS_PER_PARTITION * 128 * ?KiB,
+			?IDEAL_STEPS_PER_PARTITION,
+			?IDEAL_STEPS_PER_PARTITION * 4000},
 		calculate_cache_limits(200, 2)
 	),
 	?assertEqual(
-		{200 * ?MiB, 200 * ?MiB, 512 * ?KiB, 4, 16_000},
+		{
+			?IDEAL_STEPS_PER_PARTITION * 50 * ?MiB,
+			?IDEAL_STEPS_PER_PARTITION * 50 * ?MiB,
+			?IDEAL_STEPS_PER_PARTITION * 128 * ?KiB,
+			?IDEAL_STEPS_PER_PARTITION,
+			?IDEAL_STEPS_PER_PARTITION * 4000},
 		calculate_cache_limits(400, 2)
 	),
 	?assertEqual(
-		{500 * ?MiB, 500 * ?MiB, 512 * ?KiB, 4, 16_000},
+		{
+			?IDEAL_STEPS_PER_PARTITION * 125 * ?MiB,
+			?IDEAL_STEPS_PER_PARTITION * 125 * ?MiB,
+			?IDEAL_STEPS_PER_PARTITION * 128 * ?KiB,
+			?IDEAL_STEPS_PER_PARTITION,
+			?IDEAL_STEPS_PER_PARTITION * 4000},
 		calculate_cache_limits(1000, 2)
 	),
 	?assertEqual(
-		{200 * ?MiB, 200 * ?MiB, 32 * ?KiB, 4, 16_000},
+		{
+			?IDEAL_STEPS_PER_PARTITION * 50 * ?MiB,
+			?IDEAL_STEPS_PER_PARTITION * 50 * ?MiB,
+			?IDEAL_STEPS_PER_PARTITION * 8 * ?KiB,
+			?IDEAL_STEPS_PER_PARTITION,
+			?IDEAL_STEPS_PER_PARTITION * 4000},
 		calculate_cache_limits(6_400, 32)
 	),
 	?assertEqual(
-		{400 * ?MiB, 400 * ?MiB, 32 * ?KiB, 4, 16_000},
+		{
+			?IDEAL_STEPS_PER_PARTITION * 100 * ?MiB,
+			?IDEAL_STEPS_PER_PARTITION * 100 * ?MiB,
+			?IDEAL_STEPS_PER_PARTITION * 8 * ?KiB,
+			?IDEAL_STEPS_PER_PARTITION,
+			?IDEAL_STEPS_PER_PARTITION * 4000},
 		calculate_cache_limits(12_800, 32)
 	),
 	?assertEqual(
-		{625 * ?MiB, 625 * ?MiB, 32 * ?KiB, 4, 16_000},
+		{
+			trunc(?IDEAL_STEPS_PER_PARTITION * 156.25 * ?MiB),
+			trunc(?IDEAL_STEPS_PER_PARTITION * 156.25 * ?MiB),
+			?IDEAL_STEPS_PER_PARTITION * 8 * ?KiB,
+			?IDEAL_STEPS_PER_PARTITION,
+			?IDEAL_STEPS_PER_PARTITION * 4000},
 		calculate_cache_limits(20_000, 32)
 	).
 
@@ -1394,7 +1493,7 @@ test_calculate_cache_limits_custom_low() ->
 		calculate_cache_limits(2, 0)
 	),
 	?assertEqual(
-		{4_000 * ?MiB, 1 * ?MiB, (1 * ?MiB) div 1_000, 1, 4_000},
+		{?IDEAL_STEPS_PER_PARTITION * 1000 * ?MiB, 1 * ?MiB, (1 * ?MiB) div 1_000, 1, 4_000},
 		calculate_cache_limits(1000, 0)
 	),
 	?assertEqual(
@@ -1406,7 +1505,7 @@ test_calculate_cache_limits_custom_low() ->
 		calculate_cache_limits(2, 1)
 	),
 	?assertEqual(
-		{1_000 * ?MiB, 1 * ?MiB, (1 * ?MiB) div 1_000, 1, 4_000},
+		{?IDEAL_STEPS_PER_PARTITION * 250 * ?MiB, 1 * ?MiB, (1 * ?MiB) div 1_000, 1, 4_000},
 		calculate_cache_limits(1000, 1)
 	),
 	?assertEqual(
@@ -1418,7 +1517,7 @@ test_calculate_cache_limits_custom_low() ->
 		calculate_cache_limits(2, 2)
 	),
 	?assertEqual(
-		{512_000 * ?KiB, 1 * ?MiB, (1 * ?MiB) div 1_000, 1, 4_000},
+		{?IDEAL_STEPS_PER_PARTITION * 128_000 * ?KiB, 1 * ?MiB, (1 * ?MiB) div 1_000, 1, 4_000},
 		calculate_cache_limits(1000, 2)
 	),
 	?assertEqual(
@@ -1430,7 +1529,7 @@ test_calculate_cache_limits_custom_low() ->
 		calculate_cache_limits(2, 32)
 	),
 	?assertEqual(
-		{2_000 * ?MiB, 1 * ?MiB, (1 * ?MiB) div 64_000, 1, 4_000},
+		{?IDEAL_STEPS_PER_PARTITION * 500 * ?MiB, 1 * ?MiB, (1 * ?MiB) div 64_000, 1, 4_000},
 		calculate_cache_limits(64_000, 32)
 	).
 
@@ -1448,7 +1547,7 @@ test_calculate_cache_limits_custom_high() ->
 		calculate_cache_limits(2, 0)
 	),
 	?assertEqual(
-		{4_000 * ?MiB, 512_000_000 * ?KiB, 512_000 * ?KiB, 500, 2_000_000},
+		{?IDEAL_STEPS_PER_PARTITION * 1000 * ?MiB, 512_000_000 * ?KiB, 512_000 * ?KiB, 500, 2_000_000},
 		calculate_cache_limits(1000, 0)
 	),
 	?assertEqual(
@@ -1460,7 +1559,7 @@ test_calculate_cache_limits_custom_high() ->
 		calculate_cache_limits(2, 1)
 	),
 	?assertEqual(
-		{1000 * ?MiB, 512_000_000 * ?KiB, 512_000 * ?KiB, 2_000, 8_000_000},
+		{?IDEAL_STEPS_PER_PARTITION * 250 * ?MiB, 512_000_000 * ?KiB, 512_000 * ?KiB, 2_000, 8_000_000},
 		calculate_cache_limits(1000, 1)
 	),
 	?assertEqual(
@@ -1472,7 +1571,7 @@ test_calculate_cache_limits_custom_high() ->
 		calculate_cache_limits(2, 2)
 	),
 	?assertEqual(
-		{512_000 * ?KiB, 512_000_000 * ?KiB, 512_000 * ?KiB, 4_000, 16_000_000},
+		{?IDEAL_STEPS_PER_PARTITION * 128_000 * ?KiB, 512_000_000 * ?KiB, 512_000 * ?KiB, 4_000, 16_000_000},
 		calculate_cache_limits(1000, 2)
 	),
 	?assertEqual(
@@ -1484,6 +1583,6 @@ test_calculate_cache_limits_custom_high() ->
 		calculate_cache_limits(2, 32)
 	),
 	?assertEqual(
-		{?MINIMUM_CACHE_LIMIT_BYTES, 512_000_000 * ?KiB, 512_000 * ?KiB, 64_000, 256_000_000},
+		{(?IDEAL_STEPS_PER_PARTITION * 2 * (?RECALL_RANGE_SIZE div 32) * 1000), 512_000_000 * ?KiB, 512_000 * ?KiB, 64_000, 256_000_000},
 		calculate_cache_limits(1000, 32)
 	).

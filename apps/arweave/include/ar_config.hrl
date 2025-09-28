@@ -281,6 +281,8 @@
 	%% openssl (will be removed), fused, hiopt_m4
 	vdf = openssl,
 	proxy_header = false,
+	%% Turn on/off the rebasing check. Only disabled in tests.
+	allow_rebase = true,
 
 	% Shutdown procedures
 	shutdown_tcp_connection_timeout = ?SHUTDOWN_TCP_CONNECTION_TIMEOUT,

@@ -19,6 +19,7 @@ validate_config(Config) ->
 	validate_storage_modules(Config) andalso
 	validate_repack_in_place(Config) andalso
 	validate_cm_pool(Config) andalso
+	validate_cm(Config) andalso
 	validate_unique_replication_type(Config) andalso
 	validate_verify(Config).
 
@@ -154,6 +155,12 @@ parse_options([{<<"proxy_peers">>, Peers} | Rest], Config) when is_list(Peers) -
 	end;
 parse_options([{<<"proxy_peers">>, Peers} | _], _) ->
 	{error, {bad_type, proxy_peers, array}, Peers};
+parse_options([{<<"sync_from_local_peers_only">>, true} | Rest], Config) ->
+	parse_options(Rest, Config#config{ sync_from_local_peers_only = true });
+parse_options([{<<"sync_from_local_peers_only">>, false} | Rest], Config) ->
+	parse_options(Rest, Config#config{ sync_from_local_peers_only = false });
+parse_options([{<<"sync_from_local_peers_only">>, Opt} | _], _) ->
+	{error, {bad_type, sync_from_local_peers_only, boolean}, Opt};
 
 parse_options([{<<"start_from_latest_state">>, true} | Rest], Config) ->
 	parse_options(Rest, Config#config{ start_from_latest_state = true });
@@ -1224,6 +1231,17 @@ validate_cm_pool(Config) ->
 			true
 	end,
 	A andalso B andalso C.
+
+validate_cm(#config{ coordinated_mining = false }) ->
+	true;
+validate_cm(#config{ cm_api_secret = not_set }) ->
+	io:format("~nThe cm_api_secret must be set when coordinated_mining is set.~n~n"),
+	false;
+validate_cm(#config{ mine = false }) ->
+	io:format("~nThe mine flag must be set when coordinated_mining is set.~n~n"),
+	false;
+validate_cm(_Config) ->
+	true.
 
 validate_unique_replication_type(#config{ mine = false }) ->
 	true;
