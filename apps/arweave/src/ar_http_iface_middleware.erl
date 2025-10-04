@@ -382,6 +382,18 @@ handle(<<"GET">>, [<<"data_sync_record">>, EncodedStart, EncodedEnd, EncodedLimi
 			end
 	end;
 
+handle(<<"GET">>, [<<"chunk">>, OffsetBinary], Req, _Pid) ->
+	handle_get_chunk(OffsetBinary, Req, json);
+
+handle(<<"GET">>, [<<"chunk_proof">>, OffsetBinary], Req, _Pid) ->
+	handle_get_chunk_proof(OffsetBinary, Req, json);
+
+handle(<<"GET">>, [<<"chunk2">>, OffsetBinary], Req, _Pid) ->
+	handle_get_chunk(OffsetBinary, Req, binary);
+
+handle(<<"GET">>, [<<"chunk_proof2">>, OffsetBinary], Req, _Pid) ->
+	handle_get_chunk_proof(OffsetBinary, Req, binary);
+
 handle(<<"GET">>, [<<"tx">>, EncodedID, <<"offset">>], Req, _Pid) ->
 	case ar_node:is_joined() of
 		false ->
