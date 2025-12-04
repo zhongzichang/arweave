@@ -11,7 +11,7 @@
 
 -include("../include/ar.hrl").
 -include("../include/ar_sup.hrl").
--include("../include/ar_config.hrl").
+-include_lib("arweave_config/include/arweave_config.hrl").
 -include("../include/ar_consensus.hrl").
 
 -include_lib("eunit/include/eunit.hrl").
@@ -44,7 +44,7 @@ name(StoreID) ->
 	list_to_atom("ar_entropy_gen_" ++ ar_storage_module:label(StoreID)).
 
 register_workers(Module) ->
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	ConfiguredWorkers = lists:filtermap(
 		fun(StorageModule) ->
 				StoreID = ar_storage_module:id(StorageModule),

@@ -3,7 +3,7 @@
 -export([show_help/0, run_benchmark_from_cli/1, run_benchmark/1]).
 
 -include_lib("arweave/include/ar_consensus.hrl").
--include_lib("arweave/include/ar_config.hrl").
+-include_lib("arweave_config/include/arweave_config.hrl").
 
 run_benchmark_from_cli(Args) ->
 	Threads = list_to_integer(get_flag_value(Args, "threads", "1")),
@@ -59,8 +59,9 @@ show_help() ->
 	init:stop(1).
 
 run_benchmark({Format, Dirs, Threads, DataMiB}) ->
-	application:set_env(arweave, config, #config{ 
-		disable = [], enable  = [randomx_large_pages] }),
+	arweave_config:set_env(#config{ 
+		disable = [], enable  = [randomx_large_pages]
+	}),
 
 	ThreadDirPairs = assign_threads_to_dirs(Threads, Dirs),
 

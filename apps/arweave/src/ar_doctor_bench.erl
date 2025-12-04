@@ -4,7 +4,7 @@
 
 -include_lib("kernel/include/file.hrl").
 -include_lib("arweave/include/ar.hrl").
--include_lib("arweave/include/ar_config.hrl").
+-include_lib("arweave_config/include/arweave_config.hrl").
 -include_lib("arweave/include/ar_mining.hrl").
 -include_lib("arweave/include/ar_consensus.hrl").
 
@@ -47,7 +47,7 @@ bench_read(Args) ->
 		data_dir = DataDir,
 		storage_modules = StorageModules,
 		mining_addr = Address},
-	application:set_env(arweave, config, Config),
+	arweave_config:set_env(Config),
 
 	ar_kv_sup:start_link(),
 	ar_storage_sup:start_link(),

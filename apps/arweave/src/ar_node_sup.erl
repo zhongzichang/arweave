@@ -12,7 +12,7 @@
 %% Supervisor callbacks
 -export([init/1]).
 
--include_lib("arweave/include/ar_config.hrl").
+-include_lib("arweave_config/include/arweave_config.hrl").
 -include_lib("arweave/include/ar_sup.hrl").
 
 %% ===================================================================
@@ -90,7 +90,7 @@ ar_blacklist_middleware_spec() ->
 %% configuration.
 %%--------------------------------------------------------------------
 ar_semaphores_spec() ->
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	Semaphores = Config#config.semaphores,
 	[ ar_semaphore_spec(Name, N) || {Name, N} <- maps:to_list(Semaphores) ].
 

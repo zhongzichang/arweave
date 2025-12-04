@@ -11,7 +11,7 @@
 -export([init/1, handle_cast/2, handle_call/3, handle_info/2, terminate/2]).
 
 -include_lib("arweave/include/ar.hrl").
--include_lib("arweave/include/ar_config.hrl").
+-include_lib("arweave_config/include/arweave_config.hrl").
 -include_lib("arweave/include/ar_data_sync.hrl").
 
 -record(state, {
@@ -37,7 +37,7 @@ start_link(Name, Mode) ->
 
 init({Name, Mode}) ->
 	?LOG_INFO([{event, init}, {module, ?MODULE}, {name, Name}]),
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	%% In case there has been a restart we need to tell
 	%% ar_data_sync_worker_master to erase pending worker tasks.
 	%% We only want to do this for sync workers, not read workers.

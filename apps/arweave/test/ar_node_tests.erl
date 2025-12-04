@@ -2,7 +2,7 @@
 
 -include_lib("arweave/include/ar.hrl").
 -include_lib("arweave/include/ar_pricing.hrl").
--include_lib("arweave/include/ar_config.hrl").
+-include_lib("arweave_config/include/arweave_config.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 -import(ar_test_node, [sign_v1_tx/3, read_block_when_stored/1]).
@@ -180,13 +180,13 @@ test_persisted_mempool() ->
 			maps:is_key(SignedTX#tx.id, Mempool)
 		end,
 		100,
-		10000
+		30000
 	),
 	Config = ar_test_node:stop(),
 	try
 		%% Rejoin the network.
 		%% Expect the pending transactions to be picked up and distributed.
-		ok = application:set_env(arweave, config, Config#config{
+		ok = arweave_config:set_env(Config#config{
 			start_from_latest_state = false,
 			peers = [ar_test_node:peer_ip(peer1)]
 		}),
@@ -199,5 +199,5 @@ test_persisted_mempool() ->
 		B = read_block_when_stored(H),
 		?assertEqual([SignedTX#tx.id], B#block.txs)
 	after
-		ok = application:set_env(arweave, config, Config)
+		ok = arweave_config:set_env(Config)
 	end.

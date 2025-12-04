@@ -10,7 +10,7 @@
 
 -include_lib("arweave/include/ar.hrl").
 -include_lib("arweave/include/ar_sup.hrl").
--include_lib("arweave/include/ar_config.hrl").
+-include_lib("arweave_config/include/arweave_config.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 -define(READ_RANGE_CHUNKS, 400).
@@ -41,7 +41,7 @@ register_workers() ->
 	Workers ++ [ChunkCopy].
 
 register_read_workers() ->
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	StoreIDs = [
 		ar_storage_module:id(StorageModule) || StorageModule <- Config#config.storage_modules
 	] ++ [?DEFAULT_MODULE],
@@ -311,7 +311,7 @@ test_process_queue() ->
 		queue:to_list(Worker3#worker_tasks.task_queue)).
 
 test_register_workers() ->
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	StoreIDs = [
 		ar_storage_module:id(StorageModule) || StorageModule <- Config#config.storage_modules],
 	lists:foreach(

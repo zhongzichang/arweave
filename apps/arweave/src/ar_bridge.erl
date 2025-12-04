@@ -12,8 +12,10 @@
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
+-export([block_propagation_parallelization/0]).
+
 -include_lib("arweave/include/ar.hrl").
--include_lib("arweave/include/ar_config.hrl").
+-include_lib("arweave_config/include/arweave_config.hrl").
 
 -record(state, {
 	block_propagation_queue = gb_sets:new(),
@@ -23,6 +25,8 @@
 %%%===================================================================
 %%% API
 %%%===================================================================
+block_propagation_parallelization() ->
+	?BLOCK_PROPAGATION_PARALLELIZATION.
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -122,7 +126,7 @@ handle_info({event, block, {new, B, _}}, State) ->
 			%% The cache should have been just pruned and this block is old.
 			{noreply, State};
 		_ ->
-			{ok, Config} = application:get_env(arweave, config),
+			{ok, Config} = arweave_config:get_env(),
 			TrustedPeers = ar_peers:get_trusted_peers(),
 			SpecialPeers = Config#config.block_gossip_peers,
 			Peers = ((SpecialPeers ++ ar_peers:get_peers(current)) -- TrustedPeers) ++ TrustedPeers,
@@ -252,7 +256,7 @@ send_to_worker(Peer, {JSON, B}, W) ->
 	end.
 
 send_and_log(Peer, H, Height, Format, Bin, RecallByte) ->
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	Reply =
 		case Format of
 			json ->

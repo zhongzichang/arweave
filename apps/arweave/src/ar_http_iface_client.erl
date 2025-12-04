@@ -29,7 +29,7 @@
 %% -- End of testing exports
 
 -include("ar.hrl").
--include("ar_config.hrl").
+-include_lib("arweave_config/include/arweave_config.hrl").
 -include("ar_consensus.hrl").
 -include("ar_data_sync.hrl").
 -include("ar_data_discovery.hrl").
@@ -442,8 +442,8 @@ get_mempool([]) ->
 	{error, not_found};
 get_mempool([Peer | Peers]) ->
     case get_mempool(Peer) of
-		{ok, TXIDs} ->
-			{ok, TXIDs};
+		{{ok, TXIDs}, Peer} ->
+			{{ok, TXIDs}, Peer};
 		{error, Error} ->
 			log_failed_request(Error, [{event, failed_to_get_mempool_txids_from_peer},
 					{peer, ar_util:format_peer(Peer)},
@@ -462,7 +462,7 @@ get_mempool(Peer) ->
 		%% from a mempool with 250 MiB worth of transaction headers with no data.
 		limit => 3000000,
 		headers => p2p_headers()
-	})).
+	}), Peer).
 
 get_sync_buckets(Peer) ->
 	handle_get_sync_buckets_response(ar_http:req(#{
@@ -918,14 +918,14 @@ handle_chunk_response({error, _} = Response, _RequestedPacking, _Peer) ->
 handle_chunk_response(Response, _RequestedPacking, _Peer) ->
 	{error, Response}.
 
-handle_mempool_response({ok, {{<<"200">>, _}, _, Body, _, _}}) ->
+handle_mempool_response({ok, {{<<"200">>, _}, _, Body, _, _}}, Peer) ->
 	case catch jiffy:decode(Body) of
 		{'EXIT', Error} ->
 			?LOG_WARNING([{event, failed_to_parse_peer_mempool},
 				{error, io_lib:format("~p", [Error])}]),
 			{error, invalid_json};
 		L when is_list(L) ->
-			lists:foldr(
+			Result = lists:foldr(
 				fun	(_, {error, Reason}) ->
 						{error, Reason};
 					(EncodedTXID, {ok, Acc}) ->
@@ -946,13 +946,19 @@ handle_mempool_response({ok, {{<<"200">>, _}, _, Body, _, _}}) ->
 				end,
 				{ok, []},
 				L
-			);
+			),
+			case Result of
+				{ok, TXIDs} ->
+					{{ok, TXIDs}, Peer};
+				{error, Reason2} ->
+					{error, Reason2}
+			end;
 		NotList ->
 			?LOG_WARNING([{event, failed_to_parse_peer_mempool}, {reason, invalid_format},
 				{reply, io_lib:format("~p", [NotList])}]),
 			{error, invalid_format}
 	end;
-handle_mempool_response(Response) ->
+handle_mempool_response(Response, _Peer) ->
 	{error, Response}.
 
 handle_get_sync_buckets_response({ok, {{<<"200">>, _}, _, Body, _, _}}) ->
@@ -1424,16 +1430,16 @@ handle_cm_noop_response(Response) ->
 	{error, Response}.
 
 p2p_headers() ->
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	[{<<"x-p2p-port">>, integer_to_binary(Config#config.port)},
 			{<<"x-release">>, integer_to_binary(?RELEASE_NUMBER)}].
 
 cm_p2p_headers() ->
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	add_header(<<"x-cm-api-secret">>, Config#config.cm_api_secret, p2p_headers()).
 
 pool_client_headers() ->
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	Headers = add_header(<<"x-pool-api-key">>, Config#config.pool_api_key, p2p_headers()),
 	case Config#config.pool_worker_name of
 		not_set ->

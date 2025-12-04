@@ -7,7 +7,7 @@
 
 -include("ar.hrl").
 -include("ar_poa.hrl").
--include("ar_config.hrl").
+-include_lib("arweave_config/include/arweave_config.hrl").
 -include("ar_consensus.hrl").
 -include("ar_chunk_storage.hrl").
 -include("ar_verify_chunks.hrl").
@@ -43,7 +43,7 @@ name(StoreID) ->
 %%%===================================================================
 
 init(StoreID) ->
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	?LOG_INFO([{event, verify_chunk_storage_started},
 		{store_id, StoreID}, {mode, Config#config.verify},
 		{chunk_samples, Config#config.verify_samples}]),

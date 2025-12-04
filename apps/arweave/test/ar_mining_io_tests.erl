@@ -1,7 +1,7 @@
 -module(ar_mining_io_tests).
 
 -include_lib("arweave/include/ar.hrl").
--include_lib("arweave/include/ar_config.hrl").
+-include_lib("arweave_config/include/arweave_config.hrl").
 -include_lib("arweave/include/ar_consensus.hrl").
 -include_lib("arweave/include/ar_mining.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -14,7 +14,7 @@ chunks_read(_Worker, WhichChunk, Candidate, RangeStart, ChunkOffsets) ->
 setup_all() ->
 	[B0] = ar_weave:init([], 1, ?WEAVE_SIZE),
 	RewardAddr = ar_wallet:to_address(ar_wallet:new_keyfile()),
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	StorageModules = lists:flatten(
 		[[{ar_block:partition_size(), N, {spora_2_6, RewardAddr}}] || N <- lists:seq(0, 8)]),
 	ar_test_node:start(B0, RewardAddr, Config, StorageModules),
@@ -132,8 +132,43 @@ test_partitions() ->
 			{4, MiningAddress, 0}],
 		ar_mining_io:get_partitions(trunc(5 * ar_block:partition_size()))).
 
+get_minable_storge_modules_test() ->
+	{ok, Config} = arweave_config:get_env(),
+	Addr = Config#config.mining_addr,
+	try
+		Input = [
+			{100, 0, {spora_2_6, Addr}},
+			{200, 0, unpacked},
+			{300, 0, {replica_2_9, Addr}}
+		],
+		Expected = [
+			{100, 0, {spora_2_6, Addr}},
+			{300, 0, {replica_2_9, Addr}}
+		],
+		arweave_config:set_env(Config#config{storage_modules = Input}),
+		?assertEqual(Expected, ar_mining_io:get_minable_storage_modules())
+	after
+		arweave_config:set_env(Config)
+	end.
+
+get_packing_test() ->
+	{ok, Config} = arweave_config:get_env(),
+	Addr = Config#config.mining_addr,
+	try
+		Input = [
+			{100, 0, unpacked},
+			{200, 0, {spora_2_6, Addr}},
+			{300, 0, {replica_2_9, Addr}}
+		],
+		Expected = {spora_2_6, Addr},
+		arweave_config:set_env(Config#config{storage_modules = Input}),
+		?assertEqual(Expected, ar_mining_io:get_packing())
+	after
+		arweave_config:set_env(Config)
+	end.
+
 default_candidate() ->
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	MiningAddr = Config#config.mining_addr,
 	#mining_candidate{
 		mining_address = MiningAddr

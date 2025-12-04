@@ -3,7 +3,7 @@
 -export([fetch/3]).
 
 -include("ar.hrl").
--include("ar_config.hrl").
+-include_lib("arweave_config/include/arweave_config.hrl").
 -include("ar_data_discovery.hrl").
 
 %% The size of the span of the weave we search at a time.
@@ -50,7 +50,7 @@ fetch(Start, End, StoreID) ->
 			UnsyncedIntervals = get_unsynced_intervals(Start, End2, StoreID),
 
 			Bucket = Start div ?NETWORK_DATA_BUCKET_SIZE,
-			{ok, Config} = application:get_env(arweave, config),
+			{ok, Config} = arweave_config:get_env(),
 			AllPeers =
 				case Config#config.sync_from_local_peers_only of
 					true ->

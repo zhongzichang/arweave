@@ -1,7 +1,7 @@
 -module(ar_tx_tests).
 
 -include("../include/ar.hrl").
--include("../include/ar_config.hrl").
+-include_lib("arweave_config/include/arweave_config.hrl").
 
 -include_lib("eunit/include/eunit.hrl").
 
@@ -231,8 +231,8 @@ polls_for_transactions_and_gossips_and_mines(B0, TXFuns) ->
 	%% Expect them to be accepted, fetched by the peer we did not push them to
 	%% and included into the block.
 	%% Expect the block to be accepted by the peer.
-	{ok, MainConfig} = application:get_env(arweave, config),
-	{ok, PeerConfig} = ar_test_node:remote_call(peer1, application, get_env, [arweave, config]),
+	{ok, MainConfig} = arweave_config:get_env(),
+	{ok, PeerConfig} = ar_test_node:remote_call(peer1, arweave_config, get_env, []),
 	try
 		MainConfig2 = MainConfig#config{ max_propagation_peers = 0 },
 		_ = ar_test_node:start(#{ b0 => B0, config => MainConfig2 }),
@@ -279,7 +279,7 @@ polls_for_transactions_and_gossips_and_mines(B0, TXFuns) ->
 			TXs
 		)
 	after
-		application:set_env(arweave, config, MainConfig),
+		arweave_config:set_env(MainConfig),
 		ar_test_node:set_config(peer1, PeerConfig)
 	end.
 
@@ -293,8 +293,8 @@ keeps_txs_after_new_block(B0, FirstTXSetFuns, SecondTXSetFuns) ->
 	%% Expect the block to be accepted.
 	%% Expect transactions from the difference between the two sets to be kept in the mempool.
 	%% Mine a block on the first node, expect the difference to be included into the block.
-	{ok, MainConfig} = application:get_env(arweave, config),
-	{ok, PeerConfig} = ar_test_node:remote_call(peer1, application, get_env, [arweave, config]),
+	{ok, MainConfig} = arweave_config:get_env(),
+	{ok, PeerConfig} = ar_test_node:remote_call(peer1, arweave_config, get_env, []),
 
 	try
 		MainConfig2 = MainConfig#config{ disable = [tx_poller | MainConfig#config.disable] },
@@ -343,7 +343,7 @@ keeps_txs_after_new_block(B0, FirstTXSetFuns, SecondTXSetFuns) ->
 			lists:sort((read_block_when_stored(hd(BI2)))#block.txs)
 		)
 	after
-		application:set_env(arweave, config, MainConfig),
+		arweave_config:set_env(MainConfig),
 		ar_test_node:set_config(peer1, PeerConfig)
 	end.
 
@@ -662,13 +662,14 @@ test_drops_v1_txs_exceeding_mempool_limit() ->
 		end,
 		lists:sublist(TXs, 5)
 	),
-	{ok, Mempool1} = ar_http_iface_client:get_mempool(ar_test_node:peer_ip(peer1)),
+	Peer1 = ar_test_node:peer_ip(peer1),
+	{{ok, Mempool1}, Peer1} = ar_http_iface_client:get_mempool(Peer1),
 	%% The transactions have the same utility therefore they are sorted in the
 	%% order of submission.
 	?assertEqual([TX#tx.id || TX <- lists:sublist(TXs, 5)], Mempool1),
 	Last = lists:last(TXs),
 	{ok, {{<<"200">>, _}, _, <<"OK">>, _, _}} = ar_test_node:post_tx_to_peer(peer1, Last, false),
-	{ok, Mempool2} = ar_http_iface_client:get_mempool(ar_test_node:peer_ip(peer1)),
+	{{ok, Mempool2}, Peer1} = ar_http_iface_client:get_mempool(Peer1),
 	%% There is no place for the last transaction in the mempool.
 	?assertEqual([TX#tx.id || TX <- lists:sublist(TXs, 5)], Mempool2).
 
@@ -694,13 +695,14 @@ drops_v2_txs_exceeding_mempool_limit() ->
 		end,
 		lists:sublist(TXs, 10)
 	),
-	{ok, Mempool1} = ar_http_iface_client:get_mempool(ar_test_node:peer_ip(peer1)),
+	Peer1 = ar_test_node:peer_ip(peer1),
+	{{ok, Mempool1}, Peer1} = ar_http_iface_client:get_mempool(Peer1),
 	%% The transactions have the same utility therefore they are sorted in the
 	%% order of submission.
 	?assertEqual([TX#tx.id || TX <- lists:sublist(TXs, 10)], Mempool1),
 	Last = lists:last(TXs),
 	{ok, {{<<"200">>, _}, _, <<"OK">>, _, _}} = ar_test_node:post_tx_to_peer(peer1, Last, false),
-	{ok, Mempool2} = ar_http_iface_client:get_mempool(ar_test_node:peer_ip(peer1)),
+	{{ok, Mempool2}, Peer1} = ar_http_iface_client:get_mempool(Peer1),
 	%% The last TX is twice as big and twice as valuable so it replaces two
 	%% other transactions in the memory pool.
 	?assertEqual([Last#tx.id | [TX#tx.id || TX <- lists:sublist(TXs, 8)]], Mempool2),
@@ -708,7 +710,7 @@ drops_v2_txs_exceeding_mempool_limit() ->
 	StrippedTX = ar_test_node:sign_tx(Key, #{ last_tx => B0#block.indep_hash,
 			data => BigChunk, tags => [{<<"nonce">>, integer_to_binary(12)}] }),
 	ar_test_node:assert_post_tx_to_peer(peer1, StrippedTX#tx{ data = <<>> }),
-	{ok, Mempool3} = ar_http_iface_client:get_mempool(ar_test_node:peer_ip(peer1)),
+	{{ok, Mempool3}, Peer1} = ar_http_iface_client:get_mempool(Peer1),
 	?assertEqual([Last#tx.id] ++ [TX#tx.id || TX <- lists:sublist(TXs, 8)]
 			++ [StrippedTX#tx.id], Mempool3).
 
@@ -860,7 +862,7 @@ recovers_from_forks(ForkHeight) ->
 	_ = ar_test_node:start(B0),
 	_ = ar_test_node:start_peer(peer1, B0),
 	ar_test_node:connect_to_peer(peer1),
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	MainPort = Config#config.port,
 	PreForkTXs = lists:foldl(
 		fun(Height, TXs) ->

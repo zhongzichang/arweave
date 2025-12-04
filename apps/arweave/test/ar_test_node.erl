@@ -5,7 +5,8 @@
 		wait_until_joined/0, wait_until_joined/1,
 		restart/0, restart/1, restart_with_config/1, restart_with_config/2,
 		start_other_node/4, start_node/2, start_node/3, start_coordinated/1, base_cm_config/1, mine/1,
-		wait_until_height/1, wait_until_height/2, wait_until_height/3, assert_wait_until_height/2, http_get_block/2, get_blocks/1,
+		wait_until_height/1, wait_until_height/2, wait_until_height/3, assert_wait_until_height/2, 
+		wait_until_mining_paused/1, http_get_block/2, get_blocks/1,
 		mock_to_force_invalid_h1/0, mainnet_packing_mocks/0,
 		get_difficulty_for_invalid_hash/0, invalid_solution/0,
 		valid_solution/0, new_mock/2, mock_function/3, unmock_module/1, remote_call/4,
@@ -39,7 +40,7 @@
 		mock_functions/1, test_with_mocked_functions/2, test_with_mocked_functions/3]).
 
 -include("ar.hrl").
--include("ar_config.hrl").
+-include_lib("arweave_config/include/arweave_config.hrl").
 -include("ar_consensus.hrl").
 
 -include_lib("eunit/include/eunit.hrl").
@@ -68,6 +69,7 @@
 -define(GET_TX_DATA_TIMEOUT, 200_000).
 -define(WAIT_UNTIL_JOINED_TIMEOUT, 200_000).
 -define(WAIT_SYNCS_DATA_TIMEOUT, 200_000).
+-define(WAIT_UNTIL_MINING_PAUSED_TIMEOUT, 60_000).
 
 %%%===================================================================
 %%% Public interface.
@@ -127,34 +129,72 @@ boot_peer(TestType, Node) ->
 	try_boot_peer(TestType, Node, ?MAX_BOOT_RETRIES).
 
 try_boot_peer(_TestType, _Node, 0) ->
-    %% You might log an error or handle this case specifically as per your application logic.
-    {error, max_retries_exceeded};
+	%% You might log an error or handle this case specifically
+	%% as per your application logic.
+	{error, max_retries_exceeded};
 try_boot_peer(TestType, Node, Retries) ->
-    NodeName = peer_name(Node),
-    Port = get_unused_port(),
-    Cookie = erlang:get_cookie(),
-
+	NodeName = peer_name(Node),
+	Port = get_unused_port(),
+	Cookie = erlang:get_cookie(),
 	Paths = code:get_path(),
-
-    filelib:ensure_dir("./.tmp"),
+	filelib:ensure_dir("./.tmp"),
 	Schedulers = erlang:system_info(schedulers_online),
-    Cmd = io_lib:format(
-        "erl +S ~B:~B -pa ~s -config config/sys.config -noshell " ++
-		"-name ~s -setcookie ~s -run ar main debug port ~p " ++
-        "data_dir .tmp/data_~s_~s no_auto_join disable_replica_2_9_device_limit " ++
-		"> ~s-~s.out 2>&1 &",
-        [Schedulers, Schedulers, string:join(Paths, " "), NodeName, Cookie, Port,
-			atom_to_list(TestType), NodeName, Node, get_node_namespace()]),
-	io:format("Launching peer ~p: ~s~n", [Node, Cmd]),
-    os:cmd(Cmd),
-    case wait_until_node_is_ready(NodeName) of
-        {ok, _Node} ->
-            io:format("~s started at port ~p.~n", [NodeName, Port]),
-            {node(), NodeName};
-        {error, Reason} ->
-            io:format("Error starting ~s: ~p. Retries left: ~p~n", [NodeName, Reason, Retries]),
-            try_boot_peer(TestType, Node, Retries - 1)
-    end.
+	RawCommand = string:join([
+		"erl +S ~B:~B",
+		"-pa", "~s",
+		"-config", "config/sys.config",
+		"-noshell",
+		"-name", "~s",
+		"-setcookie", "~s",
+		"-run ar main",
+		"debug",
+		"port", "~p",
+		"data_dir", ".tmp/data_~s_~s",
+		"no_auto_join",
+		"disable_replica_2_9_device_limit",
+		"> ~s-~s.out 2>&1"
+	], " "),
+	CommandParams = [
+		Schedulers,
+		Schedulers,
+		string:join(Paths, " "),
+		NodeName,
+		Cookie,
+		Port,
+		atom_to_list(TestType),
+		NodeName,
+		Node,
+		get_node_namespace()
+	],
+	Cmd = io_lib:format(RawCommand, CommandParams),
+	run_command(Node, Cmd),
+	case wait_until_node_is_ready(NodeName) of
+		{ok, _Node} ->
+			io:format("~s started at port ~p.~n", [NodeName, Port]),
+			{node(), NodeName};
+		{error, Reason} ->
+			io:format("Error starting ~s: ~p. Retries left: ~p~n", [NodeName, Reason, Retries]),
+			try_boot_peer(TestType, Node, Retries - 1)
+	end.
+
+%%--------------------------------------------------------------------
+%% @doc run a command in asynchronous way using `spawn/1' instead of
+%% using `&' from shell feature.
+%% @end 
+%%--------------------------------------------------------------------
+run_command(Node, Command) ->
+	spawn(fun() -> run_command_init(Node, Command) end).
+
+%% @hidden
+run_command_init(Node, Command) ->
+	io:format("Launching peer (~p) ~p: ~s~n", [self(), Node, Command]),
+	try
+		Result = os:cmd(Command),
+		io:format("command result: ~p~n", [Result])
+	catch
+		E:R:S ->
+			io:format("failed command: ~p:~p:~p~n", [E,R,S])
+	end.
 
 wait_for_peers([]) ->
 	ok;
@@ -176,7 +216,7 @@ peer_name(Node) ->
 	).
 
 peer_port(Node) ->
-	{ok, Config} = ar_test_node:remote_call(Node, application, get_env, [arweave, config]),
+	{ok, Config} = ar_test_node:remote_call(Node, arweave_config, get_env, []),
 	Config#config.port.
 
 stop_peers([]) ->
@@ -191,7 +231,8 @@ stop_peer(Node) ->
 	try
 		rpc:call(peer_name(Node), init, stop, [], 30000)
 	catch
-		_:_ ->
+		E:R:S ->
+			io:format("stop_peer error: ~p:~p:~p~n", [E,R,S]),
 			%% we don't care if the node is already stopped
 			ok
 	end.
@@ -213,13 +254,13 @@ wait_until_joined() ->
 	 ).
 
 get_config(Node) ->
-	remote_call(Node, application, get_env, [arweave, config]).
+	remote_call(Node, arweave_config, get_env, []).
 
 set_config(Node, Config) ->
-	remote_call(Node, application, set_env, [arweave, config, Config]).
+	remote_call(Node, arweave_config, set_env, [Config]).
 
 update_config(Config) ->
-	{ok, BaseConfig} = application:get_env(arweave, config),
+	{ok, BaseConfig} = arweave_config:get_env(),
 	Config2 = BaseConfig#config{
 		start_from_latest_state = Config#config.start_from_latest_state,
 		auto_join = Config#config.auto_join,
@@ -243,7 +284,7 @@ update_config(Config) ->
 		repack_in_place_storage_modules = Config#config.repack_in_place_storage_modules,
 		allow_rebase = Config#config.allow_rebase
 	},
-	ok = application:set_env(arweave, config, Config2),
+	ok = arweave_config:set_env(Config2),
 	?LOG_INFO("Updated Config:"),
 	ar_config:log_config(Config2),
 	Config2.
@@ -257,7 +298,8 @@ start_node(B0, Config) ->
 start_node(B0, Config, WaitUntilSync) ->
 	?LOG_INFO("Starting node"),
 	clean_up_and_stop(),
-	{ok, BaseConfig} = application:get_env(arweave, config),
+	arweave_config:start(),
+	{ok, BaseConfig} = arweave_config:get_env(),
 	write_genesis_files(BaseConfig#config.data_dir, B0),
 	update_config(Config),
 	ar:start_dependencies(),
@@ -349,7 +391,7 @@ mine(Node) ->
 %% @doc Fetch and decode a binary-encoded block by hash H from the HTTP API of the
 %% given node. Return {ok, B} | {error, Reason}.
 http_get_block(H, Node) ->
-	{ok, Config} = remote_call(Node, application, get_env, [arweave, config]),
+	{ok, Config} = remote_call(Node, arweave_config, get_env, []),
 	Port = Config#config.port,
 	Peer = {127, 0, 0, 1, Port},
 	case ar_http:req(#{ peer => Peer, method => get,
@@ -557,6 +599,7 @@ start() ->
 	start(#{}).
 
 start(Options) when is_map(Options) ->
+	arweave_config:start(),
 	B0 =
 		case maps:get(b0, Options, not_set) of
 			not_set ->
@@ -574,7 +617,7 @@ start(Options) when is_map(Options) ->
 	Config =
 		case maps:get(config, Options, not_set) of
 			not_set ->
-				element(2, application:get_env(arweave, config));
+				element(2, arweave_config:get_env());
 			Value2 ->
 				Value2
 		end,
@@ -607,8 +650,9 @@ start(B0, RewardAddr, Config) ->
 %% Config after the test is done. Otherwise the tests that run after yours may fail.
 start(B0, RewardAddr, Config, StorageModules) ->
 	clean_up_and_stop(),
+	arweave_config:start(),
 	write_genesis_files(Config#config.data_dir, B0),
-	ok = application:set_env(arweave, config, Config#config{
+	ok = arweave_config:set_env(Config#config{
 		start_from_latest_state = true,
 		auto_join = true,
 		peers = [],
@@ -803,7 +847,7 @@ sign_tx(Node, Wallet, Args, SignFun) ->
 	).
 
 stop() ->
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	application:stop(arweave),
 	ar:stop_dependencies(),
 	Config.
@@ -822,7 +866,7 @@ join_on(#{ node := Node, join_on := JoinOnNode }, Rejoin) ->
 
 join(JoinOnNode, Rejoin) ->
 	Peer = peer_ip(JoinOnNode),
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	case Rejoin of
 		true ->
 			stop();
@@ -832,7 +876,7 @@ join(JoinOnNode, Rejoin) ->
 	RewardAddr = ar_wallet:to_address(ar_wallet:new_keyfile()),
 	StorageModules = [{ar_block:partition_size(), N,
 			get_default_storage_module_packing(RewardAddr, N)} || N <- lists:seq(0, 4)],
-	ok = application:set_env(arweave, config, Config#config{
+	ok = arweave_config:set_env(Config#config{
 		start_from_latest_state = false,
 		mining_addr = RewardAddr,
 		storage_modules = StorageModules,
@@ -933,7 +977,7 @@ wait_until_syncs_genesis_data(Node) ->
 	ok = remote_call(Node, ar_test_node, wait_until_syncs_genesis_data, [], 100_000).
 
 wait_until_syncs_genesis_data() ->
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	ar_util:do_until(
 		fun() ->
 			case ar_node:get_current_block() of
@@ -1029,17 +1073,32 @@ wait_until_block_index(BI) ->
 		?BLOCK_INDEX_TIMEOUT
 	).
 
+wait_until_mining_paused(Node) ->
+	ar_util:do_until(
+		fun() ->
+			case Node of
+				main ->
+					ar_mining_server:is_paused();
+				_ ->
+					remote_call(Node, ar_mining_server, is_paused, [])
+			end
+		end,
+		1000,
+		?WAIT_UNTIL_MINING_PAUSED_TIMEOUT
+	).
+
 %% Safely perform an rpc:call/4 and return results in a tagged tuple.
 safe_remote_call(Node, Module, Function, Args) ->
     try rpc:call(Node, Module, Function, Args, 30000) of
         Result -> {ok, Result}
     catch
-        error:Reason ->
+        error:Reason:S ->
             %% Log the error if necessary
-            io:format("Remote call error: ~p~n", [Reason]),
+            io:format("Remote call error: ~p:~p~n", [Reason,S]),
             {error, Reason};
-        _:_ ->
+	E:R:S ->
             %% Catching other exceptions, returning a general error.
+            io:format("Remote call error: ~p:~p:~p~n", [E,R,S]),
             {error, unknown}
     end.
 

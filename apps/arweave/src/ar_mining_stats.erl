@@ -2,7 +2,7 @@
 -behaviour(gen_server).
 
 -export([start_link/0, start_performance_reports/0, pause_performance_reports/1, mining_paused/0,
-		set_total_data_size/1, set_storage_module_data_size/6,
+		set_storage_module_data_size/6,
 		vdf_computed/0, raw_read_rate/2, chunks_read/2, h1_computed/2, h2_computed/2,
 		h1_solution/0, h2_solution/0, block_found/0, block_mined_but_orphaned/0,
 		h1_sent_to_peer/2, h1_received_from_peer/2, h2_sent_to_peer/1, h2_received_from_peer/1,
@@ -11,7 +11,7 @@
 -export([init/1, handle_cast/2, handle_call/3, handle_info/2, terminate/2]).
 
 -include_lib("arweave/include/ar.hrl").
--include_lib("arweave/include/ar_config.hrl").
+-include_lib("arweave_config/include/arweave_config.hrl").
 -include_lib("arweave/include/ar_consensus.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -184,17 +184,22 @@ block_mined_but_orphaned() ->
 block_mined_but_orphaned(Now) ->
 	increment_count(block_mined_but_orphaned, 1, Now).
 
-set_total_data_size(DataSize) ->
+update_total_data_size() ->
+	Pattern = {
+		{partition, '_', storage_module, '_', packing, '_'}, '$1'
+	},
+	Sizes = [Size || [Size] <- ets:match(?MODULE, Pattern)],
+	TotalDataSize = lists:sum(Sizes),
 	try
-		prometheus_gauge:set(v2_index_data_size, DataSize),
-		ets:insert(?MODULE, {total_data_size, DataSize})
+		prometheus_gauge:set(v2_index_data_size, TotalDataSize),
+		ets:insert(?MODULE, {total_data_size, TotalDataSize})
 	catch
 		error:badarg ->
 			?LOG_WARNING([{event, set_total_data_size_failed},
-				{reason, prometheus_not_started}, {data_size, DataSize}]);
+				{reason, prometheus_not_started}, {data_size, TotalDataSize}]);
 		Type:Reason ->
 			?LOG_ERROR([{event, set_total_data_size_failed},
-				{type, Type}, {reason, Reason}, {data_size, DataSize}])
+				{type, Type}, {reason, Reason}, {data_size, TotalDataSize}])
 	end.
 
 set_storage_module_data_size(
@@ -209,7 +214,8 @@ set_storage_module_data_size(
 			 PackingDifficulty],
 			DataSize),
 		ets:insert(?MODULE, {
-			{partition, PartitionNumber, storage_module, StoreID, packing, Packing}, DataSize})
+			{partition, PartitionNumber, storage_module, StoreID, packing, Packing}, DataSize}),
+		update_total_data_size()
 	catch
 		error:badarg ->
 			?LOG_WARNING([{event, set_storage_module_data_size_failed},
@@ -442,7 +448,7 @@ optimal_partition_hash_hps(PoA1Multiplier, VDFSpeed, PartitionDataSize, TotalDat
 	H1Optimal + H2Optimal.
 
 generate_report() ->
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	Height = ar_node:get_height(),
 	Packing = ar_mining_io:get_packing(),
 	Partitions = ar_mining_io:get_partitions(),
@@ -971,10 +977,11 @@ test_vdf_stats() ->
 	?assertEqual(undefined, vdf_speed(1000)).
 
 test_data_size_stats() ->
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	try
-		application:set_env(arweave, config,
-			Config#config{ mining_addr = <<"MINING">> }),
+		arweave_config:set_env(Config#config{
+			mining_addr = <<"MINING">>
+		}),
 
 		WeaveSize = floor(2 * ar_block:partition_size()),
 		ets:insert(node_state, [{weave_size, WeaveSize}]),
@@ -984,11 +991,11 @@ test_data_size_stats() ->
 		do_test_data_size_stats(Config, {composite, <<"MINING">>, 1}, {composite, <<"PACKING">>, 1}),
 		do_test_data_size_stats(Config, {composite, <<"MINING">>, 2}, {composite, <<"PACKING">>, 2})
 	after
-		application:set_env(arweave, config, Config)
+		arweave_config:set_env(Config)
 	end.
 
 do_test_data_size_stats(Config, Mining, Packing) ->
-	application:set_env(arweave, config, Config#config{ 
+	arweave_config:set_env(Config#config{ 
 		storage_modules = [
 			{floor(0.1 * ar_block:partition_size()), 10, unpacked},
 			{floor(0.1 * ar_block:partition_size()), 10, Mining},
@@ -1311,7 +1318,7 @@ test_report_poa1_multiple_2() ->
 	test_report({composite, <<"MINING">>, 2}, {composite, <<"PACKING">>, 2}, 2).
 
 test_report(Mining, Packing, PoA1Multiplier) ->
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	MiningAddress = case Mining of
 		{spora_2_6, Addr} ->
 			Addr;
@@ -1353,11 +1360,10 @@ test_report(Mining, Packing, PoA1Multiplier) ->
 	],
 	
 	try	
-		application:set_env(arweave, config,
-			Config#config{
-				storage_modules = StorageModules,
-				mining_addr = MiningAddress
-			}),
+		arweave_config:set_env(Config#config{
+			storage_modules = StorageModules,
+			mining_addr = MiningAddress
+		}),
 		ar_mining_stats:pause_performance_reports(120000),
 		reset_all_stats(),
 		Partitions = [
@@ -1373,7 +1379,6 @@ test_report(Mining, Packing, PoA1Multiplier) ->
 		Now = erlang:monotonic_time(millisecond),
 		WeaveSize = floor(10 * ar_block:partition_size()),
 		ets:insert(node_state, [{weave_size, WeaveSize}]),
-		ar_mining_stats:set_total_data_size(floor(0.6 * ar_block:partition_size())),
 		ar_mining_stats:set_storage_module_data_size(
 			ar_storage_module:id({floor(0.1 * ar_block:partition_size()), 10, Mining}),
 			Mining, 1, floor(0.1 * ar_block:partition_size()), 10,
@@ -1525,5 +1530,5 @@ test_report(Mining, Packing, PoA1Multiplier) ->
 		},
 		Report2)
 	after
-		application:set_env(arweave, config, Config)
+		arweave_config:set_env(Config)
 	end.

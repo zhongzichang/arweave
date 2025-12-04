@@ -3,7 +3,7 @@
 -export([run_benchmark/0, run_benchmark_from_cli/1]).
 
 -include_lib("arweave/include/ar_vdf.hrl").
--include_lib("arweave/include/ar_config.hrl").
+-include_lib("arweave_config/include/arweave_config.hrl").
 
 run_benchmark_from_cli(Args) ->
 	Mode = list_to_atom(get_flag_value(Args, "mode", "default")),
@@ -36,13 +36,13 @@ run_benchmark(Mode, Difficulty, Verify) ->
 			%% Run as part of startup, use whatever is set in the config
 			ok;
 		openssl ->
-			ok = application:set_env(arweave, config, #config{ vdf = openssl });
+			ok = arweave_config:set_env(#config{ vdf = openssl });
 		fused ->
-			ok = application:set_env(arweave, config, #config{ vdf = fused });
+			ok = arweave_config:set_env(#config{ vdf = fused });
 		hiopt_m4 ->
-			ok = application:set_env(arweave, config, #config{ vdf = hiopt_m4 });
+			ok = arweave_config:set_env(#config{ vdf = hiopt_m4 });
 		default ->
-			ok = application:set_env(arweave, config, #config{})
+			ok = arweave_config:set_env(#config{})
 	end,
 	Input = crypto:strong_rand_bytes(32),
 	{Time, {ok, Output, Checkpoints}} = timer:tc(fun() -> 

@@ -1,6 +1,6 @@
 -module(ar_http_iface_tests).
 
--include_lib("ar_config.hrl").
+-include_lib("arweave_config/include/arweave_config.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 -import(ar_test_node, [wait_until_height/2, wait_until_receives_txs/1,
@@ -279,7 +279,7 @@ test_single_regossip(_) ->
 	).
 
 test_node_blacklisting_get_spammer() ->
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	{RequestFun, ErrorResponse} = get_fun_msg_pair(get_info),
 	node_blacklisting_test_frame(
 		RequestFun,
@@ -289,11 +289,16 @@ test_node_blacklisting_get_spammer() ->
 	).
 
 test_node_blacklisting_post_spammer() ->
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	{RequestFun, ErrorResponse} = get_fun_msg_pair(send_tx_binary),
 	NErrors = 11,
 	NRequests = Config#config.requests_per_minute_limit div 2 + NErrors,
-	node_blacklisting_test_frame(RequestFun, ErrorResponse, NRequests, NErrors).
+	node_blacklisting_test_frame(
+		RequestFun,
+		ErrorResponse,
+		NRequests,
+		NErrors
+	).
 
 %% @doc Given a label, return a fun and a message.
 -spec get_fun_msg_pair(atom()) -> {fun(), any()}.
@@ -325,13 +330,16 @@ send_tx_binary(Index, InvalidTX) ->
 
 
 %% @doc Frame to test spamming an endpoint.
-%% TODO: Perform the requests in parallel. Just changing the lists:map/2 call
-%% to an ar_util:pmap/2 call fails the tests currently.
 -spec node_blacklisting_test_frame(fun(), any(), non_neg_integer(), non_neg_integer()) -> ok.
 node_blacklisting_test_frame(RequestFun, ErrorResponse, NRequests, ExpectedErrors) ->
 	ar_blacklist_middleware:reset(),
 	ar_rate_limiter:off(),
-	Responses = lists:map(RequestFun, lists:seq(1, NRequests)),
+	Responses = ar_util:batch_pmap(
+		RequestFun,
+		lists:seq(1, NRequests),
+		50,
+		60_000
+	),
 	?assertEqual(length(Responses), NRequests),
 	ar_blacklist_middleware:reset(),
 	Got = count_by_response_type(ErrorResponse, Responses),
@@ -799,10 +807,11 @@ test_post_unsigned_tx({_B0, Wallet1, _Wallet2, _StaticWallet}) ->
 			peer => ar_test_node:peer_ip(main),
 			path => "/wallet"
 		}),
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	try
-		application:set_env(arweave, config,
-				Config#config{ internal_api_secret = <<"correct_secret">> }),
+		arweave_config:set_env(Config#config{
+			internal_api_secret = <<"correct_secret">>
+		}),
 		{ok, {{<<"421">>, _}, _, _, _, _}} =
 			ar_http:req(#{
 				method => post,
@@ -817,7 +826,7 @@ test_post_unsigned_tx({_B0, Wallet1, _Wallet2, _StaticWallet}) ->
 				path => "/wallet",
 				headers => [{<<"X-Internal-Api-Secret">>, <<"correct_secret">>}]
 			}),
-		application:set_env(arweave, config, Config#config{ internal_api_secret = not_set }),
+		arweave_config:set_env(Config#config{ internal_api_secret = not_set }),
 		{CreateWalletRes} = ar_serialize:dejsonify(CreateWalletBody),
 		[WalletAccessCode] = proplists:get_all_values(<<"wallet_access_code">>, CreateWalletRes),
 		[Address] = proplists:get_all_values(<<"wallet_address">>, CreateWalletRes),
@@ -856,8 +865,9 @@ test_post_unsigned_tx({_B0, Wallet1, _Wallet2, _StaticWallet}) ->
 				path => "/unsigned_tx",
 				body => ar_serialize:jsonify({UnsignedTXProps})
 			}),
-		application:set_env(arweave, config,
-				Config#config{ internal_api_secret = <<"correct_secret">> }),
+		arweave_config:set_env(Config#config{
+			internal_api_secret = <<"correct_secret">>
+		}),
 		{ok, {{<<"421">>, _}, _, _, _, _}} =
 			ar_http:req(#{
 				method => post,
@@ -874,7 +884,7 @@ test_post_unsigned_tx({_B0, Wallet1, _Wallet2, _StaticWallet}) ->
 				headers => [{<<"X-Internal-Api-Secret">>, <<"correct_secret">>}],
 				body => ar_serialize:jsonify({UnsignedTXProps})
 			}),
-		application:set_env(arweave, config, Config#config{ internal_api_secret = not_set }),
+		arweave_config:set_env(Config#config{ internal_api_secret = not_set }),
 		{Res} = ar_serialize:dejsonify(Body),
 		TXID = proplists:get_value(<<"id">>, Res),
 		timer:sleep(200),
@@ -895,7 +905,7 @@ test_post_unsigned_tx({_B0, Wallet1, _Wallet2, _StaticWallet}) ->
 			maps:from_list(GetTXRes)
 		)
 	after
-		ok = application:set_env(arweave, config, Config)
+		ok = arweave_config:set_env(Config)
 	end.
 
 %% @doc Ensure the HTTP client stops fetching data from an endpoint when its data size

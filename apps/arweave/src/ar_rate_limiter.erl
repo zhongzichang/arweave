@@ -7,7 +7,7 @@
 -export([init/1, handle_cast/2, handle_call/3, handle_info/2, terminate/2]).
 
 -include_lib("arweave/include/ar.hrl").
--include_lib("arweave/include/ar_config.hrl"). % Used in ?RPM_BY_PATH.
+-include_lib("arweave_config/include/arweave_config.hrl"). % Used in ?RPM_BY_PATH.
 -include_lib("arweave/include/ar_blacklist_middleware.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
@@ -26,7 +26,7 @@ start_link() ->
 %% @doc Hang until it is safe to make another request to the given Peer with the given Path.
 %% The limits are configured in include/ar_blacklist_middleware.hrl.
 throttle(Peer, Path) ->
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	case lists:member(Peer, Config#config.local_peers) of
 		true ->
 			ok;

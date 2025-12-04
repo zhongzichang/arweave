@@ -7,7 +7,7 @@
 -export([init/1]).
 
 -include_lib("arweave/include/ar_sup.hrl").
--include_lib("arweave/include/ar_config.hrl").
+-include_lib("arweave_config/include/arweave_config.hrl").
 
 %%%===================================================================
 %%% Public interface.
@@ -22,7 +22,7 @@ start_link() ->
 
 init([]) ->
 	ets:new(sync_records, [set, public, named_table, {read_concurrency, true}]),
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	ConfiguredWorkers = lists:map(
 		fun(StorageModule) ->
 			StoreID = ar_storage_module:id(StorageModule),

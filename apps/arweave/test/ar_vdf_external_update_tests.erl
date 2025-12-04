@@ -5,7 +5,7 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -include_lib("arweave/include/ar.hrl").
--include_lib("arweave/include/ar_config.hrl").
+-include_lib("arweave_config/include/arweave_config.hrl").
 -include_lib("arweave/include/ar_mining.hrl").
 
 -import(ar_test_node, [assert_wait_until_height/2, post_block/2, send_new_block/2]).
@@ -18,7 +18,7 @@
 %% -------------------------------------------------------------------------------------------------
 
 setup_external_update() ->
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	[B0] = ar_weave:init(),
 	%% Start the testnode with a configured VDF server so that it doesn't compute its own VDF -
 	%% this is necessary so that we can test the behavior of apply_external_update without any
@@ -45,7 +45,7 @@ setup_external_update() ->
 
 cleanup_external_update({Pid, Config}) ->
 	exit(Pid, kill),
-	ok = application:set_env(arweave, config, Config),
+	ok = arweave_config:set_env(Config),
 	ets:delete(add_task),
 	ets:delete(computed_output).
 

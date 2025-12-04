@@ -11,7 +11,7 @@
 -export([split_path/1, label_http_path/1, label_req/1]).
 
 -include_lib("arweave/include/ar.hrl").
--include_lib("arweave/include/ar_config.hrl").
+-include_lib("arweave_config/include/arweave_config.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 -define(HTTP_IFACE_MIDDLEWARES, [
@@ -45,7 +45,7 @@ init(_) ->
 	% if something goes wrong, the connections must
 	% be cleaned before leaving.
 	erlang:process_flag(trap_exit, true),
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	case start_http_iface_listener(Config) of
 		{ok, Pid} -> {ok, Pid};
 		Elsewise -> {error, Elsewise}
@@ -91,24 +91,25 @@ start_http_iface_listener(Config) ->
 	Dispatch = cowboy_router:compile([{'_', ?HTTP_IFACE_ROUTES}]),
 	TlsCertfilePath = Config#config.tls_cert_file,
 	TlsKeyfilePath = Config#config.tls_key_file,
-	TransportOpts = [
+	TransportOpts = #{
 		% ranch_tcp parameters
-		{backlog, Config#config.'http_api.tcp.backlog'},
-		{delay_send, Config#config.'http_api.tcp.delay_send'},
-		{keepalive, Config#config.'http_api.tcp.keepalive'},
-		{linger, {
+		backlog => Config#config.'http_api.tcp.backlog',
+		delay_send => Config#config.'http_api.tcp.delay_send',
+		keepalive => Config#config.'http_api.tcp.keepalive',
+		linger => {
 				Config#config.'http_api.tcp.linger',
 				Config#config.'http_api.tcp.linger_timeout'
-			}
 		},
-		{max_connections, Config#config.'http_api.tcp.max_connections'},
-		{nodelay, Config#config.'http_api.tcp.nodelay'},
-		{num_acceptors, Config#config.'http_api.tcp.num_acceptors'},
-		{port, Config#config.port},
-		{send_timeout_close, Config#config.'http_api.tcp.send_timeout_close'},
-		{send_timeout, Config#config.'http_api.tcp.send_timeout'},
-		{shutdown, Config#config.'http_api.tcp.listener_shutdown'}
-	],
+		max_connections => Config#config.'http_api.tcp.max_connections',
+		nodelay => Config#config.'http_api.tcp.nodelay',
+		num_acceptors => Config#config.'http_api.tcp.num_acceptors',
+		send_timeout_close => Config#config.'http_api.tcp.send_timeout_close',
+		send_timeout => Config#config.'http_api.tcp.send_timeout',
+		shutdown => Config#config.'http_api.tcp.listener_shutdown',
+		socket_opts => [
+			{port, Config#config.port}
+		]
+	},
 	ProtocolOpts = #{
 		active_n => Config#config.'http_api.http.active_n',
 		inactivity_timeout => Config#config.'http_api.http.inactivity_timeout',

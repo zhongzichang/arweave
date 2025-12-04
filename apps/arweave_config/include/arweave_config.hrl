@@ -1,9 +1,9 @@
 -ifndef(AR_CONFIG_HRL).
 -define(AR_CONFIG_HRL, true).
 
--include_lib("ar.hrl").
--include_lib("ar_p3.hrl").
--include_lib("ar_verify_chunks.hrl").
+-include_lib("arweave/include/ar.hrl").
+-include_lib("arweave/include/ar_p3.hrl").
+-include_lib("arweave/include/ar_verify_chunks.hrl").
 
 -record(config_webhook, {
 	events = [],
@@ -185,7 +185,7 @@
 	local_peers = [],
 	proxy_peers = [],
 	sync_from_local_peers_only = false,
-	data_dir = ".",
+	data_dir = "./data",
 	log_dir = ?LOG_DIR,
 	polling = ?DEFAULT_POLLING_INTERVAL, % Polling frequency in seconds.
 	block_pollers = ?DEFAULT_BLOCK_POLLERS,
@@ -197,16 +197,13 @@
 	mining_cache_size_mb,
 	packing_cache_size_limit,
 	data_cache_size_limit,
-	tx_validators,
 	post_tx_timeout = ?DEFAULT_POST_TX_TIMEOUT,
 	max_emitters = ?NUM_EMITTER_PROCESSES,
-	tx_propagation_parallelization, % DEPRECATED.
 	sync_jobs = ?DEFAULT_SYNC_JOBS,
 	header_sync_jobs = ?DEFAULT_HEADER_SYNC_JOBS,
 	data_sync_request_packed_chunks = false,
 	disk_pool_jobs = ?DEFAULT_DISK_POOL_JOBS,
 	load_key = not_set,
-	disk_space,
 	disk_space_check_frequency = ?DISK_SPACE_CHECK_FREQUENCY_MS,
 	storage_modules = [],
 	repack_in_place_storage_modules = [],
@@ -226,8 +223,6 @@
 	max_propagation_peers = ?DEFAULT_MAX_PROPAGATION_PEERS,
 	max_block_propagation_peers = ?DEFAULT_MAX_BLOCK_PROPAGATION_PEERS,
 	webhooks = [],
-	max_gateway_connections = 128,
-	max_poa_option_depth = 500,
 	disk_pool_data_root_expiration_time = ?DEFAULT_DISK_POOL_DATA_ROOT_EXPIRATION_TIME_S,
 	max_disk_pool_buffer_mb = ?DEFAULT_MAX_DISK_POOL_BUFFER_MB,
 	max_disk_pool_data_root_buffer_mb = ?DEFAULT_MAX_DISK_POOL_DATA_ROOT_BUFFER_MB,

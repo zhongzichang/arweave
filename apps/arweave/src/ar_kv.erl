@@ -11,7 +11,7 @@
 -export([init/1, handle_cast/2, handle_call/3, handle_info/2, terminate/2]).
 
 -include_lib("arweave/include/ar.hrl").
--include_lib("arweave/include/ar_config.hrl").
+-include_lib("arweave_config/include/arweave_config.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 -define(WITH_DB(Name, Callback), with_db(Name, ?FUNCTION_NAME, Callback)).
@@ -267,7 +267,7 @@ count(Name) ->
 
 init([]) ->
 	process_flag(trap_exit, true),
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	S0 = #state{
 		db_flush_timer = #timer{interval_ms = Config#config.rocksdb_flush_interval_s * 1000},
 		wal_sync_timer = #timer{interval_ms = Config#config.rocksdb_wal_sync_interval_s * 1000}
@@ -602,13 +602,13 @@ with_each_db(Callback) ->
 
 
 get_data_dir() ->
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	Config#config.data_dir.
 
 
 
 get_base_log_dir() ->
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	Config#config.log_dir.
 
 

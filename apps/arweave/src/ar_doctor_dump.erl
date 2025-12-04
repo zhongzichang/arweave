@@ -4,7 +4,7 @@
 
 -include_lib("kernel/include/file.hrl").
 -include_lib("arweave/include/ar.hrl").
--include_lib("arweave/include/ar_config.hrl").
+-include_lib("arweave_config/include/arweave_config.hrl").
 
 main(Args) ->
 	dump(Args).
@@ -24,7 +24,7 @@ dump([IncludeTXs, H, MinHeight, DataDir, OutputDir]) ->
 	ok = filelib:ensure_dir(filename:join([OutputDir, "txs", "dummy"])),
 
 	Config = #config{data_dir = DataDir},
-	application:set_env(arweave, config, Config),
+	arweave_config:set_env(Config),
 	ar_kv_sup:start_link(),
 	ar_storage_sup:start_link(),
 

@@ -3,7 +3,7 @@
 -behaviour(gen_server).
 
 -include_lib("arweave/include/ar.hrl").
--include_lib("arweave/include/ar_config.hrl").
+-include_lib("arweave_config/include/arweave_config.hrl").
 -include_lib("arweave/include/ar_p3.hrl").
 
 -export([start_link/0, allow_request/1, reverse_charge/1, get_balance/3, get_rates_json/0]).
@@ -51,7 +51,7 @@ get_rates_json() ->
 %%%===================================================================
 init([]) ->
 	ok = ar_events:subscribe(node_state),
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	ar_p3_config:validate_config(Config).
 
 handle_call({allow_request, Req}, _From, State) ->

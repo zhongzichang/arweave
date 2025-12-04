@@ -3,7 +3,7 @@
 -export([start/1]).
 
 -include("ar.hrl").
--include("ar_config.hrl").
+-include_lib("arweave_config/include/arweave_config.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 %%% Represents a process that handles downloading the block index and the latest
@@ -71,7 +71,7 @@ start2(Peers) ->
 		ExpectedBIMerkleH ->
 			do_join(Peers, B, BI);
 		_ ->
-			{ok, Config} = application:get_env(arweave, config),
+			{ok, Config} = arweave_config:get_env(),
 			ID = binary_to_list(ar_util:encode(crypto:strong_rand_bytes(16))),
 			File = filename:join(Config#config.data_dir,
 					"inconsistent_joining_data_dump_" ++ ID),
@@ -229,7 +229,7 @@ get_block(Peers, BShadow, [TXID | TXIDs], TXs, Retries) ->
 %% @doc Perform the joining process.
 do_join(Peers, B, BI) ->
 	ar:console("Downloading the block trail.~n", []),
-	{ok, Config} = application:get_env(arweave, config),
+	{ok, Config} = arweave_config:get_env(),
 	WorkerQ = queue:from_list([spawn(fun() -> worker() end)
 			|| _ <- lists:seq(1, Config#config.join_workers)]),
 	PeerQ = queue:from_list(Peers),
@@ -528,7 +528,7 @@ worker() ->
 %% @doc Check that nodes can join a running network by using the fork recoverer.
 basic_node_join_test_() ->
 	{timeout, ?TEST_NODE_TIMEOUT, fun() ->
-		[B0] = ar_weave:init([]),
+		[B0] = ar_weave:init(),
 		ar_test_node:start(B0),
 		ar_test_node:mine(),
 		ar_test_node:wait_until_height(main, 1),
@@ -541,7 +541,7 @@ basic_node_join_test_() ->
 %% @doc Ensure that both nodes can mine after a join.
 node_join_test_() ->
 	{timeout, ?TEST_NODE_TIMEOUT, fun() ->
-		[B0] = ar_weave:init([]),
+		[B0] = ar_weave:init(),
 		ar_test_node:start(B0),
 		ar_test_node:mine(),
 		ar_test_node:wait_until_height(main, 1),
