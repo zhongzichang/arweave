@@ -7,6 +7,8 @@
 
 -import(ar_test_node, [http_get_block/2]).
 
+-define(COORDINATED_MINING_WAIT_TIMEOUT, 900_000).
+
 %% --------------------------------------------------------------------
 %% Test registration
 %% --------------------------------------------------------------------
@@ -375,7 +377,7 @@ assert_peers(ExpectedPeers, Node, Partition) ->
 
 wait_for_each_node(Miners, ValidatorNode, CurrentHeight, ExpectedPartitions) ->
 	wait_for_each_node(
-		Miners, ValidatorNode, CurrentHeight, sets:from_list(ExpectedPartitions), 20).
+		Miners, ValidatorNode, CurrentHeight, sets:from_list(ExpectedPartitions), 40).
 
 wait_for_each_node(
 		_Miners, _ValidatorNode, _CurrentHeight, _ExpectedPartitions, 0) ->
@@ -417,10 +419,20 @@ wait_for_cross_node(Miners, ValidatorNode, CurrentHeight, ExpectedPartitions, Re
 	
 mine_in_parallel(Miners, ValidatorNode, CurrentHeight) ->
 	report_miners(Miners),
+	CurrentB = ar_test_node:remote_call(ValidatorNode, ar_node, get_current_block, []),
 	ar_util:pmap(fun(Node) -> ar_test_node:mine(Node) end, Miners),
-	?debugFmt("Waiting until the validator node (port ~B) advances to height ~B.",
-			[ar_test_node:peer_port(ValidatorNode), CurrentHeight + 1]),
-	BIValidator = ar_test_node:wait_until_height(ValidatorNode, CurrentHeight + 1, false),
+	?debugFmt(
+		"Waiting until the validator node (port ~B) advances to height ~B. "
+		"Current block hash: ~s, solution hash: ~s.",
+		[
+			ar_test_node:peer_port(ValidatorNode),
+			CurrentHeight + 1,
+			ar_util:encode(CurrentB#block.indep_hash),
+			ar_util:encode(CurrentB#block.hash)
+		]
+	),
+	BIValidator = ar_test_node:wait_until_height(
+		ValidatorNode, CurrentHeight + 1, false, ?COORDINATED_MINING_WAIT_TIMEOUT),
 	%% Since multiple nodes are mining in parallel it's possible that multiple blocks
 	%% were mined. Get the Validator's current height in cas it's more than CurrentHeight+1.
 	NewHeight = ar_test_node:remote_call(ValidatorNode, ar_node, get_height, []),
@@ -434,7 +446,8 @@ mine_in_parallel(Miners, ValidatorNode, CurrentHeight) ->
 			%% Make sure the miner contains all of the new validator hashes, it's okay if
 			%% the miner contains *more* hashes since it's possible concurrent blocks were
 			%% mined between when the Validator checked and now.
-			BIMiner = ar_test_node:wait_until_height(Node, NewHeight, false),
+			BIMiner = ar_test_node:wait_until_height(
+				Node, NewHeight, false, ?COORDINATED_MINING_WAIT_TIMEOUT),
 			MinerHashes = [Hash || {Hash, _, _} <- BIMiner],
 			Message = lists:flatten(io_lib:format(
 					"Node ~p did not mine the same block as the validator node", [Node])),

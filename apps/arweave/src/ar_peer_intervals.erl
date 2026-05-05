@@ -1,10 +1,15 @@
 -module(ar_peer_intervals).
 
--export([fetch/3]).
+-export([fetch/5]).
+
+-include_lib("arweave_config/include/arweave_config.hrl").
 
 -include("ar.hrl").
--include_lib("arweave_config/include/arweave_config.hrl").
 -include("ar_data_discovery.hrl").
+
+-ifdef(AR_TEST).
+-include_lib("eunit/include/eunit.hrl").
+-endif.
 
 %% The size of the span of the weave we search at a time.
 %% By searching we mean asking peers about the intervals they have in the given span
@@ -24,71 +29,178 @@
 
 %% The number of peers to fetch sync intervals from in parallel at a time.
 -define(GET_SYNC_RECORD_BATCH_SIZE, 2).
--define(GET_SYNC_RECORD_COOLDOWN_MS, 60 * 1000).
 -define(GET_SYNC_RECORD_RPM_KEY, data_sync_record).
+-define(GET_FOOTPRINT_RECORD_RPM_KEY, footprints).
+%% Cooldown after 429 or batch_pmap timeout. Timeouts use the same duration
+%% because they're typically caused by self-throttling (ar_rate_limiter:throttle)
+%% as we approach a peer's rate limit.
+-define(GET_SYNC_RECORD_COOLDOWN_MS, 60 * 1000).
 -define(GET_SYNC_RECORD_PATH, [<<"data_sync_record">>]).
-
-%% The number of the release adding support for the
-%% GET /data_sync_record/[start]/[end]/[limit] endpoint.
--define(GET_SYNC_RECORD_RIGHT_BOUND_SUPPORT_RELEASE, 83).
+-define(GET_FOOTPRINT_RECORD_PATH, [<<"footprints">>]).
 
 %%%===================================================================
 %%% Public interface.
 %%%===================================================================
 
-fetch(Start, End, StoreID) when Start >= End ->
+fetch(Offset, Start, End, StoreID, Type) when Offset >= End ->
 	?LOG_DEBUG([{event, fetch_peer_intervals_end},
 			{store_id, StoreID},
+			{offset, Offset},
 			{range_start, Start},
-			{range_end, End}]),
-	gen_server:cast(ar_data_sync:name(StoreID), {collect_peer_intervals, Start, End});
-fetch(Start, End, StoreID) ->
-	Parent = ar_data_sync:name(StoreID),
+			{range_end, End},
+			{type, Type}]),
+	ar_data_sync:collect_peer_intervals(StoreID, Offset, Start, End, Type);
+fetch(Offset, Start, End, StoreID, Type) ->
 	spawn_link(fun() ->
-		try
-			End2 = min(Start + ?QUERY_RANGE_STEP_SIZE, End),
-			UnsyncedIntervals = get_unsynced_intervals(Start, End2, StoreID),
-
-			Bucket = Start div ?NETWORK_DATA_BUCKET_SIZE,
-			{ok, Config} = arweave_config:get_env(),
-			AllPeers =
-				case Config#config.sync_from_local_peers_only of
-					true ->
-						Config#config.local_peers;
-					false ->
-						ar_data_discovery:get_bucket_peers(Bucket)
-				end,
-			HotPeers = [
-				Peer || Peer <- AllPeers,
-				not ar_rate_limiter:is_on_cooldown(Peer, ?GET_SYNC_RECORD_RPM_KEY) andalso
-				not ar_rate_limiter:is_throttled(Peer, ?GET_SYNC_RECORD_PATH)
-			],
-			Peers = ar_data_discovery:pick_peers(HotPeers, ?QUERY_BEST_PEERS_COUNT),
-			End3 =
-				case ar_intervals:is_empty(UnsyncedIntervals) of
-					true ->
-						End2;
-					false ->
-						min(End2, fetch_peer_intervals(Parent, Start, Peers, UnsyncedIntervals))
-				end,
-			%% Schedule the next sync bucket. The cast handler logic will pause collection
-			%% if needed.
-			gen_server:cast(Parent, {collect_peer_intervals, End3, End})
-		catch
-			Class:Reason ->
-				?LOG_WARNING([{event, fetch_peers_process_exit},
-						{store_id, StoreID},
-						{range_start, Start},
-						{range_end, End},
-						{class, Class},
-						{reason, Reason}]),
-				gen_server:cast(Parent, {collect_peer_intervals, Start, End})
+		case do_fetch(Offset, Start, End, StoreID, Type) of
+			{End2, EnqueueIntervals, Peers2} ->
+				ar_data_sync:enqueue_intervals(
+					StoreID, EnqueueIntervals, Peers2),
+				ar_data_sync:collect_peer_intervals(
+					StoreID, End2, Start, End, Type);
+			wait ->
+				%% All peers on cooldown/throttled for this bucket. Wait and
+				%% retry from the same offset so we march methodically through
+				%% the range.
+				?LOG_DEBUG([{event, collect_peer_intervals_all_peers_busy},
+					{store_id, StoreID},
+					{offset, Offset}, {type, Type}]),
+				ar_data_sync:schedule_collect_peer_intervals(
+					StoreID, 1000, Offset, Start, End, Type)
 		end
 	end).
+
+do_fetch(Offset, Start, End, StoreID, normal) ->
+	Parent = ar_data_sync:name(StoreID),
+	try
+		case get_peers(Offset, normal) of
+			wait ->
+				wait;
+			Peers ->
+				End2 = min(Offset + ?QUERY_RANGE_STEP_SIZE, End),
+				UnsyncedIntervals = get_unsynced_intervals(Offset, End2, StoreID),
+				%% Schedule the next sync bucket. The cast handler logic will pause collection
+				%% if needed.
+				case ar_intervals:is_empty(UnsyncedIntervals) of
+					true ->
+						{End2, [], Peers};
+					false ->
+						{End3, EnqueueIntervals2} =
+							fetch_peer_intervals(Parent, Offset, Peers, UnsyncedIntervals),
+						{min(End2, End3), EnqueueIntervals2, Peers}
+				end
+		end
+	catch
+		Class:Reason:Stacktrace ->
+			?LOG_WARNING([{event, fetch_peers_process_exit},
+					{store_id, StoreID},
+					{offset, Offset},
+					{range_start, Start},
+					{range_end, End},
+					{type, normal},
+					{class, Class},
+					{reason, Reason},
+					{stacktrace, Stacktrace}]),
+			{Offset, [],  []}
+	end;
+
+do_fetch(Offset, Start, End, StoreID, footprint) ->
+	Parent = ar_data_sync:name(StoreID),
+	try
+		case get_peers(Offset, footprint) of
+			wait ->
+				wait;
+			Peers ->
+				Partition = ar_replica_2_9:get_entropy_partition(Offset + ?DATA_CHUNK_SIZE),
+				Footprint = ar_footprint_record:get_footprint(Offset + ?DATA_CHUNK_SIZE),
+				UnsyncedIntervals =
+					ar_footprint_record:get_unsynced_intervals(Partition, Footprint, StoreID),
+
+				EnqueueIntervals =
+					case ar_intervals:is_empty(UnsyncedIntervals) of
+						true ->
+							[];
+						false ->
+							fetch_peer_footprint_intervals(
+								Parent, Partition, Footprint, Offset, End, Peers, UnsyncedIntervals)
+					end,
+				Offset2 = get_next_fetch_offset(Offset, Start, End),
+				{Offset2, EnqueueIntervals, Peers}
+		end
+	catch
+		Class:Reason:Stacktrace ->
+			?LOG_WARNING([{event, fetch_footprint_intervals_process_exit},
+					{store_id, StoreID},
+					{offset, Offset},
+					{range_start, Start},
+					{range_end, End},
+					{type, footprint},
+					{class, Class},
+					{reason, Reason},
+					{stacktrace, Stacktrace}]),
+			{Offset, [],  []}
+	end.
+
+%% @doc Calculate the next fetch start position after processing a sector.
+%% Advances by one chunk within a sector, or jumps to the next partition boundary
+%% when near the sector end.
+get_next_fetch_offset(Offset, Start, End) ->
+	SectorSize = ar_block:get_replica_2_9_entropy_sector_size(),
+	Partition = ar_replica_2_9:get_entropy_partition(Offset + ?DATA_CHUNK_SIZE),
+	{PartitionStart, PartitionEnd} = ar_replica_2_9:get_entropy_partition_range(Partition),
+	SectorStart = max(Start, PartitionStart),
+	SectorEnd = min(PartitionEnd, SectorStart + SectorSize),
+	Offset2 =
+		case Offset + 2 * ?DATA_CHUNK_SIZE > SectorEnd of
+			true ->
+				PartitionEnd;
+			false ->
+				Offset + ?DATA_CHUNK_SIZE
+		end,
+	min(Offset2, End).
 
 %%%===================================================================
 %%% Private functions.
 %%%===================================================================
+
+get_peers(Offset, normal) ->
+	Bucket = Offset div ?NETWORK_DATA_BUCKET_SIZE,
+	get_peers2(Bucket,
+		fun(B) -> ar_data_discovery:get_bucket_peers(B) end,
+		?GET_SYNC_RECORD_RPM_KEY,
+		?GET_SYNC_RECORD_PATH);
+get_peers(Offset, footprint) ->
+	FootprintBucket = ar_footprint_record:get_footprint_bucket(Offset + ?DATA_CHUNK_SIZE),
+	get_peers2(FootprintBucket,
+		fun(B) -> ar_data_discovery:get_footprint_bucket_peers(B) end,
+		?GET_FOOTPRINT_RECORD_RPM_KEY,
+		?GET_FOOTPRINT_RECORD_PATH).
+
+get_peers2(Bucket, GetPeersFun, RPMKey, Path) ->
+	{ok, Config} = arweave_config:get_env(),
+	AllPeers =
+		case Config#config.sync_from_local_peers_only of
+			true ->
+				Config#config.local_peers;
+			false ->
+				GetPeersFun(Bucket)
+		end,
+	HotPeers = [
+		Peer || Peer <- AllPeers,
+		not ar_rate_limiter:is_on_cooldown(Peer, RPMKey) andalso
+		not ar_rate_limiter:is_throttled(Peer, Path)
+	],
+	case length(AllPeers) > 0 andalso length(HotPeers) == 0 of
+		true ->
+			%% Peers exist for this bucket but are all on cooldown/throttled.
+			%% Wait and retry from the same offset.
+			wait;
+		false ->
+			%% Either we have usable peers, or no peers are known for this
+			%% bucket at all (data discovery hasn't populated yet). In the
+			%% latter case the scan advances quickly with no peer queries.
+			ar_data_discovery:pick_peers(HotPeers, ?QUERY_BEST_PEERS_COUNT)
+	end.
 
 %% @doc Collect the unsynced intervals between Start and End excluding the blocklisted
 %% intervals.
@@ -134,28 +246,29 @@ fetch_peer_intervals(Parent, Start, Peers, UnsyncedIntervals) ->
 			end,
 			Peers,
 			?GET_SYNC_RECORD_BATCH_SIZE, % fetch sync intervals from so many peers at a time
-			%% We'll rely on the timeout to also flag when we are approaching a peer's RPM
-			%% limit. As we approach the limit we will self-throttle the requests. Eventually this
-			%% throttling will exceed 60s and we'll timout the batch_pmap and flag the peer for
-			%% cooldown.
-			60 * 1000 
+			%% Timeout for each batch of peer queries. Slow peers that exceed
+			%% this are skipped for this step but NOT put on cooldown — timeout
+			%% means "slow," not "overloaded." Only explicit 429 responses
+			%% trigger cooldown.
+			60 * 1000
 		),
 	{EnqueueIntervals, MinRightBound} =
 		lists:foldl(
 			fun	({error, batch_pmap_timeout, Peer}, Acc) ->
-					?LOG_DEBUG([{event, failed_to_fetch_peer_intervals},
+					?LOG_DEBUG([{event, peer_sync_record_timeout},
 						{parent, Parent},
-						{peer, ar_util:format_peer(Peer)},
-						{reason, batch_pmap_timeout}]),
+						{peer, ar_util:format_peer(Peer)}]),
 					ar_rate_limiter:set_cooldown(
-						Peer, ?GET_SYNC_RECORD_RPM_KEY, ?GET_SYNC_RECORD_COOLDOWN_MS),
+						Peer, ?GET_SYNC_RECORD_RPM_KEY,
+						?GET_SYNC_RECORD_COOLDOWN_MS),
 					Acc;
 				({Peer, SoughtIntervals, RightBound}, {IntervalsAcc, RightBoundAcc}) ->
 					case ar_intervals:is_empty(SoughtIntervals) of
 						true ->
 							{IntervalsAcc, RightBoundAcc};
 						false ->
-							{[{Peer, SoughtIntervals} | IntervalsAcc],
+							%% FootprintKey = none for normal syncing
+							{[{Peer, SoughtIntervals, none} | IntervalsAcc],
 								min(RightBound, RightBoundAcc)}
 					end;
 				(ok, Acc) ->
@@ -170,8 +283,7 @@ fetch_peer_intervals(Parent, Start, Peers, UnsyncedIntervals) ->
 			{[], infinity},
 			Intervals
 		),
-	gen_server:cast(Parent, {enqueue_intervals, EnqueueIntervals}),
-	MinRightBound.
+	{MinRightBound, EnqueueIntervals}.
 
 %% @doc
 %% @return {ok, Intervals, PeerRightBound} | Error
@@ -217,3 +329,251 @@ get_peer_intervals(Peer, Left, SoughtIntervals) ->
 		Error ->
 			Error
 	end.
+
+fetch_peer_footprint_intervals(Parent, Partition, Footprint, Start, End, Peers, UnsyncedIntervals) ->
+	Intervals =
+		ar_util:batch_pmap(
+			fun(Peer) ->
+				case maybe_get_peer_footprint_intervals(
+						Peer, Partition, Footprint, UnsyncedIntervals) of
+					{ok, SoughtIntervals} ->
+						{Peer, SoughtIntervals};
+					{error, cooldown} ->
+						%% Skipping peer because we hit a 429 and put it on cooldown.
+						ok;
+					{error, Reason} ->
+						?LOG_DEBUG([{event, failed_to_fetch_peer_footprint_intervals},
+							{parent, Parent},
+							{peer, ar_util:format_peer(Peer)},
+							{reason, io_lib:format("~p", [Reason])}]),
+						ok
+				end
+			end,
+			Peers,
+			?GET_SYNC_RECORD_BATCH_SIZE, % fetch sync intervals from so many peers at a time
+			%% Timeout for each batch of peer queries. Slow peers that exceed
+			%% this are skipped for this step but NOT put on cooldown — timeout
+			%% means "slow," not "overloaded." Only explicit 429 responses
+			%% trigger cooldown.
+			60 * 1000
+		),
+	EnqueueIntervals =
+		lists:foldl(
+			fun	({error, batch_pmap_timeout, Peer}, Acc) ->
+					?LOG_DEBUG([{event, peer_footprint_record_timeout},
+						{parent, Parent},
+						{peer, ar_util:format_peer(Peer)}]),
+					ar_rate_limiter:set_cooldown(
+						Peer, ?GET_FOOTPRINT_RECORD_RPM_KEY,
+						?GET_SYNC_RECORD_COOLDOWN_MS),
+					Acc;
+				({Peer, SoughtIntervals}, IntervalsAcc) ->
+					case ar_intervals:is_empty(SoughtIntervals) of
+						true ->
+							IntervalsAcc;
+						false ->
+							ByteIntervals = 
+								cut_peer_footprint_intervals(SoughtIntervals, Start, End),
+							%% XXX: turning off logging to reduce noise, will re-enable when we
+							%%      support multiple log files. 
+							% ?LOG_DEBUG([{event, fetch_peer_intervals},
+							% 	{function, fetch_peer_footprint_intervals},
+							% 	{peer, ar_util:format_peer(Peer)},
+							% 	{partition, Partition},
+							% 	{footprint, Footprint},
+							% 	{unsynced_intervals, ar_intervals:sum(UnsyncedIntervals)},
+							% 	{sought_intervals, ar_intervals:sum(SoughtIntervals)},
+							% 	{intervals, length(Intervals)},
+							% 	{byte_intervals, ar_intervals:sum(ByteIntervals)}]),
+							FootprintKey = {Partition, Footprint, Peer},
+							[{Peer, ByteIntervals, FootprintKey} | IntervalsAcc]
+					end;
+				(ok, Acc) ->
+					Acc;
+				(Error, Acc) ->
+					?LOG_DEBUG([{event, failed_to_fetch_peer_footprint_intervals},
+						{parent, Parent},
+						{peer, unknown},
+						{reason, io_lib:format("~p", [Error])}]),
+					Acc
+			end,
+			[],
+			Intervals
+		),
+	EnqueueIntervals.
+
+maybe_get_peer_footprint_intervals(Peer, Partition, Footprint, SoughtIntervals) ->
+	case ar_rate_limiter:is_on_cooldown(Peer, ?GET_FOOTPRINT_RECORD_RPM_KEY) of
+		true ->
+			{error, cooldown};
+		false ->
+			get_peer_footprint_intervals(Peer, Partition, Footprint, SoughtIntervals)
+	end.
+
+get_peer_footprint_intervals(Peer, Partition, Footprint, SoughtIntervals) ->
+	PeerReply =
+		case ar_peers:get_peer_release(Peer) >= ?GET_FOOTPRINT_SUPPORT_RELEASE of
+			true ->
+				ar_http_iface_client:get_footprints(Peer, Partition, Footprint);
+			false ->
+				%% We expect to get here only if the peer is upgraded and then downgraded again,
+				%% because we check the peer release at the bucket collection stage.
+				not_found
+		end,
+	case PeerReply of
+		{ok, Intervals} ->
+			{ok, ar_intervals:intersection(Intervals, SoughtIntervals)};
+		not_found ->
+			{ok, ar_intervals:new()};
+		{error, too_many_requests} = Error ->
+			ar_rate_limiter:set_cooldown(Peer,
+				?GET_FOOTPRINT_RECORD_RPM_KEY, ?GET_SYNC_RECORD_COOLDOWN_MS),
+			Error;
+		Error ->
+			Error
+	end.
+
+%% @doc The intervals returned by a peer may include intervals beyond the
+%% storage module boundaries. This is because we end up querying all advertised 
+%% intervals belonging to a footprint that intersects this node's unsynced
+%% intervals. This can cause this node to try to store a chunk that lies beyond
+%% its configured storage module range. To avoid this we explicitly remove all
+%% intervals beyond the provided boundaries.
+cut_peer_footprint_intervals(FootprintIntervals, Start, End) -> 
+	ByteIntervals =
+		ar_footprint_record:get_intervals_from_footprint_intervals(FootprintIntervals),
+	ByteIntervals2 = ar_intervals:cut(ByteIntervals, End),
+	PaddedStart =
+		case ar_block:get_chunk_padded_offset(Start) of
+			Start ->
+				Start;
+			Offset ->
+				Offset - ?DATA_CHUNK_SIZE
+		end,
+	ar_intervals:outerjoin(
+		ar_intervals:from_list([{PaddedStart, -1}]), ByteIntervals2).
+
+%%%===================================================================
+%%% Tests
+%%%===================================================================
+
+-ifdef(AR_TEST).
+
+cut_peer_footprint_intervals_test() ->
+
+	?assertEqual(
+		ar_intervals:from_list([{786432, 524288}, {1310720, 1048576}]),
+		cut_peer_footprint_intervals(
+			ar_intervals:from_list([{4, 0}]), 262144, 1572864),
+		"Full Footprint 0, aligned boundaries"),
+
+	?assertEqual(
+		ar_intervals:from_list([{524288,262144}, {1048576,786432}, {1572864,1310720}]),
+		cut_peer_footprint_intervals(
+			ar_intervals:from_list([{8, 4}]), 262144, 1572864),
+		"Full Footprint 1 cut to aligned boundaries"),
+
+	?assertEqual(
+		ar_intervals:from_list([
+			{262144,200000}, {786432, 524288}, {1310720, 1048576}, {1600000,1572864}]),
+		cut_peer_footprint_intervals(
+			ar_intervals:from_list([{4, 0}]), 200000, 1600000),
+		"Full Footprint 0, unaligned boundaries, pre-strict"),
+
+	?assertEqual(
+		ar_intervals:from_list([{524288,262144}, {1048576, 786432}, {1572864, 1310720}]),
+		cut_peer_footprint_intervals(
+			ar_intervals:from_list([{8, 4}]), 200000, 1600000),
+		"Full Footprint 1, unaligned boundaries, pre-strict"),
+
+	?assertEqual(
+		ar_intervals:from_list([{2883584,2621440}, {3407872,3145728}]),
+		cut_peer_footprint_intervals(
+			ar_intervals:from_list([{12, 8}]), 2400000, 3500000),
+		"Full Footprint 2, unaligned boundaries, post-strict"),
+	
+	?assertEqual(
+		ar_intervals:from_list([{2621440,2359296}, {3145728,2883584}, {3500000,3407872}]),
+		cut_peer_footprint_intervals(
+			ar_intervals:from_list([{16, 12}]), 2400000, 3500000),
+		"Full Footprint 3, unaligned boundaries, post-strict"),
+
+	?assertEqual(
+		ar_intervals:from_list([{2621440,2359296}, {3500000,3407872}]),
+		cut_peer_footprint_intervals(
+			ar_intervals:from_list([{16, 14}, {13, 12}]), 2400000, 3500000),
+		"Partial Footprint 3, unaligned boundaries, post-strict"),
+
+	ok.
+
+%% Tests for get_next_fetch_offset/4
+%% 4 binary conditions (shown as debug output 0/1 for each):
+%%   1. Start > PartitionStart
+%%   2. PartitionEnd > SectorStart + SectorSize
+%%   3. Offset + 2*CHUNK > SectorEnd
+%%   4. Offset2 > End
+%% Pattern labeled 0-F in hex (e.g., 0101 = 5)
+%% Note: 0xxx (cond1=0, cond2=0) requires partition < SectorSize, impossible in tests
+get_next_fetch_offset_test() ->
+	SectorSize = ar_block:get_replica_2_9_entropy_sector_size(),
+	{P0Start, P0End} = ar_replica_2_9:get_entropy_partition_range(0),
+	Chunk = ?DATA_CHUNK_SIZE,
+
+	?assertEqual(P0Start + Chunk,
+		get_next_fetch_offset(P0Start, P0Start, P0End),
+		"simple advance"),
+
+	?assertEqual(P0Start + 1000,
+		get_next_fetch_offset(P0Start, P0Start, P0Start + 1000),
+		"simple advance, limited by End"),
+
+	?assertEqual(P0End,
+		get_next_fetch_offset(P0Start + SectorSize - 1, P0Start, P0End),
+		"jump to PartitionEnd"),
+
+	?assertEqual(P0Start + SectorSize,
+		get_next_fetch_offset(P0Start + SectorSize - 1, P0Start, P0Start + SectorSize),
+		"jump to PartitionEnd, limited by End"),
+
+	Start8 = P0End - SectorSize,
+	?assertEqual(Start8 + Chunk,
+		get_next_fetch_offset(Start8, Start8, P0End),
+		"simple advance, mid-partition Start"),
+
+	Start9 = P0End - SectorSize,
+	?assertEqual(Start9 + 1000,
+		get_next_fetch_offset(Start9, Start9, Start9 + 1000),
+		"simple advance, mid-partition Start, limited by End"),
+
+	StartA = P0End - SectorSize,
+	?assertEqual(P0End,
+		get_next_fetch_offset(StartA + Chunk, StartA, P0End),
+		"jump to PartitionEnd, mid-partition Start"),
+
+	StartB = P0End - SectorSize,
+	SmallEndB = P0End - Chunk,
+	?assertEqual(SmallEndB,
+		get_next_fetch_offset(StartB + Chunk, StartB, SmallEndB),
+		"jump to PartitionEnd, mid-partition Start, limited by End"),
+
+	MidStart = P0Start + SectorSize,
+	?assertEqual(MidStart + Chunk,
+		get_next_fetch_offset(MidStart, MidStart, P0End),
+		"simple advance, mid-partition Start, SectorEnd past PartitionEnd"),
+
+	?assertEqual(MidStart + 1000,
+		get_next_fetch_offset(MidStart, MidStart, MidStart + 1000),
+		"simple advance, mid-partition Start, SectorEnd past PartitionEnd, limited by End"),
+
+	?assertEqual(P0End,
+		get_next_fetch_offset(MidStart + Chunk, MidStart, P0End),
+		"jump to PartitionEnd, mid-partition Start, SectorEnd past PartitionEnd"),
+
+	SmallEndF = MidStart + SectorSize,
+	?assertEqual(SmallEndF,
+		get_next_fetch_offset(MidStart + Chunk, MidStart, SmallEndF),
+		"jump to PartitionEnd, mid-partition Start, SectorEnd past PartitionEnd, limited by End"),
+
+	ok.
+
+-endif.

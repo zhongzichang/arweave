@@ -6,9 +6,10 @@
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
--include("../include/ar.hrl").
+-include("ar.hrl").
+-include("ar_consensus.hrl").
+
 -include_lib("arweave_config/include/arweave_config.hrl").
--include("../include/ar_consensus.hrl").
 
 -record(state, {
 	%% The priority queue storing the validation requests.
@@ -24,7 +25,7 @@
 }).
 
 %% The maximum size in bytes the blocks enqueued for pre-validation can occupy.
--define(MAX_PRE_VALIDATION_QUEUE_SIZE, (200 * 1024 * 1024)).
+-define(MAX_PRE_VALIDATION_QUEUE_SIZE, (200 * ?MiB)).
 
 %%%===================================================================
 %%% Public interface.
@@ -41,25 +42,33 @@ start_link() ->
 %% the processing is throttled by IP and solution hash.
 %% Returns: ok, invalid, skipped
 pre_validate(B, Peer, ReceiveTimestamp) ->
-	#block{ indep_hash = H } = B,
-	case ar_ignore_registry:member(H) of
-		true ->
-			skipped;
-		false ->
-			Ref = make_ref(),
-			ar_ignore_registry:add_ref(H, Ref),
-			erlang:put(ignore_registry_ref, Ref),
-			B2 = B#block{ receive_timestamp = ReceiveTimestamp },
-			case pre_validate_is_peer_banned(B2, Peer) of
-				enqueued ->
-					?LOG_DEBUG([{event, enqueued_block},
-							{hash, ar_util:encode(H)},
-							{peer, ar_util:format_peer(Peer)}]),
-					ok;
-				Other ->
-					ar_ignore_registry:remove_ref(H, Ref),
-					Other
-			end
+	try
+		#block{ indep_hash = H } = B,
+		case ar_ignore_registry:member(H) of
+			true ->
+				skipped;
+			false ->
+				Ref = make_ref(),
+				ar_ignore_registry:add_ref(H, Ref),
+				erlang:put(ignore_registry_ref, Ref),
+				B2 = B#block{ receive_timestamp = ReceiveTimestamp },
+				case pre_validate_is_peer_banned(B2, Peer) of
+					enqueued ->
+						?LOG_DEBUG([{event, enqueued_block},
+								{hash, ar_util:encode(H)},
+								{peer, ar_util:format_peer(Peer)}]),
+						ok;
+					Other ->
+						ar_ignore_registry:remove_ref(H, Ref),
+						Other
+				end
+		end
+	catch
+		Type:Reason:Stacktrace ->
+			?LOG_ERROR([{event, block_pre_validation_failed},
+					{type, Type}, {reason, Reason},
+					{stacktrace, Stacktrace}]),
+			invalid
 	end.
 
 %%%===================================================================
@@ -376,6 +385,10 @@ pre_validate_indep_hash(#block{ indep_hash = H } = B, PrevB, Peer) ->
 		{ok, _DifferentH} ->
 			post_block_reject_warn(B, check_indep_hash, Peer),
 			ar_events:send(block, {rejected, invalid_hash, B#block.indep_hash, Peer}),
+			invalid;
+		{'EXIT', _} ->
+			post_block_reject_warn(B, check_invalid_payload, Peer),
+			ar_events:send(block, {rejected, invalid_payload, B#block.indep_hash, Peer}),
 			invalid
 	end.
 
@@ -538,10 +551,12 @@ pre_validate_nonce_limiter_global_step_number(B, PrevB, SolutionResigned, Peer) 
 			N ->
 				N
 		end,
-	IsAhead = ar_nonce_limiter:is_ahead_on_the_timeline(BlockInfo, PrevBlockInfo),
+	IsAhead = ar_nonce_limiter:is_ahead_on_the_timeline(
+			BlockInfo, PrevBlockInfo),
 	MaxDistance = ?NONCE_LIMITER_MAX_CHECKPOINTS_COUNT,
-	ExpectedStepCount = min(MaxDistance, StepNumber - PrevStepNumber),
 	Steps = BlockInfo#nonce_limiter_info.steps,
+	ExpectedStepCount =
+		get_expected_step_count(StepNumber, PrevStepNumber, MaxDistance, Steps),
 	PrevOutput = BlockInfo#nonce_limiter_info.prev_output,
 	case IsAhead andalso StepNumber - CurrentStepNumber =< MaxDistance
 			andalso length(Steps) == ExpectedStepCount
@@ -558,6 +573,21 @@ pre_validate_nonce_limiter_global_step_number(B, PrevB, SolutionResigned, Peer) 
 			prometheus_gauge:set(block_vdf_advance, StepNumber - CurrentStepNumber),
 			pre_validate_previous_solution_hash(B, PrevB, SolutionResigned, Peer)
 	end.
+
+-ifdef(LOCALNET).
+%% In localnet we allow same-step blocks for faster block production. Consequent
+%% blocks on the same steps have the same "steps" and "expected step count" values.
+get_expected_step_count(StepNumber, PrevStepNumber, _MaxDistance, Steps) ->
+	case StepNumber - PrevStepNumber > 0 of
+		true ->
+			StepNumber - PrevStepNumber;
+		false ->
+			length(Steps)
+	end.
+-else.
+get_expected_step_count(StepNumber, PrevStepNumber, MaxDistance, _Steps) ->
+	min(MaxDistance, StepNumber - PrevStepNumber).
+-endif.
 
 pre_validate_previous_solution_hash(B, PrevB, SolutionResigned, Peer) ->
 	case B#block.previous_solution_hash == PrevB#block.hash of
@@ -716,12 +746,64 @@ pre_validate_pow_2_6(B, PrevB, PartitionUpperBound, Peer) ->
 			end
 	end.
 
+-ifdef(LOCALNET).
+%% On localnet we want to freely choose chunks, so we derive the recall range
+%% from the chosen chunk (recall_byte) rather than the other way around.
+get_precalculated_recall_range(B) ->
+	case B#block.packing_difficulty of
+		0 ->
+			{B#block.recall_byte - B#block.nonce * ?DATA_CHUNK_SIZE,
+				case B#block.recall_byte2 of
+					undefined ->
+						not_set;
+					_ ->
+						B#block.recall_byte2 - B#block.nonce * ?DATA_CHUNK_SIZE
+				end};
+		_ ->
+			ChunkNumber = B#block.nonce div ?COMPOSITE_PACKING_SUB_CHUNK_COUNT,
+			{B#block.recall_byte - ChunkNumber * ?DATA_CHUNK_SIZE,
+				case B#block.recall_byte2 of
+					undefined ->
+						not_set;
+					_ ->
+						B#block.recall_byte2 - ChunkNumber * ?DATA_CHUNK_SIZE
+				end}
+	end.
+-else.
+get_precalculated_recall_range(_B) ->
+	{not_set, not_set}.
+-endif.
+
 pre_validate_poa(B, PrevB, PartitionUpperBound, H0, H1, Peer) ->
+	{PrecalculatedRecallRange1, PrecalculatedRecallRange2} = get_precalculated_recall_range(B),
 	{RecallRange1Start, RecallRange2Start} = ar_block:get_recall_range(H0,
-			B#block.partition_number, PartitionUpperBound),
+		B#block.partition_number, PartitionUpperBound,
+		PrecalculatedRecallRange1, PrecalculatedRecallRange2),
 	RecallByte1 = ar_block:get_recall_byte(RecallRange1Start, B#block.nonce,
 			B#block.packing_difficulty),
-	{BlockStart1, BlockEnd1, TXRoot1} = ar_block_index:get_block_bounds(RecallByte1),
+	%% Search the recent blocks in the block cache and take the correct fork into account.
+	%% The following cases are considered:
+	%% - the given recall byte exceeds the upper bound of the given fork - reject it;
+	%% - the given recall byte points to some fork-specific merkle range - pick it;
+	%% - the given recall byte is older than the oldest on-chain block in cache -
+	%%   fall back to searching ar_block_index.
+	case ar_block:get_block_bounds(RecallByte1, PrevB) of
+		{error, invalid_recall_byte} ->
+			post_block_reject_warn_and_error_dump(B, check_recall_byte, Peer),
+			ar_events:send(block, {rejected, invalid_recall_byte,
+					B#block.indep_hash, Peer}),
+			invalid;
+		not_found ->
+			post_block_reject_warn_and_error_dump(B, check_poa, Peer),
+			ar_events:send(block, {rejected, invalid_poa, B#block.indep_hash, Peer}),
+			invalid;
+		{BlockStart1, BlockEnd1, TXRoot1} ->
+			MerkleArgs = {RecallByte1, RecallRange2Start, BlockStart1, BlockEnd1, TXRoot1},
+			pre_validate_poa_with_block_bounds(B, PrevB, PartitionUpperBound, H0, H1, Peer, MerkleArgs)
+	end.
+
+pre_validate_poa_with_block_bounds(B, PrevB, PartitionUpperBound, H0, H1, Peer, MerkleArgs) ->
+	{RecallByte1, RecallRange2Start, BlockStart1, BlockEnd1, TXRoot1} = MerkleArgs,
 	BlockSize1 = BlockEnd1 - BlockStart1,
 	PackingDifficulty = B#block.packing_difficulty,
 	Nonce = B#block.nonce,
@@ -755,30 +837,41 @@ pre_validate_poa(B, PrevB, PartitionUpperBound, H0, H1, Peer) ->
 				false ->
 					RecallByte2 = ar_block:get_recall_byte(RecallRange2Start, B#block.nonce,
 							B#block.packing_difficulty),
-					{BlockStart2, BlockEnd2, TXRoot2} = ar_block_index:get_block_bounds(
-							RecallByte2),
-					BlockSize2 = BlockEnd2 - BlockStart2,
-					ArgCache2 = {BlockStart2, RecallByte2, TXRoot2, BlockSize2, Packing,
-							SubChunkIndex},
-					case RecallByte2 == B#block.recall_byte2 andalso
-							ar_poa:validate({BlockStart2, RecallByte2, TXRoot2, BlockSize2,
-									B#block.poa2, Packing, SubChunkIndex, not_set}) of
-						error ->
-							?LOG_ERROR([{event, failed_to_validate_proof_of_access},
-									{block, ar_util:encode(B#block.indep_hash)}]),
+					case ar_block:get_block_bounds(RecallByte2, PrevB) of
+						{error, invalid_recall_byte} ->
+							post_block_reject_warn_and_error_dump(B, check_recall_byte2, Peer),
+							ar_events:send(block, {rejected, invalid_recall_byte2,
+									B#block.indep_hash, Peer}),
 							invalid;
-						false ->
+						not_found ->
 							post_block_reject_warn_and_error_dump(B, check_poa2, Peer),
 							ar_events:send(block, {rejected, invalid_poa2,
 									B#block.indep_hash, Peer}),
 							invalid;
-						{true, Chunk2ID} ->
-							%% Cache the proof so that in case the miner signs additional
-							%% blocks using the same solution, we can re-validate the
-							%% potentially new proofs quickly, without re-validating the
-							%% solution and re-unpacking the chunk.
-							B3 = B2#block{ poa2_cache = {ArgCache2, Chunk2ID} },
-							pre_validate_nonce_limiter(B3, PrevB, Peer)
+						{BlockStart2, BlockEnd2, TXRoot2} ->
+							BlockSize2 = BlockEnd2 - BlockStart2,
+							ArgCache2 = {BlockStart2, RecallByte2, TXRoot2, BlockSize2, Packing,
+									SubChunkIndex},
+							case RecallByte2 == B#block.recall_byte2 andalso
+									ar_poa:validate({BlockStart2, RecallByte2, TXRoot2, BlockSize2,
+											B#block.poa2, Packing, SubChunkIndex, not_set}) of
+								error ->
+									?LOG_ERROR([{event, failed_to_validate_proof_of_access},
+											{block, ar_util:encode(B#block.indep_hash)}]),
+									invalid;
+								false ->
+									post_block_reject_warn_and_error_dump(B, check_poa2, Peer),
+									ar_events:send(block, {rejected, invalid_poa2,
+											B#block.indep_hash, Peer}),
+									invalid;
+								{true, Chunk2ID} ->
+									%% Cache the proof so that in case the miner signs additional
+									%% blocks using the same solution, we can re-validate the
+									%% potentially new proofs quickly, without re-validating the
+									%% solution and re-unpacking the chunk.
+									B3 = B2#block{ poa2_cache = {ArgCache2, Chunk2ID} },
+									pre_validate_nonce_limiter(B3, PrevB, Peer)
+							end
 					end
 			end
 	end.

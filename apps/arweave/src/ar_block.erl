@@ -1,14 +1,18 @@
 -module(ar_block).
 
--export([partition_size/0, strict_data_split_threshold/0, block_field_size_limit/1, 
-		verify_timestamp/2, get_max_timestamp_deviation/0, verify_last_retarget/2,
+-export([get_consensus_window_size/0, get_max_tx_anchor_depth/0,
+		partition_size/0,
+		get_replica_2_9_entropy_sector_size/0, get_replica_2_9_entropy_partition_size/0,
+		get_sub_chunks_per_replica_2_9_entropy/0, get_replica_2_9_entropy_count/0,
+		get_replica_2_9_footprint_size/0, strict_data_split_threshold/0,
+		block_field_size_limit/1, verify_timestamp/2, get_max_timestamp_deviation/0, verify_last_retarget/2,
 		verify_weave_size/3, verify_cumulative_diff/2, verify_block_hash_list_merkle/2,
 		compute_hash_list_merkle/1, compute_h0/2, compute_h0/5, compute_h0/6,
 		compute_h1/3, compute_h2/3, compute_solution_h/2,
 		indep_hash/1, indep_hash/2, indep_hash2/2, get_block_signature_preimage/4,
 		generate_signed_hash/1, verify_signature/3, get_reward_key/2,
 		generate_block_data_segment/1, generate_block_data_segment/2,
-		generate_block_data_segment_base/1, get_recall_range/3, verify_tx_root/1,
+		generate_block_data_segment_base/1, get_recall_range/3, get_recall_range/5, verify_tx_root/1,
 		hash_wallet_list/1, generate_hash_list_for_block/2,
 		generate_tx_root_for_block/1, generate_tx_root_for_block/2,
 		generate_size_tagged_list_from_txs/2, generate_tx_tree/1, generate_tx_tree/2,
@@ -21,12 +25,13 @@
 		get_max_nonce/1, get_recall_range_size/1, get_recall_byte/3,
 		get_sub_chunk_size/1, get_nonces_per_chunk/1, get_nonces_per_recall_range/1,
 		get_sub_chunk_index/2,
-		get_chunk_padded_offset/1, get_double_signing_condition/4]).
+		get_chunk_padded_offset/1, get_double_signing_condition/4,
+		get_block_bounds/2]).
 
--include("../include/ar.hrl").
--include("../include/ar_consensus.hrl").
--include("../include/ar_block.hrl").
--include("../include/ar_vdf.hrl").
+-include("ar.hrl").
+-include("ar_consensus.hrl").
+-include("ar_block.hrl").
+-include("ar_vdf.hrl").
 
 -include_lib("eunit/include/eunit.hrl").
 
@@ -34,9 +39,46 @@
 %%% Public interface.
 %%%===================================================================
 
+%% @doc Return the number of blocks we track during consensus. The node
+%% does not accept new blocks originating from blocks older than the oldest
+%% block in this window.
+get_consensus_window_size() ->
+	?STORE_BLOCKS_BEHIND_CURRENT.
+
+%% @doc Return the maximum allowed block depth of the transaction block anchor.
+get_max_tx_anchor_depth() ->
+	ar_block:get_consensus_window_size().
+
 %% @doc Expose constants through a function to allow mocking/injection in tests.
 partition_size() -> ?PARTITION_SIZE.
 strict_data_split_threshold() -> ?STRICT_DATA_SPLIT_THRESHOLD.
+
+%% @doc Return the 2.9 entropy sector size - the largest total size in bytes of the contiguous
+%% area where the 2.9 entropy of every chunk is unique.
+-spec get_replica_2_9_entropy_sector_size() -> pos_integer().
+get_replica_2_9_entropy_sector_size() ->
+	?REPLICA_2_9_ENTROPY_COUNT * ?COMPOSITE_PACKING_SUB_CHUNK_SIZE.
+
+%% @doc Return the size of the 2.9 entropy partition.
+-spec get_replica_2_9_entropy_partition_size() -> pos_integer().
+get_replica_2_9_entropy_partition_size() ->
+	?REPLICA_2_9_ENTROPY_COUNT * ?REPLICA_2_9_ENTROPY_SIZE.
+
+%% @doc Return the number of sub-chunks per entropy. We'll generally create 32x entropies
+%% in order to fully encipher this many chunks.
+-spec get_sub_chunks_per_replica_2_9_entropy() -> pos_integer().
+get_sub_chunks_per_replica_2_9_entropy() ->
+	?REPLICA_2_9_ENTROPY_SIZE div ?COMPOSITE_PACKING_SUB_CHUNK_SIZE.
+
+%% @doc Return the total size in bytes for a full footprint of entropy.
+-spec get_replica_2_9_footprint_size() -> pos_integer().
+get_replica_2_9_footprint_size() ->
+	?REPLICA_2_9_ENTROPY_SIZE * ?COMPOSITE_PACKING_SUB_CHUNK_COUNT.
+
+%% @doc Return the number of entropies per partition.
+-spec get_replica_2_9_entropy_count() -> pos_integer().
+get_replica_2_9_entropy_count() ->
+	?REPLICA_2_9_ENTROPY_COUNT div ?COMPOSITE_PACKING_SUB_CHUNK_COUNT.
 
 %% @doc Check whether the block fields conform to the specified size limits.
 block_field_size_limit(B = #block{ reward_addr = unclaimed }) ->
@@ -572,12 +614,30 @@ generate_block_data_segment_base(B) ->
 
 %% @doc Return {RecallRange1Start, RecallRange2Start} - the start offsets
 %% of the two recall ranges.
-get_recall_range(H0, PartitionNumber, PartitionUpperBound) ->
+-ifdef(LOCALNET).
+get_recall_range(H0, PartitionNumber, PartitionUpperBound, not_set, not_set) ->
+	RecallRange1Offset = binary:decode_unsigned(binary:part(H0, 0, 8), big),
+	RecallRange1Start = PartitionNumber * ar_block:partition_size()
+			+ RecallRange1Offset rem min(ar_block:partition_size(), PartitionUpperBound),
+	RecallRange2Start = binary:decode_unsigned(H0, big) rem PartitionUpperBound,
+	{RecallRange1Start, RecallRange2Start};
+
+%% In LOCALNET mode, RecallRange1 and RecallRange2 are passed through directly.
+%% In normal mode, they are computed from H0 and PartitionNumber.
+get_recall_range(_H0, _PartitionNumber, _PartitionUpperBound, RecallRange1, RecallRange2) ->
+	{RecallRange1, RecallRange2}.
+-else.
+get_recall_range(H0, PartitionNumber, PartitionUpperBound, _RecallRange1, _RecallRange2) ->
 	RecallRange1Offset = binary:decode_unsigned(binary:part(H0, 0, 8), big),
 	RecallRange1Start = PartitionNumber * ar_block:partition_size()
 			+ RecallRange1Offset rem min(ar_block:partition_size(), PartitionUpperBound),
 	RecallRange2Start = binary:decode_unsigned(H0, big) rem PartitionUpperBound,
 	{RecallRange1Start, RecallRange2Start}.
+-endif.
+
+%% @doc Compatibility version for 3 arguments.
+get_recall_range(H0, PartitionNumber, PartitionUpperBound) ->
+	get_recall_range(H0, PartitionNumber, PartitionUpperBound, not_set, not_set).
 
 vdf_step_number(#block{ nonce_limiter_info = Info }) ->
 	Info#nonce_limiter_info.global_step_number.
@@ -637,7 +697,8 @@ get_nonces_per_chunk(_PackingDifficulty) ->
 	?COMPOSITE_PACKING_SUB_CHUNK_COUNT.
 
 get_nonces_per_recall_range(PackingDifficulty) ->
-	max(1, get_recall_range_size(PackingDifficulty) div get_sub_chunk_size(PackingDifficulty)).
+	%% Call ar_block: here so that it is mockable in tests on all nodes.
+	max(1, ar_block:get_recall_range_size(PackingDifficulty) div get_sub_chunk_size(PackingDifficulty)).
 
 %% @doc For packing difficulty 0 (aka spora_2_6 packing), there is one nonce per chunk, so
 %% the max nonce is the same as the max chunk number. For packing difficulty >= 1 (aka
@@ -676,6 +737,41 @@ get_chunk_padded_offset(Offset) ->
 ) -> boolean().
 get_double_signing_condition(CDiff1, PrevCDiff1, CDiff2, PrevCDiff2) ->
 	CDiff1 == CDiff2 orelse (CDiff1 > PrevCDiff2 andalso CDiff2 > PrevCDiff1).
+
+%% @doc Return {BlockStart, BlockEnd, TXRoot} for the block containing RecallByte.
+%% If the recall byte is below the start offset of the oldest block in the block cache,
+%% consult ar_block_index. Otherwise walk the cache backward from PrevB; fall back
+%% to ar_block_index when the parent is not in cache.
+%% Return {error, invalid_recall_byte} if RecallByte is at or above the
+%% end offset of the given previous block.
+get_block_bounds(RecallByte, PrevB) ->
+	get_block_bounds(RecallByte, PrevB, block_cache).
+
+get_block_bounds(RecallByte, PrevB, CacheTab) when RecallByte < PrevB#block.weave_size ->
+	OldestStart = ar_block_cache:get_oldest_block_start(CacheTab),
+	case RecallByte < OldestStart of
+		true ->
+			ar_block_index:get_block_bounds(RecallByte);
+		false ->
+			get_block_bounds_from_cache(RecallByte, PrevB, CacheTab)
+	end;
+get_block_bounds(_RecallByte, _PrevB, _CacheTab) ->
+	{error, invalid_recall_byte}.
+
+get_block_bounds_from_cache(RecallByte, B, CacheTab) ->
+	BlockStart = B#block.weave_size - B#block.block_size,
+	case RecallByte >= BlockStart of
+		true ->
+			{BlockStart, B#block.weave_size, B#block.tx_root};
+		false ->
+			PrevH = B#block.previous_block,
+			case ar_block_cache:get(CacheTab, PrevH) of
+				not_found ->
+					ar_block_index:get_block_bounds(RecallByte);
+				PrevB ->
+					get_block_bounds_from_cache(RecallByte, PrevB, CacheTab)
+			end
+	end.
 
 %%%===================================================================
 %%% Private functions.
@@ -844,7 +940,7 @@ get_tx_data_root(TX) ->
 %%%===================================================================
 
 hash_list_gen_test_() ->
-	{timeout, 60, fun test_hash_list_gen/0}.
+	{timeout, 120, fun test_hash_list_gen/0}.
 
 test_hash_list_gen() ->
 	[B0] = ar_weave:init(),
@@ -1089,3 +1185,117 @@ test_validate_replica_format() ->
 	?assertEqual(false, validate_replica_format(SporaExpiration, 1, 1)),
 	?assertEqual(false, validate_replica_format(SporaExpiration, 33, 1)),
 	?assertEqual(true, validate_replica_format(SporaExpiration, 2, 1)).
+
+get_block_bounds_test_() ->
+	{timeout, 30, fun test_get_block_bounds/0}.
+
+test_get_block_bounds() ->
+	ensure_ignore_registry_ets_table(),
+	Tab = ensure_block_cache_test_table(),
+	meck:new(ar_block_index, [passthrough]),
+	try
+		test_get_block_bounds_invalid_recall_byte(Tab),
+		test_get_block_bounds_falls_back_to_block_index_for_early_offsets(Tab),
+		test_get_block_bounds_falls_back_to_block_index_when_no_blocks_in_cache(Tab),
+		test_get_block_bounds_two_forks(Tab),
+		test_get_block_bounds_recall_recall_byte_equals_block_start(Tab)
+	after
+		ets:delete(Tab),
+		meck:unload(ar_block_index)
+	end.
+
+test_get_block_bounds_invalid_recall_byte(Tab) ->
+	H = crypto:strong_rand_bytes(48),
+	B = stub_block(0, H, <<>>, 1000, 400),
+	ar_block_cache:new(Tab, B),
+	?assertEqual({error, invalid_recall_byte}, get_block_bounds(1000, B, Tab)),
+	?assertEqual({error, invalid_recall_byte}, get_block_bounds(1001, B, Tab)),
+	?assertEqual({600, 1000, <<>>}, get_block_bounds(999, B, Tab)).
+
+test_get_block_bounds_falls_back_to_block_index_for_early_offsets(Tab) ->
+	H = crypto:strong_rand_bytes(48),
+	B = stub_block(3, H, <<>>, 8000, 500),
+	ar_block_cache:new(Tab, B),
+	meck:expect(ar_block_index, get_block_bounds, fun(O) -> {from_index, O} end),
+	OldestStart = 8000 - 500,
+	RecallByte = OldestStart - 1,
+	?assertEqual({from_index, RecallByte}, get_block_bounds(RecallByte, B, Tab)),
+	?assertEqual(1, meck:num_calls(ar_block_index, get_block_bounds, [RecallByte])).
+
+test_get_block_bounds_falls_back_to_block_index_when_no_blocks_in_cache(Tab) ->
+	meck:expect(ar_block_index, get_block_bounds, fun(O) -> {from_index, O} end),
+	H = crypto:strong_rand_bytes(48),
+	B = stub_block(0, H, <<>>, 1000, 899),
+	ar_block_cache:new(Tab, B),
+	?assertEqual({from_index, 100}, get_block_bounds(100, B, Tab)).
+
+test_get_block_bounds_two_forks(Tab) ->
+	meck:expect(ar_block_index, get_block_bounds, fun(_) ->
+		erlang:error(ar_block_index_should_not_be_called)
+	end),
+	H = crypto:strong_rand_bytes(48),
+	SolutionH = crypto:strong_rand_bytes(32),
+	TXRoot1 = crypto:strong_rand_bytes(32),
+	TXRoot2 = crypto:strong_rand_bytes(32),
+	RootB = stub_block(0, H, <<>>, 1000, 400, SolutionH, <<>>),
+	Fork1B = stub_block(1, crypto:strong_rand_bytes(48), H, 2000, 1000,
+		crypto:strong_rand_bytes(32), TXRoot1),
+	Fork2B = stub_block(1, crypto:strong_rand_bytes(48), H, 3000, 2000,
+		crypto:strong_rand_bytes(32), TXRoot2),
+	ar_block_cache:new(Tab, RootB),
+	ar_block_cache:add(Tab, Fork1B),
+	ar_block_cache:add(Tab, Fork2B),
+	?assertEqual({1000, 3000, TXRoot2}, get_block_bounds(2500, Fork2B, Tab)),
+	?assertEqual({1000, 3000, TXRoot2}, get_block_bounds(1500, Fork2B, Tab)),
+	?assertEqual({1000, 2000, TXRoot1}, get_block_bounds(1500, Fork1B, Tab)),
+	?assertEqual({1000, 3000, TXRoot2}, get_block_bounds(1000, Fork2B, Tab)),
+	?assertEqual({1000, 2000, TXRoot1}, get_block_bounds(1000, Fork1B, Tab)),
+	?assertEqual({600, 1000, <<>>}, get_block_bounds(999, RootB, Tab)).
+
+test_get_block_bounds_recall_recall_byte_equals_block_start(Tab) ->
+	meck:expect(ar_block_index, get_block_bounds, fun(_) ->
+		erlang:error(ar_block_index_should_not_be_called)
+	end),
+	H = crypto:strong_rand_bytes(48),
+	RootB = stub_block(0, H, <<>>, 1000, 400, crypto:strong_rand_bytes(32), <<>>),
+	B2 = stub_block(1, crypto:strong_rand_bytes(48), H, 2000, 1000,
+		crypto:strong_rand_bytes(32), crypto:strong_rand_bytes(32)),
+	ar_block_cache:new(Tab, RootB),
+	ar_block_cache:add(Tab, B2),
+	OldestStart = 1000 - 400,
+	?assertEqual(OldestStart, ar_block_cache:get_oldest_block_start(Tab)),
+	?assertEqual({OldestStart, 1000, <<>>}, get_block_bounds(OldestStart, B2, Tab)).
+
+ensure_ignore_registry_ets_table() ->
+	case ets:whereis(ignored_ids) of
+		undefined ->
+			ets:new(ignored_ids, [set, public, named_table]);
+		_ ->
+			true = ets:delete_all_objects(ignored_ids)
+	end.
+
+ensure_block_cache_test_table() ->
+	case ets:whereis(block_cache_test) of
+		undefined ->
+			ok;
+		_ ->
+			true = ets:delete(block_cache_test)
+	end,
+	block_cache_test = ets:new(block_cache_test, [set, public, named_table]),
+	block_cache_test.
+
+stub_block(Height, H, PrevH, WeaveSize, BlockSize) ->
+	stub_block(Height, H, PrevH, WeaveSize, BlockSize,
+		crypto:strong_rand_bytes(32), <<>>).
+
+stub_block(Height, H, PrevH, WeaveSize, BlockSize, SolutionH, TXRoot) ->
+	#block{
+		indep_hash = H,
+		hash = SolutionH,
+		cumulative_diff = Height + 1,
+		height = Height,
+		previous_block = PrevH,
+		weave_size = WeaveSize,
+		block_size = BlockSize,
+		tx_root = TXRoot
+	}.

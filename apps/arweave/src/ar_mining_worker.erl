@@ -305,7 +305,7 @@ handle_task({computed_h0, Candidate, _ExtraArgs}, State) ->
 	#mining_candidate{
 		h0 = H0, partition_number = Partition1, partition_upper_bound = PartitionUpperBound
 	} = Candidate,
-	{RecallRange1Start, RecallRange2Start} = ar_block:get_recall_range(H0, Partition1, PartitionUpperBound),
+	{RecallRange1Start, RecallRange2Start} = ar_mining_server:get_recall_range(H0, Partition1, PartitionUpperBound),
 	Partition2 = ar_node:get_partition_number(RecallRange2Start),
 	Candidate1 = generate_cache_ref(Candidate#mining_candidate{ partition_number2 = Partition2 }),
 	%% Check if the recall ranges are readable to avoid reserving cache space for non-existent data.
@@ -325,8 +325,8 @@ handle_task({computed_h0, Candidate, _ExtraArgs}, State) ->
 			%% Only the first recall range is readable, so we need to release the reserved space for the second
 			%% recall range.
 			State1 = release_cache_range_space(1, Candidate1#mining_candidate.session_key, State),
-			%% Mark second recall range as missing, not to wait for it to arrive.
-			State2 = mark_recall_range_missing(chunk2, Candidate1, State1),
+			%% Mark second recall range as failed, not to wait for it to arrive.
+			State2 = mark_recall_range_failed(chunk2, Candidate1, State1),
 			%% Read the recall range; the result of the read will be reported by the `chunk1` task.
 			ar_mining_io:read_recall_range(chunk1, self(), Candidate1, RecallRange1Start),
 			State2;
@@ -355,11 +355,11 @@ handle_task({computed_h1, Candidate, _ExtraArgs}, State) ->
 	State1 = hash_computed(h1, Candidate, State),
 	H1PassesDiffChecks = h1_passes_diff_checks(H1, Candidate, State1),
 	case H1PassesDiffChecks of
-		false -> ok;
-		partial -> ar_mining_server:prepare_and_post_solution(Candidate);
+		false ->
+			ok;
+		partial ->
+			ar_mining_server:prepare_and_post_solution(Candidate);
 		true ->
-			%% H1 solution found, report it.
-			
 			log_info(found_h1_solution, Candidate, State1, [
 				{h1, ar_util:encode(H1)},
 				{difficulty, get_difficulty(State1, Candidate)}]),
@@ -373,7 +373,7 @@ handle_task({computed_h1, Candidate, _ExtraArgs}, State) ->
 		Candidate#mining_candidate.session_key,
 		State1#state.chunk_cache,
 		fun
-			(#ar_mining_cache_value{chunk2_missing = true}) ->
+			(#ar_mining_cache_value{ chunk2_failed = true }) ->
 				%% This node does not store chunk2. If we're part of a coordinated
 				%% mining set, we can try one of our peers, but this node is done with
 				%% this VDF step.
@@ -389,11 +389,11 @@ handle_task({computed_h1, Candidate, _ExtraArgs}, State) ->
 				end,
 				%% Remove the cached value from the cache.
 				{ok, drop};
-			(#ar_mining_cache_value{chunk2 = undefined} = CachedValue) ->
+			(#ar_mining_cache_value{ chunk2 = undefined } = CachedValue) ->
 				%% chunk2 hasn't been read yet, so we cache H1 and wait for it.
 				%% If H1 passes diff checks, we will skip H2 for this nonce.
 				{ok, CachedValue#ar_mining_cache_value{ h1 = H1, h1_passes_diff_checks = H1PassesDiffChecks }};
-			(#ar_mining_cache_value{chunk2 = Chunk2} = CachedValue) when not H1PassesDiffChecks ->
+			(#ar_mining_cache_value{ chunk2 = Chunk2 } = CachedValue) when not H1PassesDiffChecks ->
 				%% chunk2 has already been read, so we can compute H2 now.
 				ar_mining_hash:compute_h2(self(), Candidate#mining_candidate{ chunk2 = Chunk2 }),
 				{ok, CachedValue#ar_mining_cache_value{ h1 = H1 }};
@@ -469,7 +469,7 @@ handle_task({compute_h2_for_peer, Candidate, _ExtraArgs}, State) ->
 		cm_h1_list = H1List,
 		cm_lead_peer = Peer
 	} = Candidate,
-	{_, RecallRange2Start} = ar_block:get_recall_range(H0, Partition1, PartitionUpperBound),
+	{_, RecallRange2Start} = ar_mining_server:get_recall_range(H0, Partition1, PartitionUpperBound),
 	Candidate1 = generate_cache_ref(Candidate),
 	%% Clear the list so we aren't copying it around all over the place.
 	Candidate3 = Candidate1#mining_candidate{ cm_h1_list = [] },
@@ -485,12 +485,12 @@ handle_task({compute_h2_for_peer, Candidate, _ExtraArgs}, State) ->
 			ChunkCache = ar_mining_cache:add_session(
 				Candidate3#mining_candidate.session_key, State#state.chunk_cache),
 			State1 = State#state{ chunk_cache = ChunkCache },	
-			%% First we mark the whole first recall range as missing
-			%% Then we can cache the H1 list. During this process, we also reset the chunk1_missing
+			%% First we mark the whole first recall range as failed
+			%% Then we can cache the H1 list. During this process, we also reset the chunk1_failed
 			%% flag to false for the entries we have H1 for.
 			%% After these manipulations we will only handle the second recall range nonces that
 			%% have corresponding H1s.
-			State2 = mark_recall_range_missing(chunk1, Candidate3, State1),
+			State2 = mark_recall_range_failed(chunk1, Candidate3, State1),
 			cache_h1_list(Candidate3, H1List, State2);
 		false ->
 			%% This can happen for two reasons:
@@ -570,26 +570,17 @@ process_chunks(
 ) ->
 	%% No more ChunkOffsets means no more chunks have been read. Iterate through all the
 	%% remaining nonces and remove the full chunks from the cache.
+	%% mark_single_chunk*_failed_or_drop releases SubChunkSize per nonce via
+	%% ReservationSizeAdjustment, which sums to NoncesPerChunk * SubChunkSize =
+	%% DATA_CHUNK_SIZE per chunk — matching the reservation made in compute_h0.
 	State1 = case WhichChunk of
-		chunk1 -> mark_single_chunk1_missing_or_drop(Nonce, Candidate, State);
-		chunk2 -> mark_single_chunk2_missing_or_drop(Nonce, Candidate, State)
-	end,
-	%% Drop the reservation for the current nonce group (from Nonce to Nonce + NoncesPerChunk - 1).
-	State2 = case ar_mining_cache:release_for_session(
-		Candidate#mining_candidate.session_key,
-		?DATA_CHUNK_SIZE,
-		State1#state.chunk_cache
-	) of
-		{ok, ChunkCache1} -> State1#state{ chunk_cache = ChunkCache1 };
-		{error, Reason} ->
-			log_error(mining_worker_failed_to_release_reservation_for_session,
-				Candidate, State1, [{reason, Reason}]),
-			State1
+		chunk1 -> mark_single_chunk1_failed_or_drop(Nonce, Candidate, State);
+		chunk2 -> mark_single_chunk2_failed_or_drop(Nonce, Candidate, State)
 	end,
 	%% Process the next chunk.
 	process_chunks(
 		WhichChunk, Candidate, RangeStart, Nonce + NoncesPerChunk,
-		NoncesPerChunk, NoncesPerRecallRange, [], SubChunkSize, Count, State2
+		NoncesPerChunk, NoncesPerRecallRange, [], SubChunkSize, Count, State1
 	);
 process_chunks(
 	WhichChunk, Candidate, RangeStart, Nonce, NoncesPerChunk,
@@ -602,8 +593,8 @@ process_chunks(
 			%% Skip these nonces (starting from Nonce to Nonce + NoncesPerChunk - 1).
 			%% Nonce falls in a chunk which wasn't read from disk (for example, because there are holes
 			%% in the recall range), e.g. the nonce is in the middle of a non-existent chunk.
-			%% Mark single chunk1 as missing or remove it if the corresponding chunk is already read or marked as missing.
-			State1 = mark_single_chunk1_missing_or_drop(Nonce, Candidate, State),
+			%% Mark single chunk1 as failed or remove it if the corresponding chunk is already read or marked as failed.
+			State1 = mark_single_chunk1_failed_or_drop(Nonce, Candidate, State),
 			process_chunks(
 				WhichChunk, Candidate, RangeStart, Nonce + NoncesPerChunk, NoncesPerChunk,
 				NoncesPerRecallRange, [{ChunkEndOffset, Chunk} | ChunkOffsets], SubChunkSize, Count, State1
@@ -612,8 +603,8 @@ process_chunks(
 			%% Skip these nonces (starting from Nonce to Nonce + NoncesPerChunk - 1).
 			%% Nonce falls in a chunk which wasn't read from disk (for example, because there are holes
 			%% in the recall range), e.g. the nonce is in the middle of a non-existent chunk.
-			%% Mark single chunk2 as missing or remove it if the corresponding chunk is already read and H1 is calculated.
-			State1 = mark_single_chunk2_missing_or_drop(Nonce, Candidate, State),
+			%% Mark single chunk2 as failed or remove it if the corresponding chunk is already read and H1 is calculated.
+			State1 = mark_single_chunk2_failed_or_drop(Nonce, Candidate, State),
 			process_chunks(
 				WhichChunk, Candidate, RangeStart, Nonce + NoncesPerChunk, NoncesPerChunk,
 				NoncesPerRecallRange, [{ChunkEndOffset, Chunk} | ChunkOffsets], SubChunkSize, Count, State1
@@ -661,19 +652,45 @@ process_all_sub_chunks(WhichChunk, Rest, Candidate, Nonce, State) ->
 	State.
 
 process_sub_chunk(chunk1, Candidate, SubChunk, State) ->
-	%% Compute h1.
-	ar_mining_hash:compute_h1(self(), Candidate#mining_candidate{ chunk1 = SubChunk }),
-	%% Store the chunk1 in the cache.
+	%% Store the chunk1 in the cache first; only compute h1 if the store succeeds.
 	case ar_mining_cache:with_cached_value(
 		?CACHE_KEY(Candidate#mining_candidate.cache_ref, Candidate#mining_candidate.nonce),
 		Candidate#mining_candidate.session_key,
 		State#state.chunk_cache,
 		fun(CachedValue) -> {ok, CachedValue#ar_mining_cache_value{ chunk1 = SubChunk }} end
 	) of
-		{ok, ChunkCache2} -> State#state{ chunk_cache = ChunkCache2 };
+		{ok, ChunkCache2} ->
+			ar_mining_hash:compute_h1(self(), Candidate#mining_candidate{ chunk1 = SubChunk }),
+			State#state{ chunk_cache = ChunkCache2 };
 		{error, Reason} ->
 			log_error(mining_worker_failed_to_process_chunk1, Candidate, State, [{reason, Reason}]),
-			State
+			%% Mark chunk1 as failed for this nonce. This releases the sub-chunk reservation
+			%% (pre-allocated in compute_h0) and ensures that when chunk2 arrives, the entry
+			%% will be dropped immediately — preventing orphaned entries from filling the cache.
+			%% Marking as failed adds no binary data (size difference = 0), so it succeeds even
+			%% when the cache is full.
+			SubChunkSize = ar_block:get_sub_chunk_size(Candidate#mining_candidate.packing_difficulty),
+			case ar_mining_cache:with_cached_value(
+				?CACHE_KEY(Candidate#mining_candidate.cache_ref, Candidate#mining_candidate.nonce),
+				Candidate#mining_candidate.session_key,
+				State#state.chunk_cache,
+				fun
+					(#ar_mining_cache_value{ chunk2_failed = true }) ->
+						{ok, drop, -SubChunkSize};
+					(#ar_mining_cache_value{ chunk2 = Chunk2 }) when is_binary(Chunk2) ->
+						{ok, drop, -SubChunkSize};
+					(#ar_mining_cache_value{ chunk2 = undefined } = CachedValue) ->
+						{ok, CachedValue#ar_mining_cache_value{ chunk1_failed = true },
+							-SubChunkSize}
+				end
+			) of
+				{ok, ChunkCache3} ->
+					State#state{ chunk_cache = ChunkCache3 };
+				{error, Reason2} ->
+					log_error(mining_worker_failed_to_release_reservation_for_session,
+						Candidate, State, [{reason, Reason2}]),
+					State
+			end
 	end;
 process_sub_chunk(chunk2, Candidate, SubChunk, State) ->
 	Candidate1 = Candidate#mining_candidate{ chunk2 = SubChunk },
@@ -682,20 +699,20 @@ process_sub_chunk(chunk2, Candidate, SubChunk, State) ->
 		Candidate#mining_candidate.session_key,
 		State#state.chunk_cache,
 		fun
-			(#ar_mining_cache_value{chunk1_missing = true}) ->
-				%% We've already marked the chunk1 as missing, so there was no reservation for it.
+			(#ar_mining_cache_value{ chunk1_failed = true }) ->
+				%% chunk1 already failed, so there was no reservation for it.
 				%% Since there is no need to calculate H2, we can just drop the cached value.
 				{ok, drop, -ar_block:get_sub_chunk_size(Candidate#mining_candidate.packing_difficulty)};
-			(#ar_mining_cache_value{h1_passes_diff_checks = true} = _CachedValue) ->
+			(#ar_mining_cache_value{ h1_passes_diff_checks = true } = _CachedValue) ->
 				%% H1 passes diff checks, so we skip H2 for this nonce.
 				%% Drop the cached data, we don't need it anymore.
 				%% Since we already reserved the cache size for chunk2, but we never store it,
 				%% we need to drop the reservation here.
 				{ok, drop, -ar_block:get_sub_chunk_size(Candidate#mining_candidate.packing_difficulty)};
-			(#ar_mining_cache_value{h1 = undefined} = CachedValue) ->
+			(#ar_mining_cache_value{ h1 = undefined } = CachedValue) ->
 				%% H1 is not yet calculated, cache the chunk2 for this nonce.
 				{ok, CachedValue#ar_mining_cache_value{ chunk2 = SubChunk }};
-			(#ar_mining_cache_value{h1 = H1, chunk1 = Chunk1} = CachedValue) ->
+			(#ar_mining_cache_value{ h1 = H1, chunk1 = Chunk1 } = CachedValue) ->
 				%% H1 is already calculated, compute H2 and cache the chunk2 for this nonce.
 				ar_mining_hash:compute_h2(self(), Candidate1#mining_candidate{ h1 = H1, chunk1 = Chunk1 }),
 				{ok, CachedValue#ar_mining_cache_value{ chunk2 = SubChunk }}
@@ -704,7 +721,34 @@ process_sub_chunk(chunk2, Candidate, SubChunk, State) ->
 		{ok, ChunkCache2} -> State#state{ chunk_cache = ChunkCache2 };
 		{error, Reason} ->
 			log_error(mining_worker_failed_to_process_chunk2, Candidate1, State, [{reason, Reason}]),
-			State
+			%% Mark chunk2 as failed for this nonce. This releases the sub-chunk reservation
+			%% and prevents orphaned cache entries from accumulating.
+			SubChunkSize = ar_block:get_sub_chunk_size(Candidate#mining_candidate.packing_difficulty),
+			case ar_mining_cache:with_cached_value(
+				?CACHE_KEY(Candidate1#mining_candidate.cache_ref, Candidate1#mining_candidate.nonce),
+				Candidate#mining_candidate.session_key,
+				State#state.chunk_cache,
+				fun
+					(#ar_mining_cache_value{ chunk1_failed = true }) ->
+						{ok, drop, -SubChunkSize};
+					(#ar_mining_cache_value{ chunk1 = Chunk1, h1 = undefined } = CachedValue)
+							when is_binary(Chunk1) ->
+						{ok, CachedValue#ar_mining_cache_value{ chunk2_failed = true },
+							-SubChunkSize};
+					(#ar_mining_cache_value{ h1 = H1 }) when is_binary(H1) ->
+						{ok, drop, -SubChunkSize};
+					(CachedValue) ->
+						{ok, CachedValue#ar_mining_cache_value{ chunk2_failed = true },
+							-SubChunkSize}
+				end
+			) of
+				{ok, ChunkCache3} ->
+					State#state{ chunk_cache = ChunkCache3 };
+				{error, Reason2} ->
+					log_error(mining_worker_failed_to_release_reservation_for_session,
+						Candidate1, State, [{reason, Reason2}]),
+					State
+			end
 	end.
 
 priority(computed_h2, StepNumber) -> {1, -StepNumber};
@@ -733,7 +777,8 @@ passes_diff_checks(SolutionHash, IsPoA1, Candidate, State) ->
 	DiffPair = get_difficulty(State, Candidate),
 	#mining_candidate{ packing_difficulty = PackingDifficulty } = Candidate,
 	case ar_node_utils:passes_diff_check(SolutionHash, IsPoA1, DiffPair, PackingDifficulty) of
-		true -> true;
+		true ->
+			true;
 		false ->
 			case get_partial_difficulty(State, Candidate) of
 				not_set -> false;
@@ -861,24 +906,24 @@ release_cache_range_space(Multiplier, SessionKey, #state{
 			State
 	end.
 
-%% @doc Mark the chunk1 as missing or drop the cache and reservation for this chunk.
+%% @doc Mark the chunk1 as failed or drop the cache and reservation for this chunk.
 %% This function is called for one chunk1.
-mark_single_chunk1_missing_or_drop(Nonce, Candidate, State) ->
+mark_single_chunk1_failed_or_drop(Nonce, Candidate, State) ->
 	#mining_candidate{ packing_difficulty = PackingDifficulty } = Candidate,
 	SubChunksPerChunk = ar_block:get_nonces_per_chunk(PackingDifficulty),
-	mark_single_chunk1_missing_or_drop(Nonce, SubChunksPerChunk, Candidate, State).
+	mark_single_chunk1_failed_or_drop(Nonce, SubChunksPerChunk, Candidate, State).
 
-mark_single_chunk1_missing_or_drop(_Nonce, 0, _Candidate, State) -> State;
-mark_single_chunk1_missing_or_drop(Nonce, NoncesLeft, Candidate, State) ->
-	%% Mark the chunk1 as missing.
+mark_single_chunk1_failed_or_drop(_Nonce, 0, _Candidate, State) -> State;
+mark_single_chunk1_failed_or_drop(Nonce, NoncesLeft, Candidate, State) ->
+	%% Mark the chunk1 as failed.
 	%% The cache reservation for this chunk1 will be dropped in the final (first) clause of the function.
 	case ar_mining_cache:with_cached_value(
 		?CACHE_KEY(Candidate#mining_candidate.cache_ref, Nonce),
 		Candidate#mining_candidate.session_key,
 		State#state.chunk_cache,
 		fun
-			(#ar_mining_cache_value{chunk2_missing = true}) ->
-				%% We've already marked the chunk2 as missing, so there was no reservation for it.
+			(#ar_mining_cache_value{ chunk2_failed = true }) ->
+				%% chunk2 already failed, so there was no reservation for it.
 				%% We can just drop the cached value.
 				{ok, drop, -ar_block:get_sub_chunk_size(Candidate#mining_candidate.packing_difficulty)};
 			(#ar_mining_cache_value{chunk2 = Chunk2}) when is_binary(Chunk2) ->
@@ -886,87 +931,87 @@ mark_single_chunk1_missing_or_drop(Nonce, NoncesLeft, Candidate, State) ->
 				%% The cache reservation for corresponding chunk2 was already consumed.
 				{ok, drop, -ar_block:get_sub_chunk_size(Candidate#mining_candidate.packing_difficulty)};
 			(#ar_mining_cache_value{chunk2 = undefined} = CachedValue) ->
-				%% Mark the chunk1 as missing.
+				%% Mark the chunk1 as failed.
 				%% When the corresponding chunk2 will be read from disk, it will be dropped immediately.
-				{ok, CachedValue#ar_mining_cache_value{ chunk1_missing = true }, -ar_block:get_sub_chunk_size(Candidate#mining_candidate.packing_difficulty)}
+				{ok, CachedValue#ar_mining_cache_value{ chunk1_failed = true }, -ar_block:get_sub_chunk_size(Candidate#mining_candidate.packing_difficulty)}
 		end
 	) of
 		{ok, ChunkCache1} ->
-			mark_single_chunk1_missing_or_drop(Nonce + 1, NoncesLeft - 1, Candidate, State#state{ chunk_cache = ChunkCache1 });
+			mark_single_chunk1_failed_or_drop(Nonce + 1, NoncesLeft - 1, Candidate, State#state{ chunk_cache = ChunkCache1 });
 		{error, Reason} ->
-			log_error(mining_worker_failed_to_mark_chunk1_missing,
+			log_error(mining_worker_failed_to_mark_chunk1_failed,
 				Candidate, State, [{reason, Reason}]),
-			mark_single_chunk1_missing_or_drop(Nonce + 1, NoncesLeft - 1, Candidate, State)
+			mark_single_chunk1_failed_or_drop(Nonce + 1, NoncesLeft - 1, Candidate, State)
 	end.
 
-%% @doc Mark the chunk2 as missing for a single chunk.
-mark_single_chunk2_missing_or_drop(Nonce, Candidate, State) ->
+%% @doc Mark the chunk2 as failed for a single chunk.
+mark_single_chunk2_failed_or_drop(Nonce, Candidate, State) ->
 	#mining_candidate{ packing_difficulty = PackingDifficulty } = Candidate,
 	SubChunksPerChunk = ar_block:get_nonces_per_chunk(PackingDifficulty),
-	mark_single_chunk2_missing_or_drop(Nonce, SubChunksPerChunk, Candidate, State).
+	mark_single_chunk2_failed_or_drop(Nonce, SubChunksPerChunk, Candidate, State).
 
-mark_single_chunk2_missing_or_drop(_Nonce, 0, _Candidate, State) -> State;
-mark_single_chunk2_missing_or_drop(Nonce, NoncesLeft, Candidate, State) ->
+mark_single_chunk2_failed_or_drop(_Nonce, 0, _Candidate, State) -> State;
+mark_single_chunk2_failed_or_drop(Nonce, NoncesLeft, Candidate, State) ->
 	case ar_mining_cache:with_cached_value(
 		?CACHE_KEY(Candidate#mining_candidate.cache_ref, Nonce),
 		Candidate#mining_candidate.session_key,
 		State#state.chunk_cache,
 		fun
-			(#ar_mining_cache_value{chunk1_missing = true}) ->
-				%% We've already marked the chunk1 as missing, so the reservation for it was released.
+			(#ar_mining_cache_value{ chunk1_failed = true }) ->
+				%% chunk1 already failed, so the reservation for it was released.
 				%% We can just drop the cached value and release the reservation for a single subchunk.
 				{ok, drop, -ar_block:get_sub_chunk_size(Candidate#mining_candidate.packing_difficulty)};
 			(#ar_mining_cache_value{chunk1 = Chunk1, h1 = undefined} = CachedValue) when is_binary(Chunk1) ->
 				%% We have the corresponding chunk1, but we didn't calculate H1 yet.
-				%% Mark chunk2 as missing to drop the cached value after we calculate H1.
+				%% Mark chunk2 as failed to drop the cached value after we calculate H1.
 				%% Drop the reservation for a single subchunk.
-				{ok, CachedValue#ar_mining_cache_value{ chunk2_missing = true }, -ar_block:get_sub_chunk_size(Candidate#mining_candidate.packing_difficulty)};
+				{ok, CachedValue#ar_mining_cache_value{ chunk2_failed = true }, -ar_block:get_sub_chunk_size(Candidate#mining_candidate.packing_difficulty)};
 			(#ar_mining_cache_value{h1 = H1}) when is_binary(H1) ->
 				%% We've already calculated H1, so we can drop the cached value.
 				%% Drop the reservation for a single subchunk.
 				{ok, drop, -ar_block:get_sub_chunk_size(Candidate#mining_candidate.packing_difficulty)};
 			(CachedValue) ->
-				%% The corresponding chunk1 is not missing but we didn't read it yet, so
-				%% we just mark the chunk2 as missing and continue.
+				%% chunk1 hasn't arrived yet, so
+				%% we just mark the chunk2 as failed and continue.
 				%% Drop the reservation for a single subchunk.
-				{ok, CachedValue#ar_mining_cache_value{ chunk2_missing = true }, -ar_block:get_sub_chunk_size(Candidate#mining_candidate.packing_difficulty)}
+				{ok, CachedValue#ar_mining_cache_value{ chunk2_failed = true }, -ar_block:get_sub_chunk_size(Candidate#mining_candidate.packing_difficulty)}
 		end
 	) of
 		{ok, ChunkCache1} ->
-			mark_single_chunk2_missing_or_drop(Nonce + 1, NoncesLeft - 1, Candidate, State#state{ chunk_cache = ChunkCache1 });
+			mark_single_chunk2_failed_or_drop(Nonce + 1, NoncesLeft - 1, Candidate, State#state{ chunk_cache = ChunkCache1 });
 		{error, Reason} ->
 			%% NB: this clause may cause a memory leak, because mining worker will wait for
 			%% chunk2 to arrive.
-			log_error(mining_worker_failed_to_mark_chunk2_missing,
+			log_error(mining_worker_failed_to_mark_chunk2_failed,
 				Candidate, State, [{reason, Reason}]),
-			mark_single_chunk2_missing_or_drop(Nonce + 1, NoncesLeft - 1, Candidate, State)
+			mark_single_chunk2_failed_or_drop(Nonce + 1, NoncesLeft - 1, Candidate, State)
 	end.
 
-%% @doc Mark the chunk1 or chunk2 as missing for the whole recall range.
-mark_recall_range_missing(WhichChunk, Candidate, State) ->
+%% @doc Mark the chunk1 or chunk2 as failed for the whole recall range.
+mark_recall_range_failed(WhichChunk, Candidate, State) ->
 	#mining_candidate{ packing_difficulty = PackingDifficulty } = Candidate,
-	mark_recall_range_missing(WhichChunk, 0, ar_block:get_nonces_per_recall_range(PackingDifficulty), Candidate, State).
+	mark_recall_range_failed(WhichChunk, 0, ar_block:get_nonces_per_recall_range(PackingDifficulty), Candidate, State).
 
-mark_recall_range_missing(_WhichChunk, _Nonce, 0, _Candidate, State) -> State;
-mark_recall_range_missing(WhichChunk, Nonce, NoncesLeft, Candidate, State) ->
+mark_recall_range_failed(_WhichChunk, _Nonce, 0, _Candidate, State) -> State;
+mark_recall_range_failed(WhichChunk, Nonce, NoncesLeft, Candidate, State) ->
 	case ar_mining_cache:with_cached_value(
 		?CACHE_KEY(Candidate#mining_candidate.cache_ref, Nonce),
 		Candidate#mining_candidate.session_key,
 		State#state.chunk_cache,
 		fun(CachedValue) ->
 			case WhichChunk of
-				chunk1 -> {ok, CachedValue#ar_mining_cache_value{ chunk1_missing = true }};
-				chunk2 -> {ok, CachedValue#ar_mining_cache_value{ chunk2_missing = true }}
+				chunk1 -> {ok, CachedValue#ar_mining_cache_value{ chunk1_failed = true }};
+				chunk2 -> {ok, CachedValue#ar_mining_cache_value{ chunk2_failed = true }}
 			end
 		end
 		) of
 		{ok, ChunkCache1} ->
-			mark_recall_range_missing(WhichChunk, Nonce + 1, NoncesLeft - 1, Candidate, State#state{ chunk_cache = ChunkCache1 });
+			mark_recall_range_failed(WhichChunk, Nonce + 1, NoncesLeft - 1, Candidate, State#state{ chunk_cache = ChunkCache1 });
 		{error, Reason} ->
 			%% NB: this clause may cause a memory leak, because mining worker will wait for
 			%% WhichChunk to arrive.
 			log_error(mining_worker_failed_to_add_chunk_to_cache, Candidate, State, [{reason, Reason}]),
-			mark_recall_range_missing(WhichChunk, Nonce + 1, NoncesLeft - 1, Candidate, State)
+			mark_recall_range_failed(WhichChunk, Nonce + 1, NoncesLeft - 1, Candidate, State)
 	end.
 
 cache_h1_list(_Candidate, [], State) -> State;
@@ -977,9 +1022,9 @@ cache_h1_list(Candidate, [ {H1, Nonce} | H1List ], State) ->
 		Candidate#mining_candidate.session_key,
 		State#state.chunk_cache,
 		fun(CachedValue) ->
-			%% Store the H1 received from peer, and set chunk1_missing to false,
+			%% Store the H1 received from peer, and set chunk1_failed to false,
 			%% marking that we have a recall range for this H1 list.
-			{ok, CachedValue#ar_mining_cache_value{ h1 = H1, chunk1_missing = false }}
+			{ok, CachedValue#ar_mining_cache_value{ h1 = H1, chunk1_failed = false }}
 		end
 	) of
 		{ok, ChunkCache1} ->
@@ -1092,6 +1137,7 @@ log_warning(Event, Candidate, State, ExtraLogs) ->
 
 log_warning(Event, State, ExtraLogs) ->
 	log_warning(Event, undefined, State, ExtraLogs).
+
 
 %%%===================================================================
 %%% Public Test interface.

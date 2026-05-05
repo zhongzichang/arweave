@@ -1,6 +1,20 @@
 %% The size in bits of the offset key in kv databases.
 -define(OFFSET_KEY_BITSIZE, 256).
 
+%% A single sync unit: fetch the byte range [start_offset, end_offset) from
+%% `peer` into storage module `store_id`. `footprint_key` groups chunks that
+%% share the same 256 MiB entropy (replica.2.9 mode) for admission control;
+%% `none` means the task has no footprint constraint. `retry_count` counts
+%% down on transient errors; the task is abandoned at 0.
+-record(sync_task, {
+	start_offset,
+	end_offset,
+	peer,
+	store_id,
+	retry_count = 3,
+	footprint_key = none
+}).
+
 %% The size in bits of the key prefix used in prefix bloom filter
 %% when looking up chunks by offsets from kv database.
 %% 29 bytes of the prefix correspond to the 16777216 (16 Mib) max distance
@@ -81,6 +95,8 @@
 -define(STORE_CHUNK_QUEUE_FLUSH_TIME_THRESHOLD, 2_000). % 2 seconds.
 -endif.
 
+-define(WORKER_LOAD_TABLE, worker_load).
+
 %% @doc The state of the server managing data synchronization.
 -record(sync_data_state, {
 	%% The last entries of the block index.
@@ -111,13 +127,6 @@
 	%% very unnerving. The index is NOT consulted when serving random chunks therefore
 	%% it is possible to develop a lightweight client which would sync and serve random
 	%% portions of the weave without maintaining this index.
-	data_root_index,
-	data_root_index_old,
-	%% A reference to the on-disk key-value storage mapping
-	%% AbsoluteBlockStartOffset => {TXRoot, BlockSize, DataRootIndexKeySet}.
-	%% Each key in DataRootIndexKeySet is a << DataRoot/binary, TXSize:256 >> binary.
-	%% Used to remove orphaned entries from DataRootIndex.
-	data_root_offset_index,
 	%% A reference to the on-disk key value storage mapping
 	%% << DataRootTimestamp:256, ChunkDataIndexKey/binary >> =>
 	%%     {RelativeChunkEndOffset, ChunkSize, DataRoot, TXSize, ChunkDataKey, IsStrictSplit}.
@@ -127,17 +136,9 @@
 	%% DiskPoolDataRoots and data_root_index to decide whether each chunk needs to
 	%% be removed from disk as orphaned, reincluded into the weave (by updating chunks_index),
 	%% or removed from disk_pool_chunks_index by expiration.
-	disk_pool_chunks_index,
-	disk_pool_chunks_index_old,
-	%% One of the keys from disk_pool_chunks_index or the atom "first".
-	%% The disk pool is processed chunk by chunk going from the oldest entry to the newest,
-	%% trying not to block the syncing process if the disk pool accumulates a lot of orphaned
-	%% and pending chunks. The cursor remembers the key after the last processed on the
-	%% previous iteration. After reaching the last key in the storage, we go back to
-	%% the first one. Not stored.
-	disk_pool_cursor,
-	%% The weave offset for the disk pool - chunks above this offset are stored there.
-	disk_pool_threshold = 0,
+	disk_pool = undefined,
+	%% A flag used to temporarily pause disk pool scanning.
+	scan_pause = false,
 	%% A reference to the on-disk key value storage mapping
 	%% TXID => {AbsoluteTXEndOffset, TXSize}.
 	%% Is used to serve transaction data by TXID.
@@ -169,22 +170,6 @@
 	%% sync intervals queue. We use it to quickly check which intervals have been queued
 	%% already and avoid syncing the same interval twice.
 	sync_intervals_queue_intervals = ar_intervals:new(),
-	%% A key marking the beginning of a full disk pool scan.
-	disk_pool_full_scan_start_key = none,
-	%% The timestamp of the beginning of a full disk pool scan. Used to measure
-	%% the time it takes to scan the current disk pool - if it is too short, we postpone
-	%% the next scan to save some disk IO.
-	disk_pool_full_scan_start_timestamp,
-	%% A cache of the offsets of the recently "matured" chunks. We use it to quickly
-	%% skip matured chunks when scanning the disk pool. The reason the chunk is still
-	%% in the disk pool is some of its offsets have not matured yet (the same data can be
-	%% submitted several times).
-	recently_processed_disk_pool_offsets = #{},
-	%% A registry of the currently processed disk pool chunks consulted by different
-	%% disk pool jobs to avoid double-processing.
-	currently_processed_disk_pool_keys = sets:new(),
-	%% A flag used to temporarily pause all disk pool jobs.
-	disk_pool_scan_pause = false,
 	%% The mining address the chunks are packed with in 2.6.
 	mining_address,
 	%% The identifier of the storage module the process is responsible for.
@@ -209,5 +194,22 @@
 	%% The threshold controlling the brief accumuluation of the chunks in the queue before
 	%% the actual disk dump, to reduce the chance of out-of-order write causing disk
 	%% fragmentation.
-	store_chunk_queue_threshold = ?STORE_CHUNK_QUEUE_FLUSH_SIZE_THRESHOLD
+	store_chunk_queue_threshold = ?STORE_CHUNK_QUEUE_FLUSH_SIZE_THRESHOLD,
+	%% The phase of the syncing process.
+	%% The phases are:
+	%% - normal: normal left-to-right syncing (normally, of the unpacked data).
+	%% - footprint: footprint-based syncing of replica 2.9 data.
+	sync_phase = undefined,
+	%% Number of tasks produced by the current scan. Used for adaptive backoff:
+	%% scans that complete a full range walk with 0 tasks get exponential
+	%% backoff (the module is likely near-full). Throttled scans never
+	%% complete — the wait-retry loop holds the offset until peers recover.
+	scan_tasks_produced = 0,
+	%% Whether this scan queried any peers (enqueue_intervals was called).
+	%% Scans that race through with no peers (data discovery not populated)
+	%% should not trigger backoff.
+	scan_had_peers = false,
+	%% Current backoff delay for unproductive scans (doubles each time,
+	%% capped at COLLECT_SYNC_INTERVALS_MAX_DELAY_MS).
+	scan_backoff_ms = 0
 }).

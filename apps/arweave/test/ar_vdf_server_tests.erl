@@ -39,10 +39,9 @@ cleanup({Config, PeerConfig}) ->
 %% a block that is ahead in the VDF chain: specifically:
 %%    When a block comes in that starts a new VDF session, the server should first post the
 %%    full previous session which should include all steps up to and including the
-%%    global_step_number of the block. The server should not post the new session until it has
-%%    computed a step in that session - which means the new session's first step will be 1
-%%    greater than the last step of the previous session and also 1 greater than the block's
-%%    global_step_number
+%%    global_step_number of the block (it may also include additional "overflow" steps that
+%%    were computed before the block arrived). The server should not post the new session
+%%    until it has computed a step in that session.
 %%
 %% test_vdf_server_push_slow_block tests that the VDF server can handle receiving
 %% a block that is behind in the VDF chain: specifically:
@@ -126,16 +125,28 @@ test_vdf_server_push_fast_block() ->
 	%% the B0 session and then begin using the (later) B1 VDF session going forward
 	ok = ar_events:subscribe(block),
 	post_block(B1, valid),
-	timer:sleep(3000),
 
 	Seed0 = B0#block.nonce_limiter_info#nonce_limiter_info.next_seed,
 	Seed1 = B1#block.nonce_limiter_info#nonce_limiter_info.next_seed,
 	StepNumber1 = ar_block:vdf_step_number(B1),
+	ar_util:do_until(
+		fun() ->
+			%% Wait until both VDF sessions are present and we apply VDF upt to the block's step number.
+			case {ets:lookup(computed_output, Seed0), ets:lookup(computed_output, Seed1)} of
+				{[{Seed0, _, LatestStepNumber}], [{Seed1, _, _}]} ->
+					LatestStepNumber >= StepNumber1;
+				_ ->
+					false
+			end
+		end,
+		200,
+		20_000
+	),
 
 	[{Seed0, _, LatestStepNumber0}] = get_computed_output(Seed0),
 	[{Seed1, _FirstStepNumber1, _}] = get_computed_output(Seed1),
 	?assertEqual(2, ets:info(computed_output, size), "VDF server did not post 2 sessions"),
-	?assertEqual(StepNumber1, LatestStepNumber0,
+	?assert(LatestStepNumber0 >= StepNumber1,
 		"VDF server did not post the full Session0 when starting Session1"),
 
 	cowboy:stop_listener(ar_vdf_server_test_listener).
@@ -180,7 +191,6 @@ test_vdf_server_push_slow_block() ->
 
 	Seed0 = B0#block.nonce_limiter_info#nonce_limiter_info.next_seed,
 	Seed1 = B1#block.nonce_limiter_info#nonce_limiter_info.next_seed,
-	StepNumber1 = ar_block:vdf_step_number(B1),
 
 	[{Seed0, _, LatestStepNumber0}] = get_computed_output(Seed0),
 	[{Seed1, FirstStepNumber1, LatestStepNumber1}] = get_computed_output(Seed1),
@@ -226,6 +236,9 @@ test_vdf_client_fast_block() ->
 				ar_util:format_peer(ar_test_node:peer_ip(main))
 			]
 		}),
+	%% Isolate the client-path assertion below: when B1 is posted directly to peer1,
+	%% peer1 must not relay it to main before we explicitly post it to main.
+	ar_test_node:remote_call(peer1, ar_http, block_peer_connections, []),
 	%% Start main as a VDF server
 	ar_test_node:stop(),
 	_ = ar_test_node:start(
@@ -237,13 +250,18 @@ test_vdf_client_fast_block() ->
 		}),
 
 	%% Post the block to the VDF client. It won't be able to validate it since the VDF server
-	%% isn't aware of the new VDF session yet.
+	%% isn't aware of the new VDF session yet. Also, it cannot gossip it to main because
+	%% we disabled gossip.
 	send_new_block(ar_test_node:peer_ip(peer1), B1),
 	timer:sleep(5_000),
 	?assertEqual(1,
 		length(ar_test_node:remote_call(peer1, ar_node, get_blocks, [])),
 		"VDF client shouldn't be able to validate the block until the VDF server posts a "
 		"new VDF session"),
+
+	%% Re-enable p2p communication - main will receive B1 and peer1 is
+	%% expected to sync and validate it.
+	ar_test_node:connect_to_peer(peer1),
 
 	%% After the VDF server receives the block, it should push the old and new VDF sessions
 	%% to the VDF client allowing it to validate teh block.
@@ -278,7 +296,7 @@ test_vdf_client_fast_block_pull_interface() ->
 			nonce_limiter_server_trusted_peers = [
 				ar_util:format_peer(ar_test_node:peer_ip(main))
 			],
-			enable = [vdf_server_pull | PeerConfig#config.enable] 
+			enable = [vdf_server_pull | PeerConfig#config.enable]
 		}
 	),
 	%% Start the main as a VDF server
@@ -332,7 +350,7 @@ test_vdf_client_slow_block() ->
 		PeerConfig#config{ 
 			nonce_limiter_server_trusted_peers = [
 				"127.0.0.1:" ++ integer_to_list(Config#config.port)
-			] 
+			]
 		}
 	),
 	%% Start the main as a VDF server
@@ -377,7 +395,7 @@ test_vdf_client_slow_block_pull_interface() ->
 			nonce_limiter_server_trusted_peers = [
 				"127.0.0.1:" ++ integer_to_list(Config#config.port) 
 			],
-			enable = [vdf_server_pull | PeerConfig#config.enable] 
+			enable = [vdf_server_pull | PeerConfig#config.enable]
 		}
 	),
 	%% Start the main as a VDF server

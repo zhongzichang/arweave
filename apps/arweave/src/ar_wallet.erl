@@ -3,14 +3,15 @@
 
 -export([new/0, new_ecdsa/0, new/1, sign/2, verify/3, verify_pre_fork_2_4/3,
 		to_address/1, to_address/2, hash_pub_key/1,
-		load_key/1, load_keyfile/1, new_keyfile/0, new_keyfile/1,
-		new_keyfile/2, base64_address_with_optional_checksum_to_decoded_address/1,
-		base64_address_with_optional_checksum_to_decoded_address_safe/1, wallet_filepath/1,
-		wallet_filepath/3,
+		load_key/1, load_keyfile/1, new_keyfile/0, new_keyfile/1, new_keyfile/2, new_keyfile/3,
+		base64_address_with_optional_checksum_to_decoded_address/1,
+		base64_address_with_optional_checksum_to_decoded_address_safe/1,
+		wallet_filepath/1, wallet_filepath/3,
 		get_or_create_wallet/1, recover_key/3]).
 
--include("../include/ar.hrl").
 -include_lib("arweave_config/include/arweave_config.hrl").
+
+-include("ar.hrl").
 
 -include_lib("public_key/include/public_key.hrl").
 
@@ -49,6 +50,10 @@ new_keyfile(KeyType) ->
 %% @doc Generate a new wallet public and private key, with a corresponding keyfile.
 %% The provided key is used as part of the file name.
 new_keyfile(KeyType, WalletName) ->
+	{ok, Config} = arweave_config:get_env(),
+	new_keyfile(KeyType, WalletName, Config#config.data_dir).
+
+new_keyfile(KeyType, WalletName, DataDir) ->
 	{Pub, Priv, Key} =
 		case KeyType of
 			{?RSA_SIGN_ALG, PublicExpnt} ->
@@ -106,7 +111,7 @@ new_keyfile(KeyType, WalletName) ->
 					),
 				{Pb, Prv, Ky}
 		end,
-	Filename = wallet_filepath(WalletName, Pub, KeyType),
+	Filename = wallet_filepath(WalletName, Pub, KeyType, DataDir),
 	case filelib:ensure_dir(Filename) of
 		ok ->
 			case ar_storage:write_file_atomic(Filename, Key) of
@@ -121,8 +126,11 @@ new_keyfile(KeyType, WalletName) ->
 
 wallet_filepath(Wallet) ->
 	{ok, Config} = arweave_config:get_env(),
+	wallet_filepath(Wallet, Config#config.data_dir).
+
+wallet_filepath(Wallet, DataDir) ->
 	Filename = lists:flatten(["arweave_keyfile_", binary_to_list(Wallet), ".json"]),
-	filename:join([Config#config.data_dir, ?WALLET_DIR, Filename]).
+	filename:join([DataDir, ?WALLET_DIR, Filename]).
 
 wallet_filepath2(Wallet) ->
 	{ok, Config} = arweave_config:get_env(),
@@ -204,18 +212,44 @@ sign({{KeyAlg, KeyCrv}, Priv, _}, Data)
 		[Priv, KeyCrv]
 	).
 
+%%--------------------------------------------------------------------
 %% @doc Verify that a signature is correct.
+%% @end
+%%--------------------------------------------------------------------
+-spec verify(PublicKeyInfo, Data, Signature) -> Return when
+	PublicKeyInfo :: {{KeyAlgorithm, PublicExponent}, PublicKey},
+	KeyAlgorithm :: atom(),
+	PublicExponent :: pos_integer() | secp256k1 | ed25519,
+	PublicKey :: binary(),
+	Signature :: binary(),
+	Data :: binary(),
+	Return :: boolean().
+
 verify({{KeyAlg, PublicExpnt}, Pub}, Data, Sig)
 		when KeyAlg =:= ?RSA_SIGN_ALG andalso PublicExpnt =:= 65537 ->
-	rsa_pss:verify(
-		Data,
-		sha256,
-		Sig,
-		#'RSAPublicKey'{
-			publicExponent = PublicExpnt,
-			modulus = binary:decode_unsigned(Pub)
-		}
-	);
+	try
+		rsa_pss:verify(
+			Data,
+			sha256,
+			Sig,
+			#'RSAPublicKey'{
+				publicExponent = PublicExpnt,
+				modulus = binary:decode_unsigned(Pub)
+			}
+		)
+	catch
+		C:R:S ->
+			?LOG_ERROR([
+				{event, rsa_pss_verify_failed},
+				{class, C},
+				{reason, R},
+				{stacktrace, S},
+				{pub_size, byte_size(Pub)},
+				{signature_size, byte_size(Sig)}
+			]),
+		false
+	end;
+
 % NOTE. We will not write pubkey for ECDSA signature. So don't use verify function for ECDSA, use ecrecover
 % So this function will return always false if called with no Pub
 verify({{KeyAlg, KeyCrv}, Pub}, Data, Sig)
@@ -232,22 +266,48 @@ verify({{KeyAlg, KeyCrv}, Pub}, Data, Sig)
 		[Pub, KeyCrv]
 	).
 
-%% @doc Verify that a signature is correct. The function was used to verify
-%% transactions until the fork 2.4. It rejects a valid transaction when the
-%% key modulus bit size is less than 4096. The new method (verify/3) successfully
-%% verifies all the historical transactions so this function is not used anywhere
-%% after the fork 2.4.
+%%--------------------------------------------------------------------
+%% @doc Verify that  a signature is correct. The function  was used to
+%% verify  transactions  until  the  fork  2.4.  It  rejects  a  valid
+%% transaction when  the key modulus bit  size is less than  4096. The
+%% new  method (verify/3)  successfully  verifies  all the  historical
+%% transactions so this  function is not used anywhere  after the fork
+%% 2.4.
+%% @end
+%%--------------------------------------------------------------------
+-spec verify_pre_fork_2_4(PublicKeyInfo, Data, Signature) -> Return when
+	PublicKeyInfo :: {{KeyAlgorithm, PublicExponent}, PublicKey},
+	KeyAlgorithm :: atom(),
+	PublicExponent :: pos_integer(),
+	PublicKey :: binary(),
+	Signature :: binary(),
+	Data :: binary(),
+	Return :: boolean().
+
 verify_pre_fork_2_4({{KeyAlg, PublicExpnt}, Pub}, Data, Sig)
 		when KeyAlg =:= ?RSA_SIGN_ALG andalso PublicExpnt =:= 65537 ->
-	rsa_pss:verify_legacy(
-		Data,
-		sha256,
-		Sig,
-		#'RSAPublicKey'{
-			publicExponent = PublicExpnt,
-			modulus = binary:decode_unsigned(Pub)
-		}
-	).
+	try
+		rsa_pss:verify_legacy(
+			Data,
+			sha256,
+			Sig,
+			#'RSAPublicKey'{
+				publicExponent = PublicExpnt,
+				modulus = binary:decode_unsigned(Pub)
+			}
+		)
+	catch
+		C:R:S ->
+			?LOG_ERROR([
+				{event, rsa_pss_verify_legacy_failed},
+				{class, C},
+				{reason, R},
+				{stacktrace, S},
+				{pub_size, byte_size(Pub)},
+				{signature_size, byte_size(Sig)}
+			]),
+		false
+	end.
 
 %% @doc Generate an address from a public key.
 to_address({{SigType, _Priv, Pub}, {SigType, Pub}}) ->
@@ -344,7 +404,11 @@ recover_key(Data, Signature, ?ECDSA_KEY_TYPE) ->
 %%%===================================================================
 
 wallet_filepath(WalletName, PubKey, KeyType) ->
-	wallet_filepath(wallet_name(WalletName, PubKey, KeyType)).
+	{ok, Config} = arweave_config:get_env(),
+	wallet_filepath(WalletName, PubKey, KeyType, Config#config.data_dir).
+
+wallet_filepath(WalletName, PubKey, KeyType, DataDir) ->
+	wallet_filepath(wallet_name(WalletName, PubKey, KeyType), DataDir).
 
 wallet_name(wallet_address, PubKey, KeyType) ->
 	ar_util:encode(to_address(PubKey, KeyType));

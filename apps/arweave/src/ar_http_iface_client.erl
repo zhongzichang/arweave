@@ -11,16 +11,16 @@
 	get_tx_data/2, get_wallet_list_chunk/2, get_wallet_list_chunk/3,
 	get_wallet_list/2, add_peer/1, get_info/1, get_info/2, get_peers/1,
 	get_time/2, get_height/1, get_block_index/3,
-	get_sync_record/1, get_sync_record/3, get_sync_record/4,
+	get_sync_record/1, get_sync_record/3, get_sync_record/4, get_footprints/3,
 	get_chunk_binary/3, get_mempool/1,
-	get_sync_buckets/1, get_recent_hash_list/1,
+	get_sync_buckets/1, get_footprint_buckets/1, get_recent_hash_list/1,
 	get_recent_hash_list_diff/2, get_reward_history/3,
 	get_block_time_history/3, push_nonce_limiter_update/3,
 	get_vdf_update/1, get_vdf_session/1, get_previous_vdf_session/1,
 	get_cm_partition_table/1, cm_h1_send/2, cm_h2_send/2,
 	cm_publish_send/2, get_jobs/2, post_partial_solution/2,
 	get_pool_cm_jobs/2, post_pool_cm_jobs/2,
-	post_cm_partition_table_to_pool/2]).
+	post_cm_partition_table_to_pool/2, get_data_roots/2]).
 -export([get_block_shadow/2, get_block_shadow/3, get_block_shadow/4]).
 -export([log_failed_request/2]).
 
@@ -32,6 +32,7 @@
 -include_lib("arweave_config/include/arweave_config.hrl").
 -include("ar_consensus.hrl").
 -include("ar_data_sync.hrl").
+-include("ar_sync_buckets.hrl").
 -include("ar_data_discovery.hrl").
 -include("ar_mining.hrl").
 -include("ar_wallets.hrl").
@@ -403,6 +404,17 @@ get_sync_record(Peer, Start, End, Limit) ->
 		headers => Headers
 	}), Start, Limit).
 
+get_footprints(Peer, Partition, Footprint) ->
+	handle_footprints_response(ar_http:req(#{
+		peer => Peer,
+		method => get,
+		path => "/footprints/" ++ integer_to_list(Partition) ++ "/" ++ integer_to_list(Footprint),
+		timeout => 10_000,
+		connect_timeout => 5_000,
+		limit => ?MAX_FOOTPRINT_PAYLOAD_SIZE,
+		headers => p2p_headers()
+	})).
+
 get_chunk_binary(Peer, Offset, RequestedPacking) ->
 	PackingBinary = iolist_to_binary(ar_serialize:encode_packing(RequestedPacking, false)),
 	Headers = [{<<"x-packing">>, PackingBinary},
@@ -473,7 +485,18 @@ get_sync_buckets(Peer) ->
 		connect_timeout => 2000,
 		limit => ?MAX_SYNC_BUCKETS_SIZE,
 		headers => p2p_headers()
-	})).
+	}), ?DEFAULT_SYNC_BUCKET_SIZE).
+
+get_footprint_buckets(Peer) ->
+	handle_get_sync_buckets_response(ar_http:req(#{
+		peer => Peer,
+		method => get,
+		path => "/footprint_buckets",
+		timeout => 10 * 1000,
+		connect_timeout => 2000,
+		limit => ?MAX_SYNC_BUCKETS_SIZE,
+		headers => p2p_headers()
+	}), ?NETWORK_FOOTPRINT_BUCKET_SIZE).
 
 get_recent_hash_list(Peer) ->
 	handle_get_recent_hash_list_response(ar_http:req(#{
@@ -562,9 +585,9 @@ get_block_time_history([Peer | Peers], B, ExpectedBlockTimeHistoryHashes) ->
 	Fork_2_7 = ar_fork:height_2_7(),
 	true = Height >= Fork_2_7,
 	ExpectedLength = min(Height - Fork_2_7 + 1,
-			ar_block_time_history:history_length() + ?STORE_BLOCKS_BEHIND_CURRENT),
+			ar_block_time_history:history_length() + ar_block:get_consensus_window_size()),
 	true = length(ExpectedBlockTimeHistoryHashes) == min(Height - Fork_2_7 + 1,
-			?STORE_BLOCKS_BEHIND_CURRENT),
+			ar_block:get_consensus_window_size()),
 	case ar_http:req(#{
 				peer => Peer,
 				method => get,
@@ -765,6 +788,32 @@ post_cm_partition_table_to_pool(Peer, Payload) ->
 		connect_timeout => 2000
 	})).
 
+%% @doc Fetch data_root metadata for the block that starts at or before the given offset,
+%% and validate it against the local block index. Also recompute the TXRoot from entries.
+get_data_roots(Peer, Offset) ->
+	Path = "/data_roots/" ++ integer_to_list(Offset),
+	Response = ar_http:req(#{
+			peer => Peer,
+			method => get,
+			path => Path,
+			timeout => 10 * 1000,
+			connect_timeout => 2000,
+			headers => p2p_headers()
+		}),
+	handle_get_data_roots_response(Response, Offset).
+
+handle_get_data_roots_response({ok, {{<<"200">>, _}, _, Body, _, _}}, Offset) ->
+	case ar_serialize:binary_to_data_roots(Body) of
+		{ok, {TXRoot, BlockSize, DataRootEntries}} ->
+			ar_data_roots:validate_data_roots(TXRoot, BlockSize, DataRootEntries, Offset);
+		_ ->
+			{error, invalid_response}
+	end;
+handle_get_data_roots_response({ok, {{<<"404">>, _}, _, _, _, _}}, _Offset) ->
+	{error, not_found};
+handle_get_data_roots_response(Other, _Offset) ->
+	{error, Other}.
+
 get_peer_and_path_from_url(URL) ->
 	#{ host := Host, path := P } = Parsed = uri_string:parse(URL),
 	Peer = case maps:get(port, Parsed, undefined) of
@@ -847,7 +896,7 @@ handle_get_jobs_response(Reply) ->
 
 handle_sync_record_response({ok, {{<<"200">>, _}, _, Body, _, _}}) ->
 	ar_intervals:safe_from_etf(Body);
-handle_sync_record_response({ok, {{<<"429">>, _}, _, _, _, _}} = Reply) ->
+handle_sync_record_response({ok, {{<<"429">>, _}, _, _, _, _}}) ->
 	{error, too_many_requests};
 handle_sync_record_response(Reply) ->
 	{error, Reply}.
@@ -877,6 +926,35 @@ handle_sync_record_response({ok, {{<<"200">>, _}, _, Body, _, _}}, Start, Limit)
 handle_sync_record_response({ok, {{<<"429">>, _}, _, _, _, _}}, _, _) ->
 	{error, too_many_requests};
 handle_sync_record_response(Reply, _, _) ->
+	{error, Reply}.
+
+handle_footprints_response({ok, {{<<"200">>, _}, _, Body, _, _}}) ->
+	case catch ar_serialize:json_map_to_footprint(jiffy:decode(Body, [return_maps])) of
+		{'EXIT', Reason} ->
+			{error, Reason};
+		Footprint ->
+			{ok, Footprint}
+	end;
+handle_footprints_response({ok, {{<<"404">>, _}, _, _, _, _}}) ->
+	not_found;
+handle_footprints_response({ok, {{<<"400">>, _}, _, Body, _, _}}) ->
+	case catch jiffy:decode(Body, [return_maps]) of
+		{'EXIT', Reason} ->
+			{error, Reason};
+		#{ <<"error">> := <<"footprint_number_too_large">> } ->
+			{error, footprint_number_too_large};
+		#{ <<"error">> := <<"negative_footprint_number">> } ->
+			{error, negative_footprint_number};
+		#{ <<"error">> := <<"negative_partition_number">> } ->
+			{error, negative_partition_number};
+		#{ <<"error">> := <<"invalid_footprint_number_encoding">> } ->
+			{error, invalid_footprint_number_encoding};
+		Response ->
+			{error, Response}
+	end;
+handle_footprints_response({ok, {{<<"429">>, _}, _, _, _, _}}) ->
+	{error, too_many_requests};
+handle_footprints_response(Reply) ->
 	{error, Reply}.
 
 handle_chunk_response({ok, {{<<"200">>, _}, _, Body, Start, End}}, RequestedPacking, Peer) ->
@@ -961,8 +1039,8 @@ handle_mempool_response({ok, {{<<"200">>, _}, _, Body, _, _}}, Peer) ->
 handle_mempool_response(Response, _Peer) ->
 	{error, Response}.
 
-handle_get_sync_buckets_response({ok, {{<<"200">>, _}, _, Body, _, _}}) ->
-	case ar_sync_buckets:deserialize(Body) of
+handle_get_sync_buckets_response({ok, {{<<"200">>, _}, _, Body, _, _}}, BucketSize) ->
+	case ar_sync_buckets:deserialize(Body, BucketSize) of
 		{ok, Buckets} ->
 			{ok, Buckets};
 		{'EXIT', Reason} ->
@@ -971,9 +1049,9 @@ handle_get_sync_buckets_response({ok, {{<<"200">>, _}, _, Body, _, _}}) ->
 			{error, invalid_response_type}
 	end;
 handle_get_sync_buckets_response({ok, {{<<"400">>, _}, _,
-		<<"Request type not found.">>, _, _}}) ->
+		<<"Request type not found.">>, _, _}}, _BucketSize) ->
 	{error, request_type_not_found};
-handle_get_sync_buckets_response(Response) ->
+handle_get_sync_buckets_response(Response, _BucketSize) ->
 	{error, Response}.
 
 handle_get_recent_hash_list_response({ok, {{<<"200">>, _}, _, Body, _, _}}) ->
@@ -1050,7 +1128,7 @@ parse_recent_hash_list_diff(<< H:48/binary, Len:16, TXIDs:(32 * Len)/binary, Res
 			parse_recent_hash_list_diff(Rest)
 	end;
 parse_recent_hash_list_diff(_Input) ->
-	{error, invalid_input}.
+	{error, invalid_input4}.
 
 count_blocks_on_top(Bin) ->
 	count_blocks_on_top(Bin, 0).
@@ -1060,7 +1138,7 @@ count_blocks_on_top(<<>>, N) ->
 count_blocks_on_top(<< _H:48/binary, Len:16, _TXIDs:(32 * Len)/binary, Rest/binary >>, N) ->
 	count_blocks_on_top(Rest, N + 1);
 count_blocks_on_top(_Bin, _N) ->
-	{error, invalid_input}.
+	{error, invalid_input5}.
 
 parse_txids(<< TXID:32/binary, Rest/binary >>) ->
 	[TXID | parse_txids(Rest)];
@@ -1077,7 +1155,13 @@ get_height(Peer) ->
 			headers => p2p_headers()
 		}),
 	case Response of
-		{ok, {{<<"200">>, _}, _, Body, _, _}} -> binary_to_integer(Body);
+		{ok, {{<<"200">>, _}, _, Body, _, _}} ->
+			case catch binary_to_integer(Body) of
+				{'EXIT', _} ->
+					{error, invalid_height};
+				Height ->
+					Height
+			end;
 		{ok, {{<<"500">>, _}, _, _, _, _}} -> not_joined
 	end.
 
@@ -1236,11 +1320,15 @@ get_time(Peer, Timeout) ->
 	case ar_http:req(#{method => get, peer => Peer, path => "/time",
 			headers => p2p_headers(), timeout => Timeout + 100}) of
 		{ok, {{<<"200">>, _}, _, Body, Start, End}} ->
-			Time = binary_to_integer(Body),
-			RequestTime = ceil((End - Start) / 1000000),
-			%% The timestamp returned by the HTTP daemon is floored second precision. Thus the
-			%% upper bound is increased by 1.
-			{ok, {Time - RequestTime, Time + RequestTime + 1}};
+			case catch binary_to_integer(Body) of
+				{'EXIT', _} ->
+					{error, invalid_time};
+				Time ->
+					RequestTime = ceil((End - Start) / 1000000),
+					%% The timestamp returned by the HTTP daemon is floored second precision.
+					%% Thus the upper bound is increased by 1.
+					{ok, {Time - RequestTime, Time + RequestTime + 1}}
+			end;
 		Other ->
 			{error, Other}
 	end.
@@ -1464,5 +1552,6 @@ log_failed_request(Reason, Log) ->
 		{error,{shutdown,ehostunreach}} -> ok;
 		{error,{stream_error,closed}} -> ok;
 		{error,{stream_error,closing}} -> ok;
+		{error,{stream_error,{closed,normal}}} -> ok;
 		_ -> ?LOG_DEBUG(Log)
 	end.

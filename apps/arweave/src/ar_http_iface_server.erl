@@ -15,7 +15,7 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(HTTP_IFACE_MIDDLEWARES, [
-	ar_blacklist_middleware,
+	ar_http_iface_rate_limiter_middleware,
 	ar_network_middleware,
 	cowboy_router,
 	ar_http_iface_middleware,
@@ -29,9 +29,10 @@
 
 -define(ENDPOINTS, ["info", "block", "block_announcement", "block2", "tx", "tx2",
 		"queue", "recent_hash_list", "recent_hash_list_diff", "tx_anchor", "arql", "time",
-		"chunk", "chunk2", "data_sync_record", "sync_buckets", "wallet", "unsigned_tx",
+		"chunk", "chunk2", "data_sync_record", "sync_buckets", "footprint_buckets",
+		"wallet", "unsigned_tx",
 		"peers", "hash_list", "block_index", "block_index2", "total_supply", "wallet_list",
-		"height", "metrics", "rates", "vdf", "vdf2", "partial_solution", "pool_cm_jobs"]).
+		"height", "metrics", "vdf", "vdf2", "partial_solution", "pool_cm_jobs"]).
 
 %%%===================================================================
 %%% Public interface.
@@ -89,8 +90,6 @@ terminate(Reason, _State) ->
 %%%===================================================================
 start_http_iface_listener(Config) ->
 	Dispatch = cowboy_router:compile([{'_', ?HTTP_IFACE_ROUTES}]),
-	TlsCertfilePath = Config#config.tls_cert_file,
-	TlsKeyfilePath = Config#config.tls_key_file,
 	TransportOpts = #{
 		% ranch_tcp parameters
 		backlog => Config#config.'http_api.tcp.backlog',
@@ -124,15 +123,7 @@ start_http_iface_listener(Config) ->
 		stream_handlers => [cowboy_metrics_h, cowboy_stream_h],
 		proxy_header => Config#config.proxy_header
 	},
-	case TlsCertfilePath of
-		not_set ->
-			cowboy:start_clear(ar_http_iface_listener, TransportOpts, ProtocolOpts);
-		_ ->
-			cowboy:start_tls(ar_http_iface_listener, TransportOpts ++ [
-				{certfile, TlsCertfilePath},
-				{keyfile, TlsKeyfilePath}
-			], ProtocolOpts)
-	end.
+	cowboy:start_clear(ar_http_iface_listener, TransportOpts, ProtocolOpts).
 
 name_route([]) ->
 	"/";
@@ -196,6 +187,12 @@ name_route([<<"chunk">>, _Offset]) ->
 name_route([<<"chunk2">>, _Offset]) ->
 	"/chunk2/{offset}";
 
+name_route([<<"unconfirmed_chunk">>, _EncodedTXID, _Offset]) ->
+	"/unconfirmed_chunk/{txid}/{offset}";
+
+name_route([<<"data_roots">>, _Offset]) ->
+	"/data_roots/{offset}";
+
 name_route([<<"chunk_proof">>, _Offset]) ->
 	"/chunk_proof/{offset}";
 name_route([<<"chunk_proof2">>, _Offset]) ->
@@ -205,6 +202,9 @@ name_route([<<"data_sync_record">>, _Start, _Limit]) ->
 	"/data_sync_record/{start}/{limit}";
 name_route([<<"data_sync_record">>, _Start, _End, _Limit]) ->
 	"/data_sync_record/{start}/{end}/{limit}";
+
+name_route([<<"footprints">>, _Partition, _Number]) ->
+	"/footprints/{partition}/{footprint_number}";
 
 name_route([<<"price">>, _SizeInBytes]) ->
 	"/price/{bytes}";
@@ -275,11 +275,6 @@ name_route([<<"block">>, <<"height">>, _Height, <<"wallet">>, _Addr, <<"balance"
 	"/block/height/{height}/wallet/{addr}/balance";
 name_route([<<"block">>, <<"current">>]) ->
 	"/block/current";
-
-name_route([<<"balance">>, _Addr, _Network, _Token]) ->
-	"/balance/{address}/{network}/{token}";
-name_route([<<"rates">>]) ->
-	"/rates";
 
 name_route([<<"coordinated_mining">>, <<"h1">>]) ->
 	"/coordinated_mining/h1";

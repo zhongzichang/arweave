@@ -8,6 +8,14 @@
 -define(NETWORK_DATA_BUCKET_SIZE, 10_000_000_000). % 10 GB
 -endif.
 
+%% Similar to ?NETWORK_DATA_BUCKET_SIZE, except for a footprint bucket
+%% contains several "footprints" - sets of chunks spread out across the partition.
+-ifdef(AR_TEST).
+-define(NETWORK_FOOTPRINT_BUCKET_SIZE, 36). % 12 (footprints) * 3 (chunks); ~10 MB
+-else.
+-define(NETWORK_FOOTPRINT_BUCKET_SIZE, 37888). % 37 (footprints) * 1024 (chunks); ~10 GB
+-endif.
+
 %% The maximum number of synced intervals shared with peers.
 -ifdef(AR_TEST).
 -define(MAX_SHARED_SYNCED_INTERVALS_COUNT, 20).
@@ -18,9 +26,22 @@
 %% The upper limit for the size of a sync record serialized using Erlang Term Format.
 -define(MAX_ETF_SYNC_RECORD_SIZE, 80 * ?MAX_SHARED_SYNCED_INTERVALS_COUNT).
 
+%% byte_size(ar_serialize:jsonify(jiffy:encode(#{ packing => "replica_2_9_" ++ binary_to_list(crypto:strong_rand_bytes(32)), intervals => [[integer_to_list(trunc(math:pow(2, 256) - 1)), integer_to_list(trunc(math:pow(2, 256) - 1))] || _ <- lists:seq(1, 512)] }))).
+%% 243238
+-define(MAX_FOOTPRINT_PAYLOAD_SIZE, 250_000).
+
 %% The upper limit for the size of the serialized (in Erlang Term Format) sync buckets.
 -define(MAX_SYNC_BUCKETS_SIZE, 100_000).
 
 %% How many peers with the biggest synced shares in the given bucket to query per bucket
 %% per sync job iteration.
 -define(QUERY_BEST_PEERS_COUNT, 15).
+
+%% The number of the release adding support for the
+%% GET /data_sync_record/[start]/[end]/[limit] endpoint.
+-define(GET_SYNC_RECORD_RIGHT_BOUND_SUPPORT_RELEASE, 83).
+
+%% The number of the release adding support for endpoints:
+%% GET /footprints/[partition]/[footprint] 
+%% GET /footprint_buckets
+-define(GET_FOOTPRINT_SUPPORT_RELEASE, 91).

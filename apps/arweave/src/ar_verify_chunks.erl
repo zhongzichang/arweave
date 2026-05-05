@@ -281,7 +281,7 @@ verify_chunk_storage(PaddedOffset, Metadata, {End, Start}, State)
 					not_found ->
 						false;
 					{ok, Value} ->
-						case binary_to_term(Value) of
+						case binary_to_term(Value, [safe]) of
 							{_Chunk, _DataPath} ->
 								true;
 							_ ->
@@ -329,7 +329,7 @@ verify_chunk_data(Metadata, State) ->
 		not_found ->
 			invalidate_chunk(chunk_data_not_found, AbsoluteOffset, ChunkSize, [], State);
 		{ok, Value} ->
-			case binary_to_term(Value) of
+			case binary_to_term(Value, [safe]) of
 				{_Chunk, _DataPath} ->
 					State;
 				_DataPath ->
@@ -358,7 +358,9 @@ invalidate_sync_record(Type, Cursor, NextCursor, Logs, State) ->
 	#state{ mode = Mode, store_id = StoreID } = State,
 	case Mode of
 		purge ->
-			ar_sync_record:delete(NextCursor, Cursor, ar_data_sync, StoreID);
+			ar_footprint_record:delete(NextCursor, StoreID),
+			ar_sync_record:delete(NextCursor, Cursor, ar_data_sync, StoreID),
+			ar_sync_record:delete(NextCursor, Cursor, ar_chunk_storage, StoreID);
 		log ->
 			ok
 	end,
@@ -554,7 +556,13 @@ verify_chunk_storage_test_() ->
 			fun test_verify_chunk_storage_in_interval/0),
 		ar_test_node:test_with_mocked_functions(
 			[{ar_chunk_storage, read_offset,
-				fun(_Offset, _StoreID) -> {ok, << ?DATA_CHUNK_SIZE:24 >>} end}],
+				fun(_Offset, _StoreID) -> {ok, << ?DATA_CHUNK_SIZE:24 >>} end},
+			{ar_sync_record, is_recorded,
+				fun(_, _, _) -> false end},
+			{ar_entropy_storage, is_entropy_recorded,
+				fun(_, _, _) -> false end},
+			{ar_tx_blacklist, is_byte_blacklisted,
+				fun(_) -> false end}],
 			fun test_verify_chunk_storage_should_store/0),
 		ar_test_node:test_with_mocked_functions(
 			[{ar_chunk_storage, read_offset,
@@ -595,7 +603,9 @@ verify_chunk_test_() ->
 			{ar_chunk_storage, read_offset,
 				fun(_Offset, _StoreID) -> {ok, << ?DATA_CHUNK_SIZE:24 >>} end},
 			{ar_data_sync, get_chunk_data,
-				fun(_, _) -> {ok, term_to_binary({<<>>, <<>>})} end}
+				fun(_, _) -> {ok, term_to_binary({<<>>, <<>>})} end},
+			{ar_sync_record, is_recorded,
+				fun(_, _, _) -> false end}
 		],
 			fun test_verify_chunk/0
 		)

@@ -3,7 +3,8 @@
 -export([reward_history_length/1, expected_hashes_length/1, buffered_reward_history_length/1, 
 		set_reward_history/2, get_locked_rewards/1,
 		trim_locked_rewards/2, trim_reward_history/2,
-		trim_buffered_reward_history/2, get_oldest_locked_address/1,
+		trim_buffered_reward_history/2, interim_reward_history_bi/2,
+		get_oldest_locked_address/1,
 		add_element/2, has_locked_reward/2,
 		reward_history_hash/3, validate_reward_history_hashes/3,
 		get_total_reward_for_address/2, get_reward_history_totals/1,
@@ -16,9 +17,9 @@ reward_history_length(Height) ->
 		Height - ar_fork:height_2_6() + 1, %% included for compatibility with unit tests
 		case Height >= ar_fork:height_2_8() of
 			true ->
-				ar_testnet:reward_history_blocks(Height) + ?STORE_BLOCKS_BEHIND_CURRENT;
+				ar_testnet:reward_history_blocks(Height) + ar_block:get_consensus_window_size();
 			false ->
-				ar_testnet:legacy_reward_history_blocks(Height) + ?STORE_BLOCKS_BEHIND_CURRENT
+				ar_testnet:legacy_reward_history_blocks(Height) + ar_block:get_consensus_window_size()
 		end
 	).
 
@@ -27,9 +28,9 @@ expected_hashes_length(Height) ->
 		true ->
 			%% Take one more block.reward_history_hash because after 2.8 we use
 			%% the previous reward history hash to compute the new one.
-			?STORE_BLOCKS_BEHIND_CURRENT + 1;
+			ar_block:get_consensus_window_size() + 1;
 		false ->
-			?STORE_BLOCKS_BEHIND_CURRENT
+			ar_block:get_consensus_window_size()
 		end.
 
 %% @doc The reward history that gets cached in #block and returned by /reward_history has
@@ -52,7 +53,7 @@ buffered_reward_history_length(Height) ->
 %%
 %% The expectation is that RewardHistory is at least
 %% reward_history_length/1 long, and that Blocks is no longer than
-%% ?STORE_BLOCKS_BEHIND_CURRENT. If so then each block.reward_history value will be at least
+%% ar_block:get_consensus_window_size(). If so then each block.reward_history value will be at least
 %% ?REWARD_HISTORY_BLOCKS long.
 set_reward_history([], _RewardHistory) ->
 	[];
@@ -71,7 +72,7 @@ trim_locked_rewards(Height, RewardHistory) ->
 	lists:sublist(RewardHistory, LockRewardsLength).
 
 %% @doc Trim RewardHistory to the values that will be stored in the block. This is the
-%% sliding window plus a buffer of ?STORE_BLOCKS_BEHIND_CURRENT values.
+%% sliding window plus a buffer of ar_block:get_consensus_window_size() values.
 trim_reward_history(Height, RewardHistory) ->
 	lists:sublist(RewardHistory, reward_history_length(Height)).
 
@@ -79,6 +80,14 @@ trim_reward_history(Height, RewardHistory) ->
 %% reward_history_length/1 and buffered_reward_history_length/1.
 trim_buffered_reward_history(Height, RewardHistory) ->
 	lists:sublist(RewardHistory, buffered_reward_history_length(Height)).
+
+%% @doc Return the portion of the block index needed for reading the reward history
+%% during startup. Until ~2 months post 2.8 hardfork, the reward history accumulated
+%% by any node will be shorter than the full expected length — specifically 21,600
+%% blocks plus the number of blocks elapsed since the 2.8 activation.
+interim_reward_history_bi(Height, BI) ->
+	InterimRewardHistoryLength = (Height - ar_fork:height_2_8()) + 21600,
+	lists:sublist(trim_buffered_reward_history(Height, BI), InterimRewardHistoryLength).
 
 get_oldest_locked_address(B) ->
 	LockedRewards = get_locked_rewards(B),

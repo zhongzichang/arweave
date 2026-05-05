@@ -14,10 +14,50 @@
 %%% configuration data store where all configuration parameters are
 %%% stored and specified.
 %%%
-%%% WARNING: this module/application is in active development.
+%%% WARNING: this module/application is in active development, the
+%%% interfaces can change.
+%%%
+%%% == Usage ==
+%%%
+%%% `arweave_config' application needs to be started to work
+%%% correctly, many processes are mandatory and will be in charge to
+%%% deal with stored configuration.
+%%%
+%%% ```
+%%% % start arweave_config
+%%% arweave_config:start().
+%%% '''
+%%%
+%%% Parameters keys are defined as list and can be retrieve using
+%%% `arweave_config:get/1' or `arweave_config:get/2'.
+%%%
+%%% ```
+%%% % get debug parameter.
+%%% arweave_config:get([debug]).
+%%%
+%%% % get debug parameter, if undefined, use false instead.
+%%% arweave_config:get([debug], false).
+%%% '''
+%%%
+%%% Parameters keys can be dynamically set using
+%%% `arweave_config:set/2'.
+%%%
+%%% ```
+%%% % set debug parameter to true
+%%% arweave_config:set([debug], true).
+%%%
+%%% % set debug parameter to false
+%%% arweave_config:set([debug], false).
+%%% '''
+%%%
+%%% Parameters are defined in parameter specification, defined as
+%%% callback modules or as map. If a specification is not containing
+%%% the parameter key, the interface will return and error.
+%%%
 %%% @end
 %%%===================================================================
 -module(arweave_config).
+-compile(warnings_as_errors).
 -vsn(1).
 -behavior(application).
 -behavior(gen_server).
@@ -131,12 +171,7 @@ get(Key) when is_atom(Key) ->
 get(Key) ->
 	case arweave_config_parser:key(Key) of
 		{ok, Parameter} ->
-			case arweave_config_store:get(Parameter) of
-				{ok, Value} ->
-					{ok, Value};
-				_Elsewise ->
-					arweave_config_spec:get_default(Parameter)
-			end;
+			arweave_config_spec:get(Parameter);
 		Elsewise ->
 			Elsewise
 	end.
@@ -165,11 +200,13 @@ get(Key) ->
 	Return :: term().
 
 get(Key, Default) ->
-	case get(Key) of
+	try get(Key) of
 		{ok, Value} ->
 			Value;
-		_Elsewise ->
+		_Else ->
 			Default
+	catch
+		_:_ -> Default
 	end.
 
 %%--------------------------------------------------------------------
@@ -209,7 +246,18 @@ set(Key, Value) when is_atom(Key) ->
 		{key, Key},
 		{value, Value}
 	]),
-	arweave_config_legacy:set(Key, Value);
+	case arweave_config_legacy:set(Key, Value) of
+		{ok, V} ->
+			case arweave_config_spec:get_legacy(Key) of
+				{ok, PK} ->
+					_ = set(PK, Value),
+					{ok, V};
+				Else ->
+					Else
+			end;
+		Else ->
+			Else
+	end;
 set(Key, Value) ->
 	case arweave_config_parser:key(Key) of
 		{ok, Parameter} ->
@@ -217,6 +265,19 @@ set(Key, Value) ->
 		Elsewise ->
 			Elsewise
 	end.
+
+%%--------------------------------------------------------------------
+%%
+%% == Examples ==
+%%
+%% ```
+%% 10 = getm(#{}, logdir, [logging,default,path], 10).
+%% parameter_value = getm(#{}, logdir, [logging,default,path], 10).
+%% 1 = getm(#{ logdir => 1 }, logdir, [logging,default,path], 10).
+%% '''
+%%
+%%--------------------------------------------------------------------
+% getm(MapKey, Map, Parameter, Default) ->
 
 %%--------------------------------------------------------------------
 %% @doc Start arweave_config process.

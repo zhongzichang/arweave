@@ -5,7 +5,9 @@
 		wait_until_joined/0, wait_until_joined/1,
 		restart/0, restart/1, restart_with_config/1, restart_with_config/2,
 		start_other_node/4, start_node/2, start_node/3, start_coordinated/1, base_cm_config/1, mine/1,
-		wait_until_height/1, wait_until_height/2, wait_until_height/3, assert_wait_until_height/2, 
+		wait_until_height/1, wait_until_height/2, wait_until_height/3, wait_until_height/4,
+		do_wait_until_height/2,
+		assert_wait_until_height/2,
 		wait_until_mining_paused/1, http_get_block/2, get_blocks/1,
 		mock_to_force_invalid_h1/0, mainnet_packing_mocks/0,
 		get_difficulty_for_invalid_hash/0, invalid_solution/0,
@@ -19,8 +21,10 @@
 		stop/0, stop/1, start_peer/2, start_peer/3, start_peer/4, peer_name/1, peer_port/1,
 		stop_peers/1, stop_peer/1, connect_peers/2, connect_to_peer/1,
 		disconnect_peers/2, disconnect_from/1,
-		join/2, join_on/1, rejoin_on/1,
+		join/2, join/3, join_on/1, join_on/2, rejoin_on/1,
+		generate_join_config/0, generate_join_config/1,
 		peer_ip/1, get_node_namespace/0, get_unused_port/0,
+		with_gossip_paused/2,
 
 		mine/0, get_tx_anchor/1, get_tx_confirmations/2, get_tx_price/2, get_tx_price/3,
 		get_optimistic_tx_price/2, get_optimistic_tx_price/3,
@@ -33,15 +37,18 @@
 		post_and_mine/2, post_block/2, post_block/3, send_new_block/2,
 		await_post_block/2, await_post_block/3, sign_block/3, read_block_when_stored/1,
 		read_block_when_stored/2, get_chunk/2, get_chunk/3, get_chunk_proof/2, post_chunk/2,
+		get_unconfirmed_chunk/3,
 		random_v1_data/1, assert_get_tx_data/3,
 		assert_data_not_found/2, post_tx_json/2,
 		wait_until_syncs_genesis_data/0, wait_until_syncs_genesis_data/1,
+		wait_until_syncs_offset/2, wait_until_syncs_offset/3,
 
 		mock_functions/1, test_with_mocked_functions/2, test_with_mocked_functions/3]).
 
 -include("ar.hrl").
--include_lib("arweave_config/include/arweave_config.hrl").
 -include("ar_consensus.hrl").
+
+-include_lib("arweave_config/include/arweave_config.hrl").
 
 -include_lib("eunit/include/eunit.hrl").
 
@@ -68,12 +75,14 @@
 -define(READ_BLOCK_TIMEOUT, 500_000).
 -define(GET_TX_DATA_TIMEOUT, 200_000).
 -define(WAIT_UNTIL_JOINED_TIMEOUT, 200_000).
--define(WAIT_SYNCS_DATA_TIMEOUT, 200_000).
+-define(WAIT_SYNCS_DATA_TIMEOUT, 500_000).
 -define(WAIT_UNTIL_MINING_PAUSED_TIMEOUT, 60_000).
+-define(TEST_HTTP_CLIENT_KEEPALIVE, 4_000).
 
 %%%===================================================================
 %%% Public interface.
 %%%===================================================================
+
 all_peers(test) ->
 	[{test, peer1}, {test, peer2}, {test, peer3}, {test, peer4}];
 all_peers(e2e) ->
@@ -180,7 +189,7 @@ try_boot_peer(TestType, Node, Retries) ->
 %%--------------------------------------------------------------------
 %% @doc run a command in asynchronous way using `spawn/1' instead of
 %% using `&' from shell feature.
-%% @end 
+%% @end
 %%--------------------------------------------------------------------
 run_command(Node, Command) ->
 	spawn(fun() -> run_command_init(Node, Command) end).
@@ -216,8 +225,15 @@ peer_name(Node) ->
 	).
 
 peer_port(Node) ->
-	{ok, Config} = ar_test_node:remote_call(Node, arweave_config, get_env, []),
-	Config#config.port.
+	case get({peer_port, Node}) of
+		undefined ->
+			{ok, Config} = ar_test_node:remote_call(Node, arweave_config, get_env, []),
+			Port = Config#config.port,
+			put({peer_port, Node}, Port),
+			Port;
+		Port ->
+			Port
+	end.
 
 stop_peers([]) ->
 	ok;
@@ -278,11 +294,18 @@ update_config(Config) ->
 		peers = Config#config.peers,
 		cm_exit_peer = Config#config.cm_exit_peer,
 		cm_peers = Config#config.cm_peers,
-		local_peers = Config#config.local_peers,
+		local_peers = case Config#config.local_peers of
+			[] -> [{127,0,0,1}];
+			Peers -> Peers
+		end,
 		mine = Config#config.mine,
 		storage_modules = Config#config.storage_modules,
 		repack_in_place_storage_modules = Config#config.repack_in_place_storage_modules,
-		allow_rebase = Config#config.allow_rebase
+		allow_rebase = Config#config.allow_rebase,
+		disable_replica_2_9_device_limit = true,
+		'http_client.http.keepalive' = ?TEST_HTTP_CLIENT_KEEPALIVE,
+		'http_api.limiter.data_sync_record.leaky_limit' =
+			Config#config.'http_api.limiter.data_sync_record.leaky_limit'
 	},
 	ok = arweave_config:set_env(Config2),
 	?LOG_INFO("Updated Config:"),
@@ -298,11 +321,13 @@ start_node(B0, Config) ->
 start_node(B0, Config, WaitUntilSync) ->
 	?LOG_INFO("Starting node"),
 	clean_up_and_stop(),
+	prometheus:start(),
 	arweave_config:start(),
 	{ok, BaseConfig} = arweave_config:get_env(),
 	write_genesis_files(BaseConfig#config.data_dir, B0),
 	update_config(Config),
-	ar:start_dependencies(),
+	ok = arweave_limiter:start(),
+	start_dependencies(),
 	wait_until_joined(),
 	case WaitUntilSync of
 		true ->
@@ -331,14 +356,19 @@ start_coordinated(MiningNodeCount) when MiningNodeCount >= 1, MiningNodeCount =<
 		local_peers = [peer_ip(Peer) || Peer <- MinerNodes]
 	},
 	ValidatorNodeConfig = BaseCMConfig#config{
+%		'http_api.limiter.data_sync_record.leaky_limit' = 1000,
 		mine = false,
 		peers = [ExitPeer],
 		coordinated_mining = false,
 		cm_api_secret = not_set
 	},
 
+	%% Start the validator first so that its HTTP server is available when
+	%% other nodes validate it as a trusted peer during startup.
+	%% Use peers=[] here because the exit node isn't configured yet.
+	remote_call(main, ar_test_node, start_node,
+			[B0, ValidatorNodeConfig#config{ peers = [] }]),
 	remote_call(peer1, ar_test_node, start_node, [B0, ExitNodeConfig]), %% exit node
-	remote_call(main, ar_test_node, start_node, [B0, ValidatorNodeConfig]), %% validator node
 
 	lists:foreach(
 		fun(I) ->
@@ -347,6 +377,7 @@ start_coordinated(MiningNodeCount) when MiningNodeCount >= 1, MiningNodeCount =<
 			MinerPeerIPs = [peer_ip(Peer) || Peer <- MinerPeers],
 
 			MinerConfig = BaseCMConfig#config{
+%				'http_api.limiter.data_sync_record.leaky_limit' = 1000,
 				cm_exit_peer = ExitPeer,
 				cm_peers = MinerPeerIPs,
 				local_peers = MinerPeerIPs ++ [ExitPeer],
@@ -362,10 +393,11 @@ start_coordinated(MiningNodeCount) when MiningNodeCount >= 1, MiningNodeCount =<
 base_cm_config(Peers) ->
 	RewardAddr = ar_wallet:to_address(remote_call(peer1, ar_wallet, new_keyfile, [])),
 	#config{
-		mining_cache_size_mb = 16,
+		mining_cache_size_mb = 128,
 		start_from_latest_state = true,
 		auto_join = true,
 		mining_addr = RewardAddr,
+		hashing_threads = 1,
 		sync_jobs = 2,
 		disk_pool_jobs = 2,
 		header_sync_jobs = 2,
@@ -382,7 +414,7 @@ base_cm_config(Peers) ->
 	}.
 
 mine() ->
-	gen_server:cast(ar_node_worker, mine).
+	ar_node_worker:mine_one_block().
 
 %% @doc Start mining on the given node. The node will be mining until it finds a block.
 mine(Node) ->
@@ -430,8 +462,8 @@ mainnet_packing_mocks() ->
 		{ar_block, partition_size, fun() -> 3_600_000_000_000 end},
 		{ar_block, strict_data_split_threshold, fun() -> 30_607_159_107_830 end},
 		{ar_storage_module, get_overlap, fun(_) -> 104_857_600 end},
-		{ar_replica_2_9, sub_chunks_per_entropy, fun() -> 1024 end},
-		{ar_replica_2_9, get_sector_size, fun() -> 3_515_875_328 end}
+		{ar_block, get_sub_chunks_per_replica_2_9_entropy, fun() -> 1024 end},
+		{ar_block, get_replica_2_9_entropy_sector_size, fun() -> 3_515_875_328 end}
 	].
 
 get_difficulty_for_invalid_hash() ->
@@ -448,6 +480,11 @@ load_fixture(Fixture) ->
 %%%===================================================================
 %%% Private functions.
 %%%===================================================================
+
+start_dependencies() ->
+	ok = arweave_limiter:start(),
+	{ok, _} = application:ensure_all_started(arweave, temporary),
+	ok.
 
 clean_up_and_stop() ->
 	Config = stop(),
@@ -484,10 +521,15 @@ write_genesis_files(DataDir, B0) ->
 	),
 	_ = ar_kv:create_ets(),
 	{ok, _} = ar_kv:start_link(),
-	ok = ar_kv:open(filename:join(?ROCKS_DB_DIR, "reward_history_db"), reward_history_db),
-	ok = ar_kv:open(filename:join(?ROCKS_DB_DIR, "block_time_history_db"),
-			block_time_history_db),
-	ok = ar_kv:open(filename:join(?ROCKS_DB_DIR, "block_index_db"), block_index_db),
+	ok = ar_kv:open(#{
+		path => filename:join([DataDir, ?ROCKS_DB_DIR, "reward_history_db"]),
+		name => reward_history_db}),
+	ok = ar_kv:open(#{
+		path => filename:join([DataDir, ?ROCKS_DB_DIR, "block_time_history_db"]),
+		name => block_time_history_db}),
+	ok = ar_kv:open(#{
+		path => filename:join([DataDir, ?ROCKS_DB_DIR, "block_index_db"]),
+		name => block_index_db}),
 	H = B0#block.indep_hash,
 	WeaveSize = B0#block.weave_size,
 	TXRoot = B0#block.tx_root,
@@ -545,6 +587,18 @@ wait_until_syncs_data(Left, Right, WeaveSize, Packing) ->
 	),
 	wait_until_syncs_data(Left + ?DATA_CHUNK_SIZE, Right, WeaveSize, Packing).
 
+wait_until_syncs_offset(Offset, StoreID) ->
+	wait_until_syncs_offset(Offset, StoreID, ?WAIT_SYNCS_DATA_TIMEOUT).
+
+wait_until_syncs_offset(Offset, StoreID, Timeout) ->
+	true = ar_util:do_until(
+		fun() ->
+			ar_sync_record:is_recorded(Offset, ar_data_sync, StoreID) =/= false
+		end,
+		200,
+		Timeout
+	).
+
 get_cm_storage_modules(RewardAddr, 1, 1) ->
 	%% When there's only 1 node it covers all 3 storage modules.
 	get_cm_storage_modules(RewardAddr, 1, 3) ++
@@ -599,7 +653,9 @@ start() ->
 	start(#{}).
 
 start(Options) when is_map(Options) ->
+	prometheus:start(),
 	arweave_config:start(),
+	ok = arweave_limiter:start(),
 	B0 =
 		case maps:get(b0, Options, not_set) of
 			not_set ->
@@ -650,6 +706,7 @@ start(B0, RewardAddr, Config) ->
 %% Config after the test is done. Otherwise the tests that run after yours may fail.
 start(B0, RewardAddr, Config, StorageModules) ->
 	clean_up_and_stop(),
+	prometheus:start(),
 	arweave_config:start(),
 	write_genesis_files(Config#config.data_dir, B0),
 	ok = arweave_config:set_env(Config#config{
@@ -658,7 +715,6 @@ start(B0, RewardAddr, Config, StorageModules) ->
 		peers = [],
 		cm_exit_peer = not_set,
 		cm_peers = [],
-		local_peers = [],
 		mining_addr = RewardAddr,
 		storage_modules = StorageModules,
 		disk_space_check_frequency = 1000,
@@ -670,16 +726,18 @@ start(B0, RewardAddr, Config, StorageModules) ->
 				double_check_nonce_limiter, serve_wallet_lists | Config#config.enable],
 		%% Disable rebasing by default to make the tests more reliable.
 		allow_rebase = false,
+		'http_client.http.keepalive' = ?TEST_HTTP_CLIENT_KEEPALIVE,
 		debug = true
 	}),
-	ar:start_dependencies(),
+	ok = arweave_limiter:start(),
+	start_dependencies(),
 	wait_until_joined(),
 	wait_until_syncs_genesis_data().
 
 restart() ->
 	?LOG_INFO("Restarting node"),
 	stop(),
-	ar:start_dependencies(),
+	start_dependencies(),
 	wait_until_joined().
 
 restart_with_config(Config) ->
@@ -688,7 +746,7 @@ restart_with_config(Config) ->
 
 	update_config(Config),
 
-	ar:start_dependencies(),
+	start_dependencies(),
 	wait_until_joined().
 
 restart(Node) ->
@@ -848,42 +906,88 @@ sign_tx(Node, Wallet, Args, SignFun) ->
 
 stop() ->
 	{ok, Config} = arweave_config:get_env(),
-	application:stop(arweave),
+	case stop_application(arweave, 60000) of
+		ok ->
+			ok;
+		{error, {not_started, arweave}} ->
+			ok;
+		{error, timeout} ->
+			?LOG_WARNING([{event, application_stop_timeout}, {app, arweave}]),
+			force_stop_application(arweave)
+	end,
 	ar:stop_dependencies(),
+	arweave_limiter:stop(),
 	Config.
+
+stop_application(App, Timeout) ->
+	Parent = self(),
+	Ref = make_ref(),
+	Pid = spawn(fun() -> Parent ! {Ref, application:stop(App)} end),
+	receive
+		{Ref, Result} ->
+			Result
+	after Timeout ->
+		exit(Pid, kill),
+		{error, timeout}
+	end.
+
+force_stop_application(App) ->
+	case application_controller:get_master(App) of
+		Master when is_pid(Master) ->
+			exit(Master, kill),
+			timer:sleep(1000);
+		_ ->
+			ok
+	end.
 
 stop(Node) ->
 	remote_call(Node, ar_test_node, stop, []).
 
-rejoin_on(#{ node := Node, join_on := JoinOnNode }) ->
-	join_on(#{ node => Node, join_on => JoinOnNode }, true).
+rejoin_on(#{ node := Node, join_on := JoinOnNode } = Options) ->
+	Config = maps:get(config, Options, generate_join_config(Node)),
+	join_on(#{ node => Node, join_on => JoinOnNode, config => Config }, true).
 
-join_on(#{ node := Node, join_on := JoinOnNode }) ->
-	join_on(#{ node => Node, join_on => JoinOnNode }, false).
+generate_join_config(Node) ->
+	remote_call(Node, ar_test_node, generate_join_config, []).
 
-join_on(#{ node := Node, join_on := JoinOnNode }, Rejoin) ->
-	remote_call(Node, ar_test_node, join, [JoinOnNode, Rejoin], ?REMOTE_CALL_TIMEOUT).
+generate_join_config() ->
+	{ok, Config} = arweave_config:get_env(),
+	RewardAddr = ar_wallet:to_address(ar_wallet:new_keyfile()),
+	StorageModules = [{ar_block:partition_size(), N,
+			get_default_storage_module_packing(RewardAddr, N)} || N <- lists:seq(0, 4)],
+	Config#config{
+		mining_addr = RewardAddr,
+		storage_modules = StorageModules
+	}.
+
+join_on(Params) ->
+	join_on(Params, false).
+
+join_on(#{ node := Node, join_on := JoinOnNode } = Params, Rejoin) ->
+	Config = maps:get(config, Params, generate_join_config(Node)),
+	remote_call(Node, ar_test_node, join, [JoinOnNode, Rejoin, Config], ?REMOTE_CALL_TIMEOUT).
 
 join(JoinOnNode, Rejoin) ->
+	join(JoinOnNode, Rejoin, generate_join_config()).
+
+join(JoinOnNode, Rejoin, Config) ->
 	Peer = peer_ip(JoinOnNode),
-	{ok, Config} = arweave_config:get_env(),
 	case Rejoin of
 		true ->
 			stop();
 		false ->
 			clean_up_and_stop()
 	end,
-	RewardAddr = ar_wallet:to_address(ar_wallet:new_keyfile()),
-	StorageModules = [{ar_block:partition_size(), N,
-			get_default_storage_module_packing(RewardAddr, N)} || N <- lists:seq(0, 4)],
+	prometheus:start(),
+	arweave_config:start(),
 	ok = arweave_config:set_env(Config#config{
 		start_from_latest_state = false,
-		mining_addr = RewardAddr,
-		storage_modules = StorageModules,
 		auto_join = true,
-		peers = [Peer]
+		peers = [Peer],
+		'http_client.http.keepalive' = ?TEST_HTTP_CLIENT_KEEPALIVE
 	}),
-	ar:start_dependencies(),
+	start_dependencies(),
+	wait_until_joined(),
 	whereis(ar_node_worker).
 
 get_default_storage_module_packing(RewardAddr, Index) ->
@@ -973,6 +1077,14 @@ disconnect_from(Node) ->
 	ar_http:block_peer_connections(),
 	remote_call(Node, ar_http, block_peer_connections, []).
 
+with_gossip_paused(Node, Fun) when is_function(Fun, 0) ->
+	ok = remote_call(Node, ar_bridge, stop_gossip, []),
+	try
+		Fun()
+	after
+		ok = remote_call(Node, ar_bridge, start_gossip, [])
+	end.
+
 wait_until_syncs_genesis_data(Node) ->
 	ok = remote_call(Node, ar_test_node, wait_until_syncs_genesis_data, [], 100_000).
 
@@ -1002,7 +1114,7 @@ wait_until_syncs_genesis_data() ->
 		gen_server:cast(
 			list_to_atom("ar_data_sync_" ++ ar_storage_module:label(ar_storage_module:id(M))),
 			sync_data
-		) 
+		)
 		|| M <- Config#config.storage_modules
 	],
 	[wait_until_syncs_data(N * Size, (N + 1) * Size, WeaveSize, Packing)
@@ -1011,32 +1123,35 @@ wait_until_syncs_genesis_data() ->
 	ok.
 
 wait_until_height(Node, TargetHeight) ->
-	wait_until_height(Node, TargetHeight, true).
+	wait_until_height(Node, TargetHeight, true, ?WAIT_UNTIL_BLOCK_HEIGHT_TIMEOUT).
 
 wait_until_height(Node, TargetHeight, Strict) ->
-	{BI, Height} = case Node of
+	wait_until_height(Node, TargetHeight, Strict, ?WAIT_UNTIL_BLOCK_HEIGHT_TIMEOUT).
+
+wait_until_height(Node, TargetHeight, Strict, Timeout) ->
+	BI = case Node of
 		main ->
-			{
-				wait_until_height(TargetHeight),
-				ar_node:get_height()
-			};
+			do_wait_until_height(TargetHeight, Timeout);
 		_ ->
-			{
-				remote_call(Node, ?MODULE, wait_until_height, [TargetHeight],
-					?WAIT_UNTIL_BLOCK_HEIGHT_TIMEOUT + 500),
-				remote_call(Node, ar_node, get_height, [])
-			}
+			remote_call(Node, ?MODULE, do_wait_until_height, [TargetHeight, Timeout],
+				Timeout + 500)
 	end,
 	case Strict of
 		true ->
-			?assertEqual(TargetHeight, Height,
-				iolist_to_binary(io_lib:format("Node ~p not at the expected height", [Node])));
+			Height = length(BI) - 1,
+			?assert(Height >= TargetHeight,
+				iolist_to_binary(io_lib:format(
+					"Node ~p not at the expected height. Expected: ~B, got: ~B",
+					[Node, TargetHeight, Height])));
 		false ->
 			ok
 	end,
 	BI.
 
 wait_until_height(TargetHeight) ->
+	do_wait_until_height(TargetHeight, ?WAIT_UNTIL_BLOCK_HEIGHT_TIMEOUT).
+
+do_wait_until_height(TargetHeight, Timeout) ->
 	{ok, BI} = ar_util:do_until(
 		fun() ->
 			case ar_node:get_blocks() of
@@ -1047,7 +1162,7 @@ wait_until_height(TargetHeight) ->
 			end
 		end,
 		100,
-		?WAIT_UNTIL_BLOCK_HEIGHT_TIMEOUT
+		Timeout
 	),
 	BI.
 
@@ -1298,24 +1413,93 @@ unmock_module(Module) ->
 unmock_module(_Module, 0) ->
 	ok;
 unmock_module(Module, Retries) ->
+	Pid = erlang:whereis(Module),
+	case is_pid(Pid) of
+		true ->
+			catch sys:suspend(Pid, 5000);
+		false ->
+			ok
+	end,
 	try
-		meck:unload(Module)
+		timed_meck_unload(Module, 10000)
 	catch
-		%% If it's already not mocked, consider it a success
 		error:{not_mocked, Module} ->
 			ok;
-		%% Retry on other errors
 		error:E ->
 			?debugFmt("ar_test_node (retries left ~p): Error unloading mock for ~p: ~p",
 					[Retries - 1, Module, E]),
+			resume_if_alive(Pid),
 			timer:sleep(1000),
 			unmock_module(Module, Retries - 1);
 		exit:E ->
 			?debugFmt("ar_test_node (retries left ~p): Exit unloading mock for ~p: ~p",
 					[Retries - 1, Module, E]),
+			resume_if_alive(Pid),
 			timer:sleep(1000),
 			unmock_module(Module, Retries - 1)
+	after
+		resume_if_alive(Pid)
 	end.
+
+resume_if_alive(Pid) ->
+	case is_pid(Pid) andalso erlang:is_process_alive(Pid) of
+		true ->
+			catch sys:resume(Pid);
+		false ->
+			ok
+	end.
+
+%% meck:unload internally uses gen_server:call(..., infinity), so if the meck
+%% process is stuck handling a call from a blocked process, it will hang forever
+%% and the catch/retry logic above never fires. Wrap it with a finite timeout
+%% and kill the stuck meck process if needed.
+%%
+%% After killing the meck process we must restore the original module from the
+%% beam file on disk, because meck's terminate (which normally does this) did
+%% not run.
+timed_meck_unload(Module, Timeout) ->
+	Caller = self(),
+	Ref = make_ref(),
+	Worker = spawn(fun() ->
+		try
+			Result = meck:unload(Module),
+			Caller ! {Ref, {ok, Result}}
+		catch
+			Class:Reason ->
+				Caller ! {Ref, {Class, Reason}}
+		end
+	end),
+	receive
+		{Ref, {ok, Result}} ->
+			Result;
+		{Ref, {error, Reason}} ->
+			error(Reason);
+		{Ref, {exit, Reason}} ->
+			exit(Reason)
+	after Timeout ->
+		exit(Worker, kill),
+		MeckProcName = list_to_atom(atom_to_list(Module) ++ "_meck"),
+		case erlang:whereis(MeckProcName) of
+			undefined ->
+				ok;
+			MeckPid ->
+				exit(MeckPid, kill),
+				timer:sleep(100)
+		end,
+		force_restore_module(Module),
+		exit(timed_meck_unload_timeout)
+	end.
+
+%% After force-killing the meck process, the module is left with meck-generated
+%% stub code and no backing ETS tables. Restore the original beam from disk so
+%% processes don't crash in an infinite meck stub loop.
+force_restore_module(Module) ->
+	OrigName = list_to_atom(atom_to_list(Module) ++ "_meck_original"),
+	code:purge(Module),
+	code:delete(Module),
+	code:purge(OrigName),
+	code:delete(OrigName),
+	code:load_file(Module).
 
 mock_functions(Functions) ->
 	{
@@ -1397,12 +1581,22 @@ post_block(B, ExpectedResults) ->
 	post_block(B, ExpectedResults, peer_ip(main)).
 
 post_block(B, ExpectedResults, Peer) ->
-	?assertMatch({ok, {{<<"200">>, _}, _, _, _, _}}, send_new_block(Peer, B)),
+	Result = send_new_block_with_retry(Peer, B, 2),
+	?assertMatch({ok, {{<<"200">>, _}, _, _, _, _}}, Result),
 	await_post_block(B, ExpectedResults, Peer).
 
 send_new_block(Peer, B) ->
 	ar_http_iface_client:send_block_binary(Peer, B#block.indep_hash,
 			ar_serialize:block_to_binary(B)).
+
+send_new_block_with_retry(Peer, B, RetriesLeft) ->
+	case send_new_block(Peer, B) of
+		{error, {stream_error, closed}} when RetriesLeft > 0 ->
+			timer:sleep(50),
+			send_new_block_with_retry(Peer, B, RetriesLeft - 1);
+		Result ->
+			Result
+	end.
 
 await_post_block(B, ExpectedResults) ->
 	await_post_block(B, ExpectedResults, peer_ip(main)).
@@ -1533,6 +1727,14 @@ post_chunk(Node, Proof) ->
 		body => Proof
 	}).
 
+get_unconfirmed_chunk(Node, EncodedTXID, RelativeEndOffset) ->
+	ar_http:req(#{
+		method => get,
+		peer => peer_ip(Node),
+		path => "/unconfirmed_chunk/" ++ binary_to_list(EncodedTXID)
+				++ "/" ++ integer_to_list(RelativeEndOffset)
+	}).
+
 random_v1_data(Size) ->
 	%% Make sure v1 txs do not end with a digit, otherwise they are malleable.
 	<< (crypto:strong_rand_bytes(Size - 1))/binary, <<"a">>/binary >>.
@@ -1548,11 +1750,11 @@ assert_get_tx_data(Node, TXID, ExpectedData) ->
 					true;
 				{ok, {{<<"404">>, _}, _, _, _, _}} ->
 					false;
-				{ok, {{<<"200">>, _}, _, OtherData, _, _}} ->
-					?debugFmt("Got unexpected tx data response. TXID: ~s. Peer: ~s. "
-							"Expected data size: ~B, got data size: ~B.~n",
-							[ar_util:encode(TXID), ar_util:format_peer(Peer),
-								byte_size(ExpectedData), byte_size(OtherData)]);
+			{ok, {{<<"200">>, _}, _, OtherData, _, _}} ->
+				?assertEqual(byte_size(ExpectedData), byte_size(OtherData),
+						lists:flatten(io_lib:format(
+							"TX data size mismatch. TXID: ~s. Peer: ~s.",
+							[ar_util:encode(TXID), ar_util:format_peer(Peer)])));
 				UnexpectedResponse ->
 					?debugFmt("Got unexpected tx data response. TXID: ~s. Peer: ~s. "
 							" response: ~p.~n",

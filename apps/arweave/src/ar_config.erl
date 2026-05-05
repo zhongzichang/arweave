@@ -1,19 +1,126 @@
+%%%===================================================================
+%%% GNU General Public License, version 2 (GPL-2.0)
+%%% The GNU General Public License (GPL-2.0)
+%%% Version 2, June 1991
+%%%
+%%% ------------------------------------------------------------------
+%%%
+%%% @copyright 2026 (c) Arweave
+%%% @author Arweave Team
+%%% @doc arweave legacy configuration parser module.
+%%% @end
+%%%===================================================================
 -module(ar_config).
-
--export([validate_config/1, set_dependent_flags/1, use_remote_vdf_server/0,
-		pull_from_remote_vdf_server/0, compute_own_vdf/0, is_vdf_server/0,
-		is_public_vdf_server/0, parse/1, parse_storage_module/1, log_config/1]).
-
--include("../include/ar.hrl").
--include("../include/ar_consensus.hrl").
+-export([
+	compute_own_vdf/0,
+	is_public_vdf_server/0,
+	is_vdf_server/0,
+	log_config/1,
+	parse/1,
+	parse_config_file/1,
+	parse_config_file/2,
+	parse_storage_module/1,
+	pull_from_remote_vdf_server/0,
+	set_dependent_flags/1,
+	use_remote_vdf_server/0,
+	validate_config/1
+]).
+-include("ar.hrl").
+-include("ar_consensus.hrl").
 -include_lib("arweave_config/include/arweave_config.hrl").
--include("../include/ar_p3.hrl").
+
+-ifdef(AR_TEST).
+-export([
+         parse_peers/2
+]).
+-endif.
 
 %%%===================================================================
 %%% Public interface.
 %%%===================================================================
 
+%%--------------------------------------------------------------------
+%% @doc
+%% @see parse_config_file/2
+%% @end
+%%--------------------------------------------------------------------
+-spec parse_config_file(Args) -> Return when
+	Args :: [string()],
+	Return :: {ok, #config{}}
+		| {error, term(), term()}
+		| {error, term()}.
+
+parse_config_file(Args) ->
+	parse_config_file(Args, [], #config{}).
+
+%%--------------------------------------------------------------------
+%% @doc Take legacy command line argument and look for config_file
+%% parameter, then read and parse the file.
+%% @end
+%%--------------------------------------------------------------------
+-spec parse_config_file(Args, Config) -> Return when
+	Args :: [string()],
+	Config :: #config{},
+	Return :: {ok, #config{}}
+		| {error, term(), term()}
+		| {error, term()}.
+
+parse_config_file(Args, Config) ->
+	parse_config_file(Args, [], Config).
+
+%%--------------------------------------------------------------------
+%% @hidden
+%%--------------------------------------------------------------------
+-spec parse_config_file(Args, Skipped, Config) -> Return when
+	Args :: [string()],
+	Skipped :: [string()],
+	Config :: #config{},
+	Return :: {ok, #config{}}
+		| {error, term(), term()}
+		| {error, term()}.
+
+parse_config_file([], _, Config) ->
+	{ok, Config};
+parse_config_file(["config_file", Path | Rest], Skipped, _) ->
+	case read_config_from_file(Path) of
+		{ok, Config} ->
+			parse_config_file(Rest, Skipped, Config);
+		{error, Reason, Item} ->
+			io:format("Failed to parse config: ~p: ~p.~n", [Reason, Item]),
+			ar_cli_parser:show_help(),
+			{error, Reason, Item};
+		{error, Reason} ->
+			io:format("Failed to parse config: ~p.~n", [Reason]),
+			ar_cli_parser:show_help(),
+			{error, Reason}
+	end;
+parse_config_file([Arg | Rest], Skipped, Config) ->
+	parse_config_file(Rest, [Arg | Skipped], Config).
+
+%%--------------------------------------------------------------------
+%% @doc read the content of a configuration and then parse it with
+%% `ar_config:parse/1'.
+%% @end
+%%--------------------------------------------------------------------
+-spec read_config_from_file(Path) -> Return when
+	Path :: string(),
+	Return :: {ok, binary()}
+		| {error, file_unreadable, Path}.
+
+read_config_from_file(Path) ->
+	case file:read_file(Path) of
+		{ok, FileData} ->
+			ar_config:parse(FileData);
+		{error, _} ->
+			{error, file_unreadable, Path}
+	end.
+
+%%--------------------------------------------------------------------
+%% @doc Validate legacy configuration file as `#config{}' record.
+%% @end
+%%--------------------------------------------------------------------
 -spec validate_config(Config :: #config{}) -> boolean().
+
 validate_config(Config) ->
 	validate_init(Config) andalso
 	validate_storage_modules(Config) andalso
@@ -21,13 +128,24 @@ validate_config(Config) ->
 	validate_cm_pool(Config) andalso
 	validate_cm(Config) andalso
 	validate_unique_replication_type(Config) andalso
-	validate_verify(Config).
+	validate_verify(Config) andalso
+	validate_start_from_state(Config).
 
--spec set_dependent_flags(Config :: #config{}) -> #config{}.
+%%--------------------------------------------------------------------
 %% @doc Some flags force other flags to be set.
+%% @end
+%%--------------------------------------------------------------------
+-spec set_dependent_flags(Config :: #config{}) -> #config{}.
+
 set_dependent_flags(Config) ->
-	Config2 = set_verify_flags(Config),
+	Config1 = set_start_from_state_flags(Config),
+	Config2 = set_verify_flags(Config1),
 	Config2.
+
+set_start_from_state_flags(#config{ start_from_state = not_set } = Config) ->
+	Config;
+set_start_from_state_flags(Config) ->
+	Config#config{ start_from_latest_state = true }.
 
 use_remote_vdf_server() ->
 	{ok, Config} = arweave_config:get_env(),
@@ -169,6 +287,11 @@ parse_options([{<<"start_from_latest_state">>, false} | Rest], Config) ->
 parse_options([{<<"start_from_latest_state">>, Opt} | _], _) ->
 	{error, {bad_type, start_from_latest_state, boolean}, Opt};
 
+parse_options([{<<"start_from_state">>, Folder} | Rest], Config) when is_binary(Folder) ->
+	parse_options(Rest, Config#config{ start_from_state = binary_to_list(Folder) });
+parse_options([{<<"start_from_state">>, Folder} | _], _) ->
+	{error, {bad_type, start_from_state, string}, Folder};
+
 parse_options([{<<"start_from_block">>, H} | Rest], Config) when is_binary(H) ->
 	case ar_util:safe_decode(H) of
 		{ok, Decoded} when byte_size(Decoded) == 48 ->
@@ -309,6 +432,11 @@ parse_options([{<<"disable_replica_2_9_device_limit">>, false} | Rest], Config) 
 parse_options([{<<"disable_replica_2_9_device_limit">>, Opt} | _], _) ->
 	{error, {bad_type, disable_replica_2_9_device_limit, boolean}, Opt};
 
+parse_options([{<<"replica_2_9_entropy_cache_size_mb">>, N} | Rest], Config) when is_integer(N)->
+	parse_options(Rest, Config#config{ replica_2_9_entropy_cache_size_mb = N });
+parse_options([{<<"replica_2_9_entropy_cache_size_mb">>, Opt} | _], _) ->
+	{error, {bad_type, replica_2_9_entropy_cache_size_mb, number}, Opt};
+
 parse_options([{<<"diff">>, Diff} | Rest], Config) when is_integer(Diff) ->
 	parse_options(Rest, Config#config{ diff = Diff });
 parse_options([{<<"diff">>, Diff} | _], _) ->
@@ -385,6 +513,12 @@ parse_options([{<<"header_sync_jobs">>, Value} | Rest], Config)
 	parse_options(Rest, Config#config{ header_sync_jobs = Value });
 parse_options([{<<"header_sync_jobs">>, Value} | _], _) ->
 	{error, {bad_type, header_sync_jobs, number}, Value};
+
+parse_options([{<<"enable_data_roots_syncing">>, Value} | Rest], Config)
+		when is_boolean(Value) ->
+	parse_options(Rest, Config#config{ enable_data_roots_syncing = Value });
+parse_options([{<<"enable_data_roots_syncing">>, Value} | _], _) ->
+	{error, {bad_type, enable_data_roots_syncing, boolean}, Value};
 
 parse_options([{<<"disk_pool_jobs">>, Value} | Rest], Config)
 		when is_integer(Value) ->
@@ -534,6 +668,12 @@ parse_options([{<<"max_disk_pool_data_root_buffer_mb">>, D} | Rest], Config)
 		when is_integer(D) ->
 	parse_options(Rest, Config#config{ max_disk_pool_data_root_buffer_mb = D });
 
+parse_options([{<<"max_duplicate_data_roots">>, <<"infinity">>} | Rest], Config) ->
+	parse_options(Rest, Config#config{ max_duplicate_data_roots = infinity });
+parse_options([{<<"max_duplicate_data_roots">>, D} | Rest], Config)
+		when is_integer(D) ->
+	parse_options(Rest, Config#config{ max_duplicate_data_roots = D });
+
 parse_options([{<<"disk_cache_size_mb">>, D} | Rest], Config) when is_integer(D) ->
 	parse_options(Rest, Config#config{ disk_cache_size = D });
 
@@ -596,16 +736,6 @@ parse_options([{<<"defragment_modules">>, L} | Rest], Config) when is_list(L) ->
 	end;
 parse_options([{<<"defragment_modules">>, Bin} | _], _) ->
 	{error, {bad_type, defragment_modules, array}, Bin};
-
-parse_options([{<<"p3">>, {P3Config}} | Rest], Config) ->
-	try
-		P3 = ar_p3_config:parse_p3(P3Config, #p3_config{}),
-		parse_options(Rest, Config#config{ p3 = P3 })
-	catch error:Reason ->
-		{error,
-			{bad_format, p3, Reason},
-			P3Config}
-	end;
 
 parse_options([{<<"http_api.tcp.idle_timeout_seconds">>, D} | Rest], Config) when is_integer(D) ->
 	parse_options(Rest, Config#config{ http_api_transport_idle_timeout = D * 1000 });
@@ -909,6 +1039,796 @@ parse_options([{<<"http_api.tcp.send_timeout">>, Timeout}|Rest], Config) ->
 			{error, {bad_value, 'http_api.tcp.send_timeout'}, Timeout}
 	end;
 
+%% RATE LIMITER GENERAL
+parse_options([{<<"http_api.limiter.general.sliding_window_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit >= 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.general.sliding_window_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.general.sliding_window_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.general.sliding_window_duration">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.general.sliding_window_duration' = Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.general.sliding_window_duration'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.general.sliding_window_timestamp_cleanup_interval">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.general.sliding_window_timestamp_cleanup_interval' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.general.sliding_window_timestamp_cleanup_interval'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.general.sliding_window_timestamp_cleanup_expiry">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.general.sliding_window_timestamp_cleanup_expiry' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.general.sliding_window_timestamp_cleanup_expiry'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.general.leaky_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit >= 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.general.leaky_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.general.leaky_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.general.leaky_tick_interval">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.general.leaky_tick_interval' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.general.leaky_tick_interval'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.general.leaky_tick_reduction">>, Reduction}|Rest], Config) ->
+    case Reduction of
+        Reduction when is_integer(Reduction), Reduction > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.general.leaky_tick_reduction' = Reduction });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.general.leaky_tick_reduction'}, Reduction}
+    end;
+
+parse_options([{<<"http_api.limiter.general.concurrency_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.general.concurrency_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.general.concurrency_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.general.is_manual_reduction_disabled">>, IsDisabled}|Rest], Config) ->
+    case IsDisabled of
+        IsDisabled when is_boolean(IsDisabled) ->
+            parse_options(Rest, Config#config{'http_api.limiter.general.is_manual_reduction_disabled' = IsDisabled });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.general.is_manual_reduction_disabled'}, IsDisabled}
+    end;
+
+%% RATE LIMITER CHUNK
+parse_options([{<<"http_api.limiter.chunk.sliding_window_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit >= 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.chunk.sliding_window_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.chunk.sliding_window_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.chunk.sliding_window_duration">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.chunk.sliding_window_duration' = Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.chunk.sliding_window_duration'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.chunk.sliding_window_timestamp_cleanup_interval">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.chunk.sliding_window_timestamp_cleanup_interval' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.chunk.sliding_window_timestamp_cleanup_interval'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.chunk.sliding_window_timestamp_cleanup_expiry">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.chunk.sliding_window_timestamp_cleanup_expiry' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.chunk.sliding_window_timestamp_cleanup_expiry'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.chunk.leaky_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit >= 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.chunk.leaky_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.chunk.leaky_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.chunk.leaky_tick_interval">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.chunk.leaky_tick_interval' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.chunk.leaky_tick_interval'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.chunk.leaky_tick_reduction">>, Reduction}|Rest], Config) ->
+    case Reduction of
+        Reduction when is_integer(Reduction), Reduction > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.chunk.leaky_tick_reduction' = Reduction });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.chunk.leaky_tick_reduction'}, Reduction}
+    end;
+
+parse_options([{<<"http_api.limiter.chunk.concurrency_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.chunk.concurrency_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.chunk.concurrency_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.chunk.is_manual_reduction_disabled">>, IsDisabled}|Rest], Config) ->
+    case IsDisabled of
+        IsDisabled when is_boolean(IsDisabled) ->
+            parse_options(Rest, Config#config{'http_api.limiter.chunk.is_manual_reduction_disabled' = IsDisabled });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.chunk.is_manual_reduction_disabled'}, IsDisabled}
+    end;
+
+%% RATE LIMITER DATA_SYNC_RECORD
+parse_options([{<<"http_api.limiter.data_sync_record.sliding_window_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit >= 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.data_sync_record.sliding_window_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.data_sync_record.sliding_window_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.data_sync_record.sliding_window_duration">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.data_sync_record.sliding_window_duration' = Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.data_sync_record.sliding_window_duration'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.data_sync_record.sliding_window_timestamp_cleanup_interval">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.data_sync_record.sliding_window_timestamp_cleanup_interval' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.data_sync_record.sliding_window_timestamp_cleanup_interval'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.data_sync_record.sliding_window_timestamp_cleanup_expiry">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.data_sync_record.sliding_window_timestamp_cleanup_expiry' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.data_sync_record.sliding_window_timestamp_cleanup_expiry'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.data_sync_record.leaky_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit >= 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.data_sync_record.leaky_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.data_sync_record.leaky_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.data_sync_record.leaky_tick_interval">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.data_sync_record.leaky_tick_interval' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.data_sync_record.leaky_tick_interval'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.data_sync_record.leaky_tick_reduction">>, Reduction}|Rest], Config) ->
+    case Reduction of
+        Reduction when is_integer(Reduction), Reduction > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.data_sync_record.leaky_tick_reduction' = Reduction });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.data_sync_record.leaky_tick_reduction'}, Reduction}
+    end;
+
+parse_options([{<<"http_api.limiter.data_sync_record.concurrency_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.data_sync_record.concurrency_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.data_sync_record.concurrency_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.data_sync_record.is_manual_reduction_disabled">>, IsDisabled}|Rest], Config) ->
+    case IsDisabled of
+        IsDisabled when is_boolean(IsDisabled) ->
+            parse_options(Rest, Config#config{'http_api.limiter.data_sync_record.is_manual_reduction_disabled' = IsDisabled });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.data_sync_record.is_manual_reduction_disabled'}, IsDisabled}
+    end;
+
+%% RATE LIMITER RECENT_HASH_LIST_DIFF
+parse_options([{<<"http_api.limiter.recent_hash_list_diff.sliding_window_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit >= 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.recent_hash_list_diff.sliding_window_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.recent_hash_list_diff.sliding_window_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.recent_hash_list_diff.sliding_window_duration">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.recent_hash_list_diff.sliding_window_duration' = Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.recent_hash_list_diff.sliding_window_duration'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.recent_hash_list_diff.sliding_window_timestamp_cleanup_interval">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.recent_hash_list_diff.sliding_window_timestamp_cleanup_interval' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.recent_hash_list_diff.sliding_window_timestamp_cleanup_interval'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.recent_hash_list_diff.sliding_window_timestamp_cleanup_expiry">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.recent_hash_list_diff.sliding_window_timestamp_cleanup_expiry' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.recent_hash_list_diff.sliding_window_timestamp_cleanup_expiry'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.recent_hash_list_diff.leaky_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit >= 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.recent_hash_list_diff.leaky_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.recent_hash_list_diff.leaky_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.recent_hash_list_diff.leaky_tick_interval">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.recent_hash_list_diff.leaky_tick_interval' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.recent_hash_list_diff.leaky_tick_interval'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.recent_hash_list_diff.leaky_tick_reduction">>, Reduction}|Rest], Config) ->
+    case Reduction of
+        Reduction when is_integer(Reduction), Reduction > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.recent_hash_list_diff.leaky_tick_reduction' = Reduction });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.recent_hash_list_diff.leaky_tick_reduction'}, Reduction}
+    end;
+
+parse_options([{<<"http_api.limiter.recent_hash_list_diff.concurrency_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.recent_hash_list_diff.concurrency_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.recent_hash_list_diff.concurrency_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.recent_hash_list_diff.is_manual_reduction_disabled">>, IsDisabled}|Rest], Config) ->
+    case IsDisabled of
+        IsDisabled when is_boolean(IsDisabled) ->
+            parse_options(Rest, Config#config{'http_api.limiter.recent_hash_list_diff.is_manual_reduction_disabled' = IsDisabled });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.recent_hash_list_diff.is_manual_reduction_disabled'}, IsDisabled}
+    end;
+
+%% RATE LIMITER BLOCK_INDEX
+parse_options([{<<"http_api.limiter.block_index.sliding_window_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit >= 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.block_index.sliding_window_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.block_index.sliding_window_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.block_index.sliding_window_duration">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.block_index.sliding_window_duration' = Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.block_index.sliding_window_duration'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.block_index.sliding_window_timestamp_cleanup_interval">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.block_index.sliding_window_timestamp_cleanup_interval' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.block_index.sliding_window_timestamp_cleanup_interval'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.block_index.sliding_window_timestamp_cleanup_expiry">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.block_index.sliding_window_timestamp_cleanup_expiry' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.block_index.sliding_window_timestamp_cleanup_expiry'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.block_index.leaky_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit >= 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.block_index.leaky_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.block_index.leaky_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.block_index.leaky_tick_interval">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.block_index.leaky_tick_interval' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.block_index.leaky_tick_interval'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.block_index.leaky_tick_reduction">>, Reduction}|Rest], Config) ->
+    case Reduction of
+        Reduction when is_integer(Reduction), Reduction > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.block_index.leaky_tick_reduction' = Reduction });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.block_index.leaky_tick_reduction'}, Reduction}
+    end;
+
+parse_options([{<<"http_api.limiter.block_index.concurrency_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.block_index.concurrency_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.block_index.concurrency_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.block_index.is_manual_reduction_disabled">>, IsDisabled}|Rest], Config) ->
+    case IsDisabled of
+        IsDisabled when is_boolean(IsDisabled) ->
+            parse_options(Rest, Config#config{'http_api.limiter.block_index.is_manual_reduction_disabled' = IsDisabled });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.block_index.is_manual_reduction_disabled'}, IsDisabled}
+    end;
+
+%% RATE LIMITER WALLET_LIST
+parse_options([{<<"http_api.limiter.wallet_list.sliding_window_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit >= 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.wallet_list.sliding_window_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.wallet_list.sliding_window_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.wallet_list.sliding_window_duration">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.wallet_list.sliding_window_duration' = Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.wallet_list.sliding_window_duration'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.wallet_list.sliding_window_timestamp_cleanup_interval">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.wallet_list.sliding_window_timestamp_cleanup_interval' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.wallet_list.sliding_window_timestamp_cleanup_interval'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.wallet_list.sliding_window_timestamp_cleanup_expiry">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.wallet_list.sliding_window_timestamp_cleanup_expiry' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.wallet_list.sliding_window_timestamp_cleanup_expiry'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.wallet_list.leaky_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit >= 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.wallet_list.leaky_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.wallet_list.leaky_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.wallet_list.leaky_tick_interval">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.wallet_list.leaky_tick_interval' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.wallet_list.leaky_tick_interval'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.wallet_list.leaky_tick_reduction">>, Reduction}|Rest], Config) ->
+    case Reduction of
+        Reduction when is_integer(Reduction), Reduction > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.wallet_list.leaky_tick_reduction' = Reduction });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.wallet_list.leaky_tick_reduction'}, Reduction}
+    end;
+
+parse_options([{<<"http_api.limiter.wallet_list.concurrency_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.wallet_list.concurrency_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.wallet_list.concurrency_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.wallet_list.is_manual_reduction_disabled">>, IsDisabled}|Rest], Config) ->
+    case IsDisabled of
+        IsDisabled when is_boolean(IsDisabled) ->
+            parse_options(Rest, Config#config{'http_api.limiter.wallet_list.is_manual_reduction_disabled' = IsDisabled });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.wallet_list.is_manual_reduction_disabled'}, IsDisabled}
+    end;
+
+%% RATE LIMITER GET_VDF
+parse_options([{<<"http_api.limiter.get_vdf.sliding_window_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit >= 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.get_vdf.sliding_window_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.get_vdf.sliding_window_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.get_vdf.sliding_window_duration">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.get_vdf.sliding_window_duration' = Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.get_vdf.sliding_window_duration'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.get_vdf.sliding_window_timestamp_cleanup_interval">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.get_vdf.sliding_window_timestamp_cleanup_interval' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.get_vdf.sliding_window_timestamp_cleanup_interval'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.get_vdf.sliding_window_timestamp_cleanup_expiry">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.get_vdf.sliding_window_timestamp_cleanup_expiry' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.get_vdf.sliding_window_timestamp_cleanup_expiry'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.get_vdf.leaky_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit >= 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.get_vdf.leaky_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.get_vdf.leaky_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.get_vdf.leaky_tick_interval">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.get_vdf.leaky_tick_interval' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.get_vdf.leaky_tick_interval'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.get_vdf.leaky_tick_reduction">>, Reduction}|Rest], Config) ->
+    case Reduction of
+        Reduction when is_integer(Reduction), Reduction > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.get_vdf.leaky_tick_reduction' = Reduction });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.get_vdf.leaky_tick_reduction'}, Reduction}
+    end;
+
+parse_options([{<<"http_api.limiter.get_vdf.concurrency_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.get_vdf.concurrency_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.get_vdf.concurrency_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.get_vdf.is_manual_reduction_disabled">>, IsDisabled}|Rest], Config) ->
+    case IsDisabled of
+        IsDisabled when is_boolean(IsDisabled) ->
+            parse_options(Rest, Config#config{'http_api.limiter.get_vdf.is_manual_reduction_disabled' = IsDisabled });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.get_vdf.is_manual_reduction_disabled'}, IsDisabled}
+    end;
+
+%% RATE LIMITER GET_VDF_SESSION
+parse_options([{<<"http_api.limiter.get_vdf_session.sliding_window_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit >= 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.get_vdf_session.sliding_window_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.get_vdf_session.sliding_window_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.get_vdf_session.sliding_window_duration">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.get_vdf_session.sliding_window_duration' = Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.get_vdf_session.sliding_window_duration'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.get_vdf_session.sliding_window_timestamp_cleanup_interval">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.get_vdf_session.sliding_window_timestamp_cleanup_interval' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.get_vdf_session.sliding_window_timestamp_cleanup_interval'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.get_vdf_session.sliding_window_timestamp_cleanup_expiry">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.get_vdf_session.sliding_window_timestamp_cleanup_expiry' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.get_vdf_session.sliding_window_timestamp_cleanup_expiry'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.get_vdf_session.leaky_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit >= 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.get_vdf_session.leaky_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.get_vdf_session.leaky_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.get_vdf_session.leaky_tick_interval">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.get_vdf_session.leaky_tick_interval' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.get_vdf_session.leaky_tick_interval'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.get_vdf_session.leaky_tick_reduction">>, Reduction}|Rest], Config) ->
+    case Reduction of
+        Reduction when is_integer(Reduction), Reduction > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.get_vdf_session.leaky_tick_reduction' = Reduction });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.get_vdf_session.leaky_tick_reduction'}, Reduction}
+    end;
+
+parse_options([{<<"http_api.limiter.get_vdf_session.concurrency_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.get_vdf_session.concurrency_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.get_vdf_session.concurrency_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.get_vdf_session.is_manual_reduction_disabled">>, IsDisabled}|Rest], Config) ->
+    case IsDisabled of
+        IsDisabled when is_boolean(IsDisabled) ->
+            parse_options(Rest, Config#config{'http_api.limiter.get_vdf_session.is_manual_reduction_disabled' = IsDisabled });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.get_vdf_session.is_manual_reduction_disabled'}, IsDisabled}
+    end;
+
+%% RATE LIMITER GET_PREVIOUS_VDF_SESSION
+parse_options([{<<"http_api.limiter.get_previous_vdf_session.sliding_window_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit >= 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.get_previous_vdf_session.sliding_window_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.get_previous_vdf_session.sliding_window_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.get_previous_vdf_session.sliding_window_duration">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.get_previous_vdf_session.sliding_window_duration' = Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.get_previous_vdf_session.sliding_window_duration'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.get_previous_vdf_session.sliding_window_timestamp_cleanup_interval">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.get_previous_vdf_session.sliding_window_timestamp_cleanup_interval' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.get_previous_vdf_session.sliding_window_timestamp_cleanup_interval'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.get_previous_vdf_session.sliding_window_timestamp_cleanup_expiry">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.get_previous_vdf_session.sliding_window_timestamp_cleanup_expiry' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.get_previous_vdf_session.sliding_window_timestamp_cleanup_expiry'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.get_previous_vdf_session.leaky_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit >= 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.get_previous_vdf_session.leaky_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.get_previous_vdf_session.leaky_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.get_previous_vdf_session.leaky_tick_interval">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.get_previous_vdf_session.leaky_tick_interval' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.get_previous_vdf_session.leaky_tick_interval'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.get_previous_vdf_session.leaky_tick_reduction">>, Reduction}|Rest], Config) ->
+    case Reduction of
+        Reduction when is_integer(Reduction), Reduction > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.get_previous_vdf_session.leaky_tick_reduction' = Reduction });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.get_previous_vdf_session.leaky_tick_reduction'}, Reduction}
+    end;
+
+parse_options([{<<"http_api.limiter.get_previous_vdf_session.concurrency_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.get_previous_vdf_session.concurrency_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.get_previous_vdf_session.concurrency_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.get_previous_vdf_session.is_manual_reduction_disabled">>, IsDisabled}|Rest], Config) ->
+    case IsDisabled of
+        IsDisabled when is_boolean(IsDisabled) ->
+            parse_options(Rest, Config#config{'http_api.limiter.get_previous_vdf_session.is_manual_reduction_disabled' = IsDisabled });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.get_previous_vdf_session.is_manual_reduction_disabled'}, IsDisabled}
+    end;
+
+%% RATE LIMITER METRICS
+parse_options([{<<"http_api.limiter.metrics.sliding_window_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit >= 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.metrics.sliding_window_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.metrics.sliding_window_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.metrics.sliding_window_duration">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.metrics.sliding_window_duration' = Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.metrics.sliding_window_duration'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.metrics.sliding_window_timestamp_cleanup_interval">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.metrics.sliding_window_timestamp_cleanup_interval' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.metrics.sliding_window_timestamp_cleanup_interval'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.metrics.sliding_window_timestamp_cleanup_expiry">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.metrics.sliding_window_timestamp_cleanup_expiry' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.metrics.sliding_window_timestamp_cleanup_expiry'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.metrics.leaky_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit >= 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.metrics.leaky_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.metrics.leaky_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.metrics.leaky_tick_interval">>, Duration}|Rest], Config) ->
+    case Duration of
+        Duration when is_integer(Duration), Duration > 0 ->
+            parse_options(
+              Rest, Config#config{'http_api.limiter.metrics.leaky_tick_interval' =
+                                      Duration });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.metrics.leaky_tick_interval'}, Duration}
+    end;
+
+parse_options([{<<"http_api.limiter.metrics.leaky_tick_reduction">>, Reduction}|Rest], Config) ->
+    case Reduction of
+        Reduction when is_integer(Reduction), Reduction > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.metrics.leaky_tick_reduction' = Reduction });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.metrics.leaky_tick_reduction'}, Reduction}
+    end;
+
+parse_options([{<<"http_api.limiter.metrics.concurrency_limit">>, Limit}|Rest], Config) ->
+    case Limit of
+        Limit when is_integer(Limit), Limit > 0 ->
+            parse_options(Rest, Config#config{'http_api.limiter.metrics.concurrency_limit' = Limit });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.metrics.concurrency_limit'}, Limit}
+    end;
+
+parse_options([{<<"http_api.limiter.metrics.is_manual_reduction_disabled">>, IsDisabled}|Rest], Config) ->
+    case IsDisabled of
+        IsDisabled when is_boolean(IsDisabled) ->
+            parse_options(Rest, Config#config{'http_api.limiter.metrics.is_manual_reduction_disabled' = IsDisabled });
+        _ ->
+            {error, {bad_value, 'http_api.limiter.metrics.is_manual_reduction_disabled'}, IsDisabled}
+    end;
+
 parse_options([Opt | _], _) ->
 	{error, unknown, Opt};
 parse_options([], Config) ->
@@ -963,7 +1883,9 @@ safe_map(Fun, List) ->
 parse_peers([Peer | Rest], ParsedPeers) ->
 	case ar_util:safe_parse_peer(Peer) of
 		{ok, ParsedPeer} -> parse_peers(Rest, ParsedPeer ++ ParsedPeers);
-		{error, _} -> error
+		{error, _} -> 
+			?LOG_WARNING([{event, invalid_peer_in_config}, {peer, Peer}, {action, ignored}]),
+			parse_peers(Rest, ParsedPeers)
 	end;
 parse_peers([], ParsedPeers) ->
 	Flatten = lists:flatten(ParsedPeers),
@@ -1088,6 +2010,8 @@ log_config_value(proxy_peers, FieldValue) ->
 	format_peers(FieldValue);
 log_config_value(mining_addr, FieldValue) ->
 	format_binary(FieldValue);
+log_config_value(start_from_state, FieldValue) ->
+	FieldValue;
 log_config_value(start_from_block, FieldValue) ->
 	format_binary(FieldValue);
 log_config_value(storage_modules, FieldValue) ->
@@ -1232,6 +2156,17 @@ validate_verify(#config{ repack_in_place_storage_modules = RepackInPlaceStorageM
 validate_verify(_Config) ->
 	true.
 
+validate_start_from_state(#config{ start_from_state = not_set }) ->
+	true;
+validate_start_from_state(#config{ start_from_state = Folder, data_dir = DataDir }) ->
+	case filename:absname(Folder) == filename:absname(DataDir) of
+		true ->
+			io:format("~nstart_from_state folder cannot be the same as data_dir.~n~n"),
+			false;
+		false ->
+			true
+	end.
+
 disable_vdf(Config) ->
 	RemovePublicVDFServer =
 		lists:filter(fun(Item) -> Item =/= public_vdf_server end, Config#config.enable),
@@ -1274,4 +2209,3 @@ set_verify_flags(Config) ->
 		max_propagation_peers = 0,
 		max_block_propagation_peers = 0
 	}.
-

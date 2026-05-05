@@ -31,7 +31,9 @@
 		json_map_to_candidate/1, encode_packing/2, decode_packing/2,
 		jobs_to_json_struct/1, json_struct_to_jobs/1,
 		partial_solution_response_to_json_struct/1,
-		pool_cm_jobs_to_json_struct/1, json_map_to_pool_cm_jobs/1]).
+		pool_cm_jobs_to_json_struct/1, json_map_to_pool_cm_jobs/1,
+		footprint_to_json_map/1, json_map_to_footprint/1,
+		data_roots_to_binary/1, binary_to_data_roots/1]).
 
 -include("ar.hrl").
 -include("ar_consensus.hrl").
@@ -119,19 +121,27 @@ binary_to_block(<< H:48/binary, PrevHSize:8, PrevH:PrevHSize/binary,
 			_ -> {RateDividend, RateDivisor} end,
 	ScheduledRate = case SchedRateDivisorSize of 0 -> undefined;
 			_ -> {SchedRateDividend, SchedRateDivisor} end,
-	Addr2 = case {AddrSize, Height >= ar_fork:height_2_6()} of
-			{0, false} -> unclaimed; _ -> Addr end,
-	B = #block{ indep_hash = H, previous_block = PrevH, timestamp = TS,
-			nonce = Nonce, height = Height, diff = Diff, cumulative_diff = CDiff,
-			last_retarget = LastRetarget, hash = Hash, block_size = BlockSize,
-			weave_size = WeaveSize, reward_addr = Addr2, tx_root = TXRoot,
-			wallet_list = WalletList, hash_list_merkle = HashListMerkle,
-			reward_pool = RewardPool, packing_2_5_threshold = Threshold2,
-			strict_data_split_threshold = StrictChunkThreshold2,
-			usd_to_ar_rate = Rate, scheduled_usd_to_ar_rate = ScheduledRate,
-			poa = #poa{ option = PoAOption, chunk = Chunk, data_path = DataPath,
-					tx_path = TXPath }},
-	parse_block_tags_transactions(Rest, B);
+	case Height >= ar_fork:height_2_5() andalso
+			(Rate == undefined orelse ScheduledRate == undefined) of
+		true ->
+			{error, invalid_block_input};
+		false ->
+			Addr2 = case {AddrSize, Height >= ar_fork:height_2_6()} of
+					{0, false} -> unclaimed; _ -> Addr end,
+			B = #block{ indep_hash = H, previous_block = PrevH, timestamp = TS,
+					nonce = Nonce, height = Height, diff = Diff,
+					cumulative_diff = CDiff,
+					last_retarget = LastRetarget, hash = Hash,
+					block_size = BlockSize,
+					weave_size = WeaveSize, reward_addr = Addr2, tx_root = TXRoot,
+					wallet_list = WalletList, hash_list_merkle = HashListMerkle,
+					reward_pool = RewardPool, packing_2_5_threshold = Threshold2,
+					strict_data_split_threshold = StrictChunkThreshold2,
+					usd_to_ar_rate = Rate, scheduled_usd_to_ar_rate = ScheduledRate,
+					poa = #poa{ option = PoAOption, chunk = Chunk, data_path = DataPath,
+							tx_path = TXPath }},
+			parse_block_tags_transactions(Rest, B)
+	end;
 binary_to_block(_Bin) ->
 	{error, invalid_block_input}.
 
@@ -1261,6 +1271,48 @@ binary_to_block_index(<< BH:48/binary, WeaveSizeSize:16, WeaveSize:(WeaveSizeSiz
 binary_to_block_index(_Rest, _BI) ->
 	{error, invalid_input}.
 
+data_roots_to_binary({TXRoot, BlockSize, DataRootEntries}) when is_binary(TXRoot) ->
+	EncodedEntries = lists:map(
+		fun({DataRoot, TXSize, TXStartOffset, TXPath}) ->
+			<< DataRoot:32/binary,
+				(encode_int(TXSize, 8))/binary,
+				(encode_int(TXStartOffset, 8))/binary,
+                (encode_bin(TXPath, 24))/binary >>
+		end,
+		DataRootEntries),
+	<< (encode_bin(TXRoot, 8))/binary,
+		(encode_int(BlockSize, 16))/binary,
+		(length(DataRootEntries)):32,
+		(iolist_to_binary(EncodedEntries))/binary >>.
+
+%% @doc Decode data_roots_to_binary/1 payload.
+binary_to_data_roots(<< TXRootSize:8, TXRoot:TXRootSize/binary,
+		BlockSizeSize:16, BlockSize:(BlockSizeSize*8),
+		Count:32, Rest/binary >>) when TXRootSize == 0; TXRootSize == 32; Count =< ?BLOCK_TX_COUNT_LIMIT ->
+	case catch binary_to_data_root_entries(Count, Rest, []) of
+		{ok, DataRootEntries, <<>>} ->
+			{ok, {TXRoot, BlockSize, lists:reverse(DataRootEntries)}};
+		{ok, _Entries, _Tail} ->
+			{error, invalid_input3};
+		{'EXIT', _} ->
+			{error, exception};
+		Error ->
+			Error
+	end;
+binary_to_data_roots(_Other) ->
+	{error, invalid_input1}.
+
+binary_to_data_root_entries(0, Bin, Acc) ->
+	{ok, Acc, Bin};
+binary_to_data_root_entries(N, << DataRoot:32/binary,
+		TXSizeSize:8, TXSize:(TXSizeSize*8),
+		TXStartSize:8, TXStartOffset:(TXStartSize*8),
+        TXPathSize:24, TXPath:TXPathSize/binary, Rest/binary >>, Acc) when N > 0 ->
+	binary_to_data_root_entries(N - 1, Rest,
+		[{DataRoot, TXSize, TXStartOffset, TXPath} | Acc]);
+binary_to_data_root_entries(_N, _Bin, _Acc) ->
+	{error, invalid_input2}.
+
 %% @doc Take a JSON struct and produce JSON string.
 jsonify(JSONStruct) ->
 	iolist_to_binary(jiffy:encode(JSONStruct)).
@@ -1848,11 +1900,18 @@ poa_map_to_json_map(Map) ->
 		data_path => ar_util:encode(DataPath),
 		packing => BinaryPacking
 	},
-	case maps:get(end_offset, Map, not_found) of
+	Map3 =
+		case maps:get(absolute_end_offset, Map, not_found) of
+			not_found ->
+				Map2;
+			EndOffset ->
+				Map2#{ absolute_end_offset => integer_to_binary(EndOffset) }
+		end,
+	case maps:get(chunk_size, Map, not_found) of
 		not_found ->
-			Map2;
-		EndOffset ->
-			Map2#{ end_offset => integer_to_binary(EndOffset) }
+			Map3;
+		ChunkSize ->
+			Map3#{ chunk_size => integer_to_binary(ChunkSize) }
 	end.
 
 poa_no_chunk_map_to_json_map(Map) ->
@@ -1861,11 +1920,11 @@ poa_no_chunk_map_to_json_map(Map) ->
 		tx_path => ar_util:encode(TXPath),
 		data_path => ar_util:encode(DataPath)
 	},
-	case maps:get(end_offset, Map, not_found) of
+	case maps:get(absolute_end_offset, Map, not_found) of
 		not_found ->
 			Map2;
 		EndOffset ->
-			Map2#{ end_offset => integer_to_binary(EndOffset) }
+			Map2#{ absolute_end_offset => integer_to_binary(EndOffset) }
 	end.
 
 json_map_to_poa_map(JSON) ->
@@ -2353,3 +2412,17 @@ json_map_to_pool_cm_jobs(Map) ->
 	H1ReadJobs = [json_map_to_candidate(Job)
 			|| Job <- maps:get(<<"h1_read_jobs">>, Map, [])],
 	#pool_cm_jobs{ h1_to_h2_jobs = H1ToH2Jobs, h1_read_jobs = H1ReadJobs }.
+
+footprint_to_json_map(Intervals) ->
+	Intervals2 = ar_intervals:to_list(Intervals),
+	Intervals3 = [[integer_to_binary(Start), integer_to_binary(End)]
+			|| {End, Start} <- Intervals2],
+	#{
+		intervals => Intervals3
+	}.
+
+json_map_to_footprint(Map) ->
+	Intervals = maps:get(<<"intervals">>, Map),
+	Intervals2 = [{binary_to_integer(End), binary_to_integer(Start)}
+			|| [Start, End] <- Intervals],
+	ar_intervals:from_list(Intervals2).

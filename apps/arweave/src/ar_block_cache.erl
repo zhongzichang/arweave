@@ -9,7 +9,8 @@
 		get_block_and_status/2, remove/2, get_checkpoint_block/1, prune/2,
 		get_by_solution_hash/5, is_known_solution_hash/2,
 		get_siblings/2, get_fork_blocks/2, update_timestamp/3,
-		get_blocks_by_miner/2]).
+		get_blocks_by_miner/2,
+		get_oldest_block_start/1]).
 
 -include_lib("arweave/include/ar.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -34,7 +35,7 @@
 %% {solution, SolutionHash} => set(BlockHash)
 %%   - all blocks with the same solution hash
 %% longest_chain => [{BlockHash, [TXIDs]}]
-%%  - the top ?STORE_BLOCKS_BEHIND_CURRENT blocks of the longest chain
+%%  - the top ar_block:get_consensus_window_size() blocks of the longest chain
 %% tip -> BlockHash
 %%   - curent block chain tip
 %% links -> gb_set({Height, BlockHash})
@@ -229,6 +230,19 @@ get_block_and_status(Tab, H) ->
 			{B, {Status, Timestamp}}
 	end.
 
+%% @doc Return the start offset of the oldest on-chain block still in the cache.
+get_oldest_block_start(Tab) ->
+	[{_, Set}] = ets:lookup(Tab, links),
+	{{_Height, H}, _Set2} = gb_sets:take_smallest(Set),
+	case ets:lookup(Tab, {block, H}) of
+		[] ->
+			%% The block cache should have been just updated - retry.
+			get_oldest_block_start(Tab);
+		%% The lowest block must be on-chain by construction.
+		[{_, {B, on_chain, _Timestamp, _Children}}] ->
+			B#block.weave_size - B#block.block_size
+	end.
+
 %% @doc Get a {block, previous blocks, status} tuple for the earliest block from
 %% the longest chain, which has not been validated yet. The previous blocks are
 %% sorted from newest to oldest. The last one is a block from the current fork.
@@ -252,7 +266,7 @@ get_earliest_not_validated_from_longest_chain(Tab) ->
 	end.
 
 %% @doc Return the list of {BH, TXIDs} pairs corresponding to the top up to the
-%% ?STORE_BLOCKS_BEHIND_CURRENT blocks of the longest chain and the number of blocks
+%% ar_block:get_consensus_window_size() blocks of the longest chain and the number of blocks
 %% in this list that are not on chain yet.
 %%
 %% The cache is updated via update_longest_chain_cache/1 which calls
@@ -268,7 +282,7 @@ get_longest_chain_block_txs_pairs(Tab, H, N, PrevStatus, PrevH, Pairs, NotOnChai
 		[{_, {B, {not_validated, awaiting_nonce_limiter_validation}, _Timestamp,
 				_Children}}] ->
 			get_longest_chain_block_txs_pairs(Tab, B#block.previous_block,
-					?STORE_BLOCKS_BEHIND_CURRENT, none, none, [], 0);
+					ar_block:get_consensus_window_size(), none, none, [], 0);
 		[{_, {B, Status, _Timestamp, _Children}}] ->
 			case PrevStatus == on_chain andalso Status /= on_chain of
 				true ->
@@ -728,7 +742,7 @@ prune2(Tab, Depth, TipHeight) ->
 
 update_longest_chain_cache(Tab) ->
 	[{_, {_CDiff, H}}] = ets:lookup(Tab, max_cdiff),
-	Result = get_longest_chain_block_txs_pairs(Tab, H, ?STORE_BLOCKS_BEHIND_CURRENT,
+	Result = get_longest_chain_block_txs_pairs(Tab, H, ar_block:get_consensus_window_size(),
 			none, none, [], 0),
 	case ets:update_element(Tab, longest_chain, {2, Result}) of
 		true -> ok;
@@ -1083,6 +1097,7 @@ block_cache_test() ->
 	assert_max_cdiff({0, block_id(B1)}),
 	assert_is_valid_fork(true, on_chain, B1),
 	?assertEqual([], get_siblings(bcache_test, B1)),
+	?assertEqual(0, get_oldest_block_start(bcache_test)),
 
 	%% Re-adding B1 shouldn't change anything - i.e. nothing should be updated because the
 	%% block is already on chain
@@ -1097,6 +1112,7 @@ block_cache_test() ->
 	assert_longest_chain([B1], 0),
 	assert_max_cdiff({0, block_id(B1)}),
 	assert_is_valid_fork(true, on_chain, B1),
+	?assertEqual(0, get_oldest_block_start(bcache_test)),
 
 	%% Same as above.
 	%%
@@ -1769,11 +1785,15 @@ assert_tip(ExpectedTip) ->
 
 random_block(CDiff) ->
 	#block{ indep_hash = crypto:strong_rand_bytes(48), height = 0, cumulative_diff = CDiff,
-			hash = crypto:strong_rand_bytes(32) }.
+			hash = crypto:strong_rand_bytes(32),
+			weave_size = 0,
+			block_size = 0 }.
 
 random_block_after_repacking(CDiff) ->
 	#block{ indep_hash = crypto:strong_rand_bytes(48), height = 0, cumulative_diff = CDiff,
-			hash = crypto:strong_rand_bytes(32) }.
+			hash = crypto:strong_rand_bytes(32),
+			weave_size = 0,
+			block_size = 0 }.
 
 block_id(#block{ indep_hash = H }) ->
 	H.
@@ -1789,9 +1809,9 @@ get_blocks_by_miner_test() ->
 	Tab = bcache_test,
 	?assertEqual([], get_blocks_by_miner(Tab, <<"miner1">>)),
 	% Create some test blocks
-	B1 = #block{ indep_hash = <<"hash1">>, reward_addr = <<"miner1">> },
-	B2 = #block{ indep_hash = <<"hash2">>, reward_addr = <<"miner2">> },
-	B3 = #block{ indep_hash = <<"hash3">>, reward_addr = <<"miner1">> },
+	B1 = #block{ indep_hash = <<"hash1">>, reward_addr = <<"miner1">>, block_size = 0, weave_size = 0 },
+	B2 = #block{ indep_hash = <<"hash2">>, reward_addr = <<"miner2">>, block_size = 0, weave_size = 0 },
+	B3 = #block{ indep_hash = <<"hash3">>, reward_addr = <<"miner1">>, block_size = 0, weave_size = 0 },
 	% Add blocks to cache
 	add(Tab, on_top(B1, B0)),
 	add(Tab, on_top(B2, B0)),

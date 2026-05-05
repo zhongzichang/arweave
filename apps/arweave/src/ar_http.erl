@@ -78,12 +78,14 @@ req(Args, ReestablishedConnection) ->
 	Response = case catch gen_server:call(?MODULE, {get_connection, Args}, 15000) of
 		{ok, PID} ->
 			case request(PID, Args) of
-				{error, Error} when Error == {shutdown, normal}; Error == noproc ->
-					case ReestablishedConnection of
-						true ->
+				{error, Error} ->
+					case {ReestablishedConnection, should_retry_closed_connection(Error)} of
+						{false, true} ->
+							req(Args, true);
+						{_, true} ->
 							{error, client_error};
-						false ->
-							req(Args, true)
+						{_, false} ->
+							{error, Error}
 					end;
 				Reply ->
 					Reply
@@ -457,6 +459,29 @@ upload_metric(#{method := post, path := Path, body := Body}) ->
 	);
 upload_metric(_) ->
 	ok.
+
+should_retry_closed_connection({shutdown, normal}) ->
+	true;
+should_retry_closed_connection(noproc) ->
+	true;
+should_retry_closed_connection({down, {shutdown, closed}}) ->
+	true;
+should_retry_closed_connection({down, {shutdown, {error, einval}}}) ->
+	true;
+should_retry_closed_connection({stream_error, closed}) ->
+	true;
+should_retry_closed_connection({stream_error, closing}) ->
+	true;
+should_retry_closed_connection({stream_error, {closed, normal}}) ->
+	true;
+should_retry_closed_connection({shutdown, closed}) ->
+	true;
+should_retry_closed_connection(closed) ->
+	true;
+should_retry_closed_connection(closing) ->
+	true;
+should_retry_closed_connection(_) ->
+	false.
 
 gen_code_rest(200) ->
 	{<<"200">>, <<"OK">>};

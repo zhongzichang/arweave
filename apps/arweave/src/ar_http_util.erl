@@ -3,7 +3,7 @@
 -export([get_tx_content_type/1, arweave_peer/1]).
 
 -include_lib("arweave/include/ar.hrl").
--include_lib("arweave_config/include/arweave_config.hrl").
+-include_lib("eunit/include/eunit.hrl").
 
 -define(PRINTABLE_ASCII_REGEX, "^[ -~]*$").
 
@@ -21,6 +21,16 @@ get_tx_content_type(#tx { tags = Tags }) ->
 		false ->
 			none
 	end.
+
+%%--------------------------------------------------------------------
+%% @doc Check and valid `x-p2p-port' header.
+%% @end
+%%--------------------------------------------------------------------
+-spec arweave_peer(Req) -> Return when
+	Req :: cowboy:req(),
+	Return :: {A, A, A, A, Port},
+	A :: pos_integer(),
+	Port :: pos_integer().
 
 arweave_peer(Req) ->
 	{ok, Config} = application:get_env(arweave, config),
@@ -41,7 +51,6 @@ arweave_peer(Req) ->
 	end,
 
 	{IpV4_1, IpV4_2, IpV4_3, IpV4_4, ArweavePeerPort}.
-
 
 %%%===================================================================
 %%% Private functions.
@@ -100,3 +109,62 @@ is_valid_content_type(ContentType) ->
 		match -> true;
 		nomatch -> false
 	end.
+
+arweave_peer_test() ->
+	[
+		% an undefined x-p2p-port header should return the
+		% default arweave port
+		?assertEqual(
+			{1,2,3,4, ?DEFAULT_HTTP_IFACE_PORT},
+			arweave_peer(#{
+				headers => #{},
+				peer => {{1,2,3,4}, 1234}
+			})
+		),
+
+		% 1/TCP port is valid
+		?assertEqual(
+			{1,2,3,4, 1},
+			arweave_peer(#{
+				headers => #{ <<"x-p2p-port">> => <<"1">> },
+				peer => {{1,2,3,4}, 1234}
+			})
+		),
+
+		% 65535/TCP port is valid
+		?assertEqual(
+			{1,2,3,4, 65535},
+			arweave_peer(#{
+				headers => #{ <<"x-p2p-port">> => <<"65535">> },
+				peer => {{1,2,3,4}, 1234}
+			})
+		),
+
+		% 0/TCP port is invalid
+		?assertEqual(
+			{1,2,3,4, ?DEFAULT_HTTP_IFACE_PORT},
+			arweave_peer(#{
+				headers => #{ <<"x-p2p-port">> => <<"0">> },
+				peer => {{1,2,3,4}, 1234}
+			})
+		),
+
+		% 65536/TCP port is invalid
+		?assertEqual(
+			{1,2,3,4, ?DEFAULT_HTTP_IFACE_PORT},
+			arweave_peer(#{
+				headers => #{ <<"x-p2p-port">> => <<"65536">> },
+				peer => {{1,2,3,4}, 1234}
+			})
+		),
+
+		% a TCP port must be an integer, if not, a default
+		% port is returned.
+		?assertEqual(
+			{1,2,3,4, ?DEFAULT_HTTP_IFACE_PORT},
+			arweave_peer(#{
+				headers => #{ <<"x-p2p-port">> => <<"test">> },
+				peer => {{1,2,3,4}, 1234}
+			})
+		)
+	].

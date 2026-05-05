@@ -1,26 +1,35 @@
 %%% @doc Tracks the availability and performance of the network peers.
 -module(ar_peers).
-
 -behaviour(gen_server).
-
 -include_lib("arweave/include/ar.hrl").
 -include_lib("arweave_config/include/arweave_config.hrl").
 -include_lib("arweave/include/ar_peers.hrl").
-
 -include_lib("eunit/include/eunit.hrl").
-
--export([start_link/0, get_peers/1, get_peer_performances/1, get_trusted_peers/0,
+-export([
+	add_peer/2,
+	connected_peer/1,
+	disconnected_peer/1,
+	discover_peers/0,
+	filter_peers/2,
+	get_connection_timestamp_peer/1,
+	get_peer_performances/1,
+	get_peer_release/1,
+	get_peers/1,
+	get_tag/2,
+	get_trusted_peers/0,
+	is_connected_peer/1,
 	is_public_peer/1,
-	get_peer_release/1, stats/1, discover_peers/0, add_peer/2,
-	resolve_and_cache_peer/2, rate_fetched_data/4, rate_fetched_data/6,
-	rate_gossiped_data/4, issue_warning/3
+	issue_warning/3,
+	rate_fetched_data/4,
+	rate_fetched_data/6,
+	rate_gossiped_data/4,
+	resolve_and_cache_peer/2,
+	resolve_and_cache_peer/3,
+	set_tag/3,
+	start_link/0,
+	stats/1
 ]).
-
--export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
--export([set_tag/3, get_tag/2]).
--export([connected_peer/1, disconnected_peer/1, is_connected_peer/1]).
--export([get_connection_timestamp_peer/1]).
--export([filter_peers/2]).
+-export([init/1, handle_continue/2, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 %% The frequency in seconds of re-resolving DNS of peers configured by domain names.
 -define(STORE_RESOLVED_DOMAIN_S, 60).
@@ -115,6 +124,8 @@
 	invalid_partition_number,
 	invalid_nonce,
 	invalid_pow,
+	invalid_recall_byte,
+	invalid_recall_byte2,
 	invalid_poa,
 	invalid_poa2,
 	invalid_nonce_limiter,
@@ -129,6 +140,7 @@
 	invalid_second_chunk,
 	invalid_poa2_recall_byte2_undefined,
 	invalid_hash,
+	invalid_payload,
 	invalid_timestamp,
 	invalid_resigned_solution_hash,
 	invalid_nonce_limiter_global_step_number,
@@ -287,10 +299,18 @@ get_peer_release(Peer) ->
 rate_fetched_data(Peer, DataType, LatencyMicroseconds, DataSize) ->
 	rate_fetched_data(Peer, DataType, ok, LatencyMicroseconds, DataSize, 1).
 rate_fetched_data(Peer, DataType, ok, LatencyMicroseconds, DataSize, Concurrency) ->
-	gen_server:cast(?MODULE,
-		{valid_data, Peer, DataType, LatencyMicroseconds / 1000, DataSize, Concurrency});
+	try
+		gen_server:cast(?MODULE,
+			{valid_data, Peer, DataType, LatencyMicroseconds / 1000, DataSize, Concurrency})
+	catch
+		_:_ -> ok
+	end;
 rate_fetched_data(Peer, DataType, _, _LatencyMicroseconds, _DataSize, _Concurrency) ->
-	gen_server:cast(?MODULE, {invalid_data, Peer, DataType}).
+	try
+		gen_server:cast(?MODULE, {invalid_data, Peer, DataType})
+	catch
+		_:_ -> ok
+	end.
 
 rate_gossiped_data(Peer, DataType, LatencyMicroseconds, DataSize) ->
 	case check_peer(Peer) of
@@ -337,39 +357,160 @@ discover_peers() ->
 			discover_peers(get_peer_peers(Peer))
 	end.
 
-%% @doc Resolve the domain name of the given peer (if the given peer is an IP address)
-%% and cache it. Invalidate the cache after ?STORE_RESOLVED_DOMAIN_S seconds.
-%%
-%% Return {ok, Peer} | {error, Reason}.
+%%--------------------------------------------------------------------
+%% @doc
+%% @see resolve_and_cache_peer/3
+%% @end
+%%--------------------------------------------------------------------
+-spec resolve_and_cache_peer(RawPeer, Type) -> Return when
+	RawPeer :: string(),
+	Type :: term(),
+	Return :: {ok, {A,A,A,A,Port}} | {error, term()},
+	A :: pos_integer(),
+	Port :: pos_integer().
+
 resolve_and_cache_peer(RawPeer, Type) ->
-	Now = os:system_time(second),
+	resolve_and_cache_peer(RawPeer, Type, #{}).
+
+%%--------------------------------------------------------------------
+%% @doc Resolve the  domain name of the given peer  (if the given peer
+%% is  an  IP  address)  and  cache it.  Invalidate  the  cache  after
+%% `?STORE_RESOLVED_DOMAIN_S seconds.'  Return {ok, Peer} | {error,
+%% Reason}.
+%% @end
+%%--------------------------------------------------------------------
+-spec resolve_and_cache_peer(RawPeer, Type, Opts) -> Return when
+	RawPeer :: string(),
+	Type :: term(),
+	Opts :: map(),
+	Return :: {ok, {A,A,A,A,Port}} | {error, term()},
+	A :: pos_integer(),
+	Port :: pos_integer().
+
+resolve_and_cache_peer(RawPeer, Type, Opts) ->
+	Now = maps:get(now, Opts, erlang:system_time(second)),
+	CacheTTL = maps:get(cache_ttl, Opts,
+			    ?STORE_RESOLVED_DOMAIN_S),
+	State = #{
+		raw_peer => RawPeer,
+		type => Type,
+		now => Now,
+		opts => Opts,
+		cache_ttl => CacheTTL
+	},
+
+	% first check if the peer as string (so using a name
+	% record) is present in ets table. If the peer is not present
+	% in cache, then it will be updated. Else, the timestamp needs
+	% to be checked.
 	case ets:lookup(?MODULE, {raw_peer, RawPeer}) of
 		[] ->
-			case ar_util:safe_parse_peer(RawPeer) of
-				{ok, [Peer]} ->
-					ets:insert(?MODULE, {{raw_peer, RawPeer}, {Peer, Now}}),
-					ets:insert(?MODULE, {{Type, Peer}, RawPeer}),
-					{ok, Peer};
-				Error ->
-					Error
-			end;
-		[{_, {Peer, Timestamp}}] ->
-			case Timestamp + ?STORE_RESOLVED_DOMAIN_S < Now of
-				true ->
-					case ar_util:safe_parse_peer(RawPeer) of
-						{ok, [Peer2]} ->
-							%% The cache entry has expired.
-							ets:delete(?MODULE, {Type, {Peer, Timestamp}}),
-							ets:insert(?MODULE, {{raw_peer, RawPeer}, {Peer2, Now}}),
-							ets:insert(?MODULE, {{Type, Peer2}, RawPeer}),
-							{ok, Peer2};
-						Error ->
-							Error
-					end;
-				false ->
-					{ok, Peer}
-			end
+			resolve_and_cache_peer_empty(State);
+		[{_, {CachedPeer, CachedTimestamp}}] ->
+			NewState = State#{
+				cache_timestamp => CachedTimestamp,
+				cache_peer => CachedPeer
+			},
+			resolve_and_cache_peer2(CachedPeer, NewState)
 	end.
+
+%%--------------------------------------------------------------------
+%% @hidden
+%% @private
+%% @doc check if peer cache did not expired.
+%% @end
+%%--------------------------------------------------------------------
+resolve_and_cache_peer2(CachedPeer, State) ->
+	Now = maps:get(now, State),
+	CachedTimestamp = maps:get(cache_timestamp, State),
+	CacheTTL = maps:get(cache_ttl, State),
+
+	% if the peer present in cache expired, it needs to be
+	% refreshed, else it can be returned.
+	case CachedTimestamp + CacheTTL < Now of
+		true ->
+			resolve_and_cache_peer_refresh(CachedPeer, State);
+		false ->
+			{ok, CachedPeer}
+	end.
+
+%%--------------------------------------------------------------------
+%% @hidden
+%% @private
+%% @doc the cache expired.
+%% @end
+%%--------------------------------------------------------------------
+resolve_and_cache_peer_refresh(_CachedPeer, State) ->
+	RawPeer = maps:get(raw_peer, State),
+	Opts = maps:get(opts, State, #{}),
+
+	% the cache entry expired, in this case, raw peer needs to be
+	% reparsed and checked. It will return a list of peers.
+	case ar_util:safe_parse_peer(RawPeer, Opts) of
+		{ok, NewPeers} when is_list(NewPeers) ->
+			%% The cache entry has expired.
+			cache_update_peers(NewPeers, State);
+		{error, Error} ->
+			{error, Error}
+	end.
+
+%%--------------------------------------------------------------------
+%% @hidden
+%% @private
+%% @doc No peer cached available, we need to update it.
+%% @end
+%%--------------------------------------------------------------------
+resolve_and_cache_peer_empty(State) ->
+	RawPeer = maps:get(raw_peer, State),
+	case ar_util:safe_parse_peer(RawPeer) of
+		{ok, Peers} when is_list(Peers) ->
+			cache_insert_peers(Peers, State);
+		{error, Error} ->
+			{error, Error}
+	end.
+
+%%--------------------------------------------------------------------
+%% @hidden
+%% @private
+%% @doc insert peers in the cache, when the peer is a DNS containing
+%% more than one entry.
+%% @end
+%%--------------------------------------------------------------------
+cache_insert_peers(Peers, State) ->
+	cache_insert_peers(Peers, [], State).
+
+cache_insert_peers([], Buffer, _State) ->
+	[Peer] = ar_util:pick_random(Buffer, 1),
+	{ok, Peer};
+cache_insert_peers([Peer|Rest], Buffer, State) ->
+	RawPeer = maps:get(raw_peer, State),
+	Type = maps:get(type, State),
+	Now = maps:get(now, State),
+	_ = ets:insert(?MODULE, {{raw_peer, RawPeer}, {Peer, Now}}),
+	_ = ets:insert(?MODULE, {{Type, Peer}, RawPeer}),
+	cache_insert_peers(Rest, [Peer|Buffer], State).
+
+%%--------------------------------------------------------------------
+%% @hidden
+%% @private
+%% @doc Update a list of peers.
+%% @end
+%%--------------------------------------------------------------------
+cache_update_peers(Peers, State) ->
+	cache_update_peers(Peers, [], State).
+
+cache_update_peers([], Buffer, _State) ->
+	[Peer] = ar_util:pick_random(Buffer, 1),
+	{ok, Peer};
+cache_update_peers([Peer|Rest], Buffer, State) ->
+	RawPeer = maps:get(raw_peer, State),
+	CacheTimestamp = maps:get(cache_timestamp, State),
+	Type = maps:get(type, State),
+	Now = maps:get(now, State),
+	ets:delete(?MODULE, {Type, {Peer, CacheTimestamp}}),
+	ets:insert(?MODULE, {{raw_peer, RawPeer}, {Peer, Now}}),
+	ets:insert(?MODULE, {{Type, Peer}, RawPeer}),
+	cache_update_peers(Rest, [Peer|Buffer], State).
 
 %%%===================================================================
 %%% Generic server callbacks.
@@ -379,24 +520,26 @@ init([]) ->
 	{ok, Config} = arweave_config:get_env(),
 	case Config#config.verify of
 		false ->
-			%% Trap exit to avoid corrupting any open files on quit.
 			process_flag(trap_exit, true),
 			ok = ar_events:subscribe(block),
-			load_peers(),
-			gen_server:cast(?MODULE, rank_peers),
-			gen_server:cast(?MODULE, ping_peers),
-			_ = ar_timer:apply_interval(
-				?GET_MORE_PEERS_FREQUENCY_MS,
-				?MODULE,
-				discover_peers,
-				[],
-				#{ skip_on_shutdown => true }
-			);
+			{ok, #state{}, {continue, init}};
 		_ ->
-			ok
-	end,
+			{ok, #state{}}
+	end.
 
-	{ok, #state{}}.
+handle_continue(init, State) ->
+	load_peers(),
+	gen_server:cast(?MODULE, rank_peers),
+	gen_server:cast(?MODULE, ping_peers),
+	_ = ar_timer:apply_interval(
+		?GET_MORE_PEERS_FREQUENCY_MS,
+		?MODULE,
+		discover_peers,
+		[],
+		#{ skip_on_shutdown => true }
+	),
+	?LOG_INFO([{event, ar_peers_initialized}]),
+	{noreply, State}.
 
 handle_call(Request, _From, State) ->
 	?LOG_WARNING([{event, unhandled_call}, {module, ?MODULE}, {request, Request}]),
@@ -488,23 +631,13 @@ get_peer_peers(Peer) ->
 	end.
 
 get_or_init_performance(Peer) ->
-	case ets:lookup(?MODULE, {peer, Peer}) of
-		[] ->
-			#performance{};
-		[{_, Performance}] ->
-			Performance
-	end.
+	ets:lookup_element(?MODULE, {peer, Peer}, 2, #performance{}).
 
 set_performance(Peer, Performance) ->
 	ets:insert(?MODULE, [{{peer, Peer}, Performance}]).
 
 get_total_rating(Rating) ->
-	case ets:lookup(?MODULE, {rating_total, Rating}) of
-		[] ->
-			0;
-		[{_, Total}] ->
-			Total
-	end.
+	ets:lookup_element(?MODULE, {rating_total, Rating}, 2, 0).
 
 set_total_rating(Rating, Total) ->
 	ets:insert(?MODULE, {{rating_total, Rating}, Total}).
@@ -825,14 +958,14 @@ update_rating(Peer, LatencyMilliseconds, DataSize, Concurrency, IsSuccess) ->
 	end,
 	AverageLatency2 = case LatencyMilliseconds of
 		undefined -> AverageLatency;
-		_ -> calculate_ema(AverageLatency, LatencyMilliseconds, ?THROUGHPUT_ALPHA)
+		_ -> ar_util:ema(AverageLatency, LatencyMilliseconds, ?THROUGHPUT_ALPHA)
 	end,
 	%% In order to approximate the impact of multiple concurrent requests we multiply
 	%% DataSize by the Concurrency value. We do this *only* when updating the AverageThroughput
 	%% value so that it doesn't distort the TotalThroughput.
 	AverageThroughput2 = case LatencyMilliseconds of
 		undefined -> AverageThroughput;
-		_ -> calculate_ema(
+		_ -> ar_util:ema(
 			AverageThroughput, (DataSize * Concurrency) / LatencyMilliseconds, ?THROUGHPUT_ALPHA)
 	end,
 	TotalThroughput2 = case LatencyMilliseconds of
@@ -843,7 +976,7 @@ update_rating(Peer, LatencyMilliseconds, DataSize, Concurrency, IsSuccess) ->
 		undefined -> TotalTransfers;
 		_ -> TotalTransfers + 1
 	end,
-	AverageSuccess2 = calculate_ema(AverageSuccess, ar_util:bool_to_int(IsSuccess), ?SUCCESS_ALPHA),
+	AverageSuccess2 = ar_util:ema(AverageSuccess, ar_util:bool_to_int(IsSuccess), ?SUCCESS_ALPHA),
 	%% Rating is an estimate of the peer's effective throughput in bytes per millisecond.
 	%% 'lifetime' considers all data ever received from this peer
 	%% 'current' considers recently received data
@@ -875,9 +1008,6 @@ update_rating(Peer, LatencyMilliseconds, DataSize, Concurrency, IsSuccess) ->
 	set_total_rating(lifetime, TotalLifetimeRating2),
 	set_total_rating(current, TotalCurrentRating2),
 	Performance2.
-
-calculate_ema(OldEMA, Value, Alpha) ->
-	Alpha * Value + (1 - Alpha) * OldEMA.
 
 maybe_add_peer(Peer, Release) ->
 	maybe_rotate_peer_ports(Peer),
@@ -914,8 +1044,12 @@ remove_peer(Reason, RemovedPeer) ->
 	set_total_rating(lifetime, TotalLifetimeRating - get_peer_rating(lifetime, Performance)),
 	set_total_rating(current, TotalCurrentRating - get_peer_rating(current, Performance)),
 	ets:delete(?MODULE, {peer, RemovedPeer}),
+	remove_peer_tags(RemovedPeer),
 	remove_peer_port(RemovedPeer),
 	ar_events:send(peer, {removed, RemovedPeer}).
+
+remove_peer_tags(Peer) ->
+	ets:match_delete(?MODULE, {{ar_tags, ?MODULE, Peer, '_'}, '_'}).
 
 remove_peer_port(Peer) ->
 	{IP, Port} = get_ip_port(Peer),

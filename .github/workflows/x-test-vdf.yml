@@ -47,7 +47,6 @@ jobs:
             ar_chain_stats,
             ar_chunk_copy,
             ar_chunk_storage,
-            ar_data_sync_worker_master,
             ar_deep_hash,
             ar_device_lock,
             ar_diff_dag,
@@ -55,16 +54,20 @@ jobs:
             ar_entropy_storage,
             ar_ets_intervals,
             ar_events,
+            ar_footprint_record,
             ar_inflation,
             ar_intervals,
             ar_join,
             ar_kv,
+            arweave_limiter_group,
+            arweave_limiter_metrics_collector,
             ar_merkle,
             ar_node,
             ar_node_utils,
             ar_nonce_limiter,
             ar_patricia_tree,
             ar_peers,
+            ar_peer_intervals,
             ar_pricing,
             ar_retarget,
             ar_serialize,
@@ -78,6 +81,7 @@ jobs:
             ar_base64_compatibility_tests,
             ar_config_tests,
             ar_difficulty_tests,
+            ar_forced_validation_tests,
             ar_header_sync_tests,
             ar_http_iface_tests,
             ar_http_util_tests,
@@ -92,6 +96,7 @@ jobs:
             ar_vdf_block_validation_tests,
             ar_vdf_server_tests,
             ar_vdf_external_update_tests,
+            ar_cli_parser
           ]
     steps:
       - name: cleanup
@@ -102,6 +107,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: "recursive"
+          lfs: false
 
       - name: Download artifact
         uses: actions/download-artifact@v4

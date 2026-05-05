@@ -13,6 +13,7 @@
 %%% @end
 %%%===================================================================
 -module(arweave_config_spec_default).
+-compile(warnings_as_errors).
 -export([init/2]).
 -include("arweave_config_spec.hrl").
 -include_lib("kernel/include/logger.hrl").
@@ -35,9 +36,7 @@ fetch(Module, State) ->
 	try Module:default() of
 		Default ->
 			NewState = State#{ default => Default },
-			{ok, NewState};
-		Elsewise ->
-			{ok, State}
+			{ok, NewState}
 	catch
 		E:R:S ->
 			?LOG_ERROR([

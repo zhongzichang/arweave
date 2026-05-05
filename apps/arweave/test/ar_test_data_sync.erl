@@ -6,8 +6,9 @@
 -include_lib("arweave_config/include/arweave_config.hrl").
 
 -export([setup_nodes/0, setup_nodes/1,
-		imperfect_split/1, build_proofs/3, build_proofs/5,
-        tx/2, tx/3, tx/4, wait_until_syncs_chunk/2,
+		imperfect_split/1, build_proofs/3, build_proofs/4, build_proofs/5,
+        tx/1, tx/2, tx/3, tx/4, make_fixed_data_tx/2, make_fixed_data_tx/3,
+        wait_until_syncs_chunk/2,
         wait_until_syncs_chunks/1, wait_until_syncs_chunks/2, wait_until_syncs_chunks/3,
         get_tx_offset/2, get_tx_data/1,
         post_random_blocks/1, get_records_with_proofs/3, post_proofs/4, post_proofs/5,
@@ -15,7 +16,8 @@
         generate_random_standard_split/0, generate_random_original_v1_split/0]).
 
 -define(SYNC_CHUNKS_CHECK, 1000).
--define(SYNC_CHUNKS_TIMEOUT, 300*1000).
+%% Chunk sync can exceed 60s on slow CI (fork recovery, composite packing, many peers).
+-define(SYNC_CHUNKS_TIMEOUT, 120_000).
 
 get_records_with_proofs(B, TX, Chunks) ->
 	[{B, TX, Chunks, Proof} || Proof <- build_proofs(B, TX, Chunks)].
@@ -49,6 +51,30 @@ setup_nodes2(#{ peer_addr := PeerAddr } = Options) ->
 	ar_test_node:connect_to_peer(peer1),
 	Wallet.
 
+make_fixed_data_tx(Wallet, Chunks) ->
+	make_fixed_data_tx(Wallet, Chunks, #{}).
+
+make_fixed_data_tx(Wallet, Chunks, Options) when is_map(Options) ->
+	SizedChunkIDs = ar_tx:sized_chunks_to_sized_chunk_ids(
+			ar_tx:chunks_to_size_tagged_chunks(Chunks)),
+	{DataRoot, DataTree} = ar_merkle:generate_tree(SizedChunkIDs),
+	Format = maps:get(format, Options, v2),
+	Reward = maps:get(reward, Options, fetch),
+	BaseTXParams = maps:with([tx_anchor_peer, get_fee_peer], Options),
+	TXParams = BaseTXParams#{
+		wallet => Wallet,
+		split_type => {fixed_data, DataRoot, Chunks},
+		format => Format,
+		reward => Reward
+	},
+	{TX, Chunks2} = tx(TXParams),
+	#{
+		tx => TX,
+		data_root => DataRoot,
+		data_tree => DataTree,
+		chunks => Chunks2
+	}.
+
 tx(Wallet, SplitType) ->
 	tx(Wallet, SplitType, v2, fetch).
 
@@ -59,54 +85,63 @@ tx(Wallet, SplitType, Format) ->
 	tx(Wallet, SplitType, Format, fetch).
 
 tx(Wallet, SplitType, Format, Reward) ->
+	tx(#{ wallet => Wallet, split_type => SplitType,
+			format => Format, reward => Reward }).
+
+tx(Params) when is_map(Params) ->
+	#{ wallet := Wallet, split_type := SplitType,
+		format := Format, reward := Reward } = Params,
+	TXAnchorPeer = maps:get(tx_anchor_peer, Params, main),
+	TXAnchor = ar_test_node:get_tx_anchor(TXAnchorPeer),
+	GetFeePeer = maps:get(get_fee_peer, Params, peer1),
 	case {SplitType, Format} of
 		{{fixed_data, DataRoot, Chunks}, v2} ->
 			Data = binary:list_to_bin(Chunks),
 			Args = #{ data_size => byte_size(Data), data_root => DataRoot,
-					last_tx => ar_test_node:get_tx_anchor(main) },
+					last_tx => TXAnchor },
 			Args2 = case Reward of fetch -> Args; _ -> Args#{ reward => Reward } end,
-			{ar_test_node:sign_tx(Wallet, Args2), Chunks};
+			{ar_test_node:sign_tx(GetFeePeer, Wallet, Args2), Chunks};
 		{{fixed_data, DataRoot, Chunks}, v1} ->
 			Data = binary:list_to_bin(Chunks),
 			Args = #{ data_size => byte_size(Data), data_root => DataRoot,
-					last_tx => ar_test_node:get_tx_anchor(main), data => Data },
+					last_tx => TXAnchor, data => Data },
 			Args2 = case Reward of fetch -> Args; _ -> Args#{ reward => Reward } end,
-			{ar_test_node:sign_v1_tx(Wallet, Args2), Chunks};
+			{ar_test_node:sign_v1_tx(GetFeePeer, Wallet, Args2), Chunks};
 		{original_split, v1} ->
 			{_, Chunks} = generate_random_original_v1_split(),
 			Data = binary:list_to_bin(Chunks),
-			Args = #{ data => Data, last_tx => ar_test_node:get_tx_anchor(main) },
+			Args = #{ data => Data, last_tx => TXAnchor },
 			Args2 = case Reward of fetch -> Args; _ -> Args#{ reward => Reward } end,
-			{ar_test_node:sign_v1_tx(Wallet, Args2), Chunks};
+			{ar_test_node:sign_v1_tx(GetFeePeer, Wallet, Args2), Chunks};
 		{original_split, v2} ->
 			{DataRoot, Chunks} = generate_random_original_split(),
 			Data = binary:list_to_bin(Chunks),
 			Args = #{ data_size => byte_size(Data), data_root => DataRoot,
-					last_tx => ar_test_node:get_tx_anchor(main) },
+					last_tx => TXAnchor },
 			Args2 = case Reward of fetch -> Args; _ -> Args#{ reward => Reward } end,
-			{ar_test_node:sign_tx(Wallet, Args2), Chunks};
+			{ar_test_node:sign_tx(GetFeePeer, Wallet, Args2), Chunks};
 		{{custom_split, ChunkNumber}, v2} ->
 			{DataRoot, Chunks} = generate_random_split(ChunkNumber),
 			Args = #{ data_size => byte_size(binary:list_to_bin(Chunks)),
-					last_tx => ar_test_node:get_tx_anchor(main), data_root => DataRoot },
+					last_tx => TXAnchor, data_root => DataRoot },
 			Args2 = case Reward of fetch -> Args; _ -> Args#{ reward => Reward } end,
-			TX = ar_test_node:sign_tx(Wallet, Args2),
+			TX = ar_test_node:sign_tx(GetFeePeer, Wallet, Args2),
 			{TX, Chunks};
 		{standard_split, v2} ->
 			{DataRoot, Chunks} = generate_random_standard_split(),
 			Data = binary:list_to_bin(Chunks),
 			Args = #{ data_size => byte_size(Data), data_root => DataRoot,
-					last_tx => ar_test_node:get_tx_anchor(main) },
+					last_tx => TXAnchor },
 			Args2 = case Reward of fetch -> Args; _ -> Args#{ reward => Reward } end,
-			TX = ar_test_node:sign_tx(Wallet, Args2),
+			TX = ar_test_node:sign_tx(GetFeePeer, Wallet, Args2),
 			{TX, Chunks};
 		{{original_split, ChunkNumber}, v2} ->
 			{DataRoot, Chunks} = generate_random_original_split(ChunkNumber),
 			Data = binary:list_to_bin(Chunks),
 			Args = #{ data_size => byte_size(Data), data_root => DataRoot,
-					last_tx => ar_test_node:get_tx_anchor(main) },
+					last_tx => TXAnchor },
 			Args2 = case Reward of fetch -> Args; _ -> Args#{ reward => Reward } end,
-			TX = ar_test_node:sign_tx(Wallet, Args2),
+			TX = ar_test_node:sign_tx(GetFeePeer, Wallet, Args2),
 			{TX, Chunks}
 	end.
 
@@ -133,11 +168,11 @@ generate_random_split(ChunkCount) ->
 
 generate_random_original_v1_split() ->
 	%% Make sure v1 data does not end with a digit, otherwise it's malleable.
-	Data = << (crypto:strong_rand_bytes(rand:uniform(1024 * 1024)))/binary, <<"a">>/binary >>,
+	Data = << (crypto:strong_rand_bytes(rand:uniform(?MiB)))/binary, <<"a">>/binary >>,
 	original_split(Data).
 
 generate_random_original_split() ->
-	Data = << (crypto:strong_rand_bytes(rand:uniform(1024 * 1024)))/binary >>,
+	Data = << (crypto:strong_rand_bytes(rand:uniform(?MiB)))/binary >>,
 	original_split(Data).
 
 generate_random_standard_split() ->
@@ -205,6 +240,11 @@ build_proofs(B, TX, Chunks) ->
 	build_proofs(TX, Chunks, B#block.txs, B#block.weave_size - B#block.block_size,
 			B#block.height).
 
+build_proofs(DataRoot, DataTree, Chunks, Options) when is_map(Options) ->
+	SizeTaggedChunks = ar_tx:chunks_to_size_tagged_chunks(Chunks),
+	DataSize = maps:get(data_size, Options, byte_size(binary:list_to_bin(Chunks))),
+	build_chunk_proofs(SizeTaggedChunks, DataRoot, DataTree, DataSize, Options).
+
 build_proofs(TX, Chunks, TXs, BlockStartOffset, Height) ->
 	SizeTaggedTXs = ar_block:generate_size_tagged_list_from_txs(TXs, Height),
 	SizeTaggedDataRoots = [{Root, Offset} || {{_, Root}, Offset} <- SizeTaggedTXs],
@@ -217,29 +257,49 @@ build_proofs(TX, Chunks, TXs, BlockStartOffset, Height) ->
 		ar_tx:sized_chunks_to_sized_chunk_ids(SizeTaggedChunks)
 	),
 	DataSize = byte_size(binary:list_to_bin(Chunks)),
-	lists:foldl(
-		fun
-			({<<>>, _}, Proofs) ->
-				Proofs;
-			({Chunk, ChunkOffset}, Proofs) ->
-				TXStartOffset = TXOffset - DataSize,
-				AbsoluteChunkEndOffset = BlockStartOffset + TXStartOffset + ChunkOffset,
-				Proof = #{
-					tx_path => ar_util:encode(TXPath),
-					data_root => ar_util:encode(DataRoot),
-					data_path =>
-						ar_util:encode(
-							ar_merkle:generate_path(DataRoot, ChunkOffset - 1, DataTree)
-						),
-					chunk => ar_util:encode(Chunk),
-					offset => integer_to_binary(ChunkOffset - 1),
-					data_size => integer_to_binary(DataSize)
-				},
-				Proofs ++ [{AbsoluteChunkEndOffset, Proof}]
-		end,
-		[],
-		SizeTaggedChunks
+	TXStartOffset = TXOffset - DataSize,
+	build_chunk_proofs(SizeTaggedChunks, DataRoot, DataTree, DataSize, #{
+		tx_path => TXPath,
+		result_offset_base => BlockStartOffset + TXStartOffset,
+		proof_offset => inclusive_end
+	}).
+
+build_chunk_proofs(SizeTaggedChunks, DataRoot, DataTree, DataSize, Options) ->
+	ResultOffsetBase = maps:get(result_offset_base, Options, 0),
+	ProofOffsetType = maps:get(proof_offset, Options, inclusive_end),
+	lists:reverse(
+		lists:foldl(
+			fun
+				({<<>>, _}, Proofs) ->
+					Proofs;
+				({Chunk, ChunkEndOffset}, Proofs) ->
+					ProofOffset = proof_offset(ChunkEndOffset, ProofOffsetType),
+					Proof = maybe_add_tx_path(#{
+						data_root => ar_util:encode(DataRoot),
+						data_path =>
+							ar_util:encode(
+								ar_merkle:generate_path(DataRoot, ProofOffset, DataTree)
+							),
+						chunk => ar_util:encode(Chunk),
+						offset => integer_to_binary(ProofOffset),
+						data_size => integer_to_binary(DataSize)
+					}, Options),
+					[{ResultOffsetBase + ChunkEndOffset, Proof} | Proofs]
+			end,
+			[],
+			SizeTaggedChunks
+		)
 	).
+
+proof_offset(ChunkEndOffset, end_offset) ->
+	ChunkEndOffset;
+proof_offset(ChunkEndOffset, inclusive_end) ->
+	ChunkEndOffset - 1.
+
+maybe_add_tx_path(Proof, #{ tx_path := TXPath }) ->
+	Proof#{ tx_path => ar_util:encode(TXPath) };
+maybe_add_tx_path(Proof, _Options) ->
+	Proof.
 
 get_tx_offset(Node, TXID) ->
 	Peer = ar_test_node:peer_ip(Node),
@@ -288,47 +348,48 @@ post_blocks(Wallet, BlockMap) ->
 				ar_test_node:mine(),
 				ar_test_node:assert_wait_until_height(peer1, Height),
 				Acc;
-			({TXMap, _Height}, Acc) ->
-				TXsWithChunks = lists:map(
-					fun
-						(v1) ->
-							{v1_tx(Wallet), v1};
-						(v2) ->
-							{tx(Wallet, original_split), v2};
-						(v2_no_data) -> % same as v2 but its data won't be submitted
-							{tx(Wallet, {custom_split, random}), v2_no_data};
-						(v2_standard_split) ->
-							{tx(Wallet, standard_split), v2_standard_split};
-						(empty_tx) ->
-							{tx(Wallet, {custom_split, 0}), empty_tx};
-						(fixed_data) ->
-							{tx(Wallet, {fixed_data, DataRoot, FixedChunks}), fixed_data}
-					end,
-					TXMap
-				),
-				B = ar_test_node:post_and_mine(
-					#{ miner => main, await_on => main },
-					[TX || {{TX, _}, _} <- TXsWithChunks]
-				),
-				Acc ++ [{B, TX, C} || {{TX, C}, Type} <- lists:sort(TXsWithChunks),
-						Type /= v2_no_data, Type /= empty_tx]
+		({TXMap, Height}, Acc) ->
+			TXsWithChunks = lists:map(
+				fun
+					(v1) ->
+						{v1_tx(Wallet), v1};
+					(v2) ->
+						{tx(Wallet, original_split), v2};
+					(v2_no_data) -> % same as v2 but its data won't be submitted
+						{tx(Wallet, {custom_split, random}), v2_no_data};
+					(v2_standard_split) ->
+						{tx(Wallet, standard_split), v2_standard_split};
+					(empty_tx) ->
+						{tx(Wallet, {custom_split, 0}), empty_tx};
+					(fixed_data) ->
+						{tx(Wallet, {fixed_data, DataRoot, FixedChunks}), fixed_data}
+				end,
+				TXMap
+			),
+			B = ar_test_node:post_and_mine(
+				#{ miner => main, await_on => main },
+				[TX || {{TX, _}, _} <- TXsWithChunks]
+			),
+			ar_test_node:assert_wait_until_height(peer1, Height),
+			Acc ++ [{B, TX, C} || {{TX, C}, Type} <- lists:sort(TXsWithChunks),
+					Type /= v2_no_data, Type /= empty_tx]
 		end,
 		[],
 		lists:zip(BlockMap, lists:seq(1, length(BlockMap)))
 	).
 
 post_proofs(Peer, B, TX, Chunks) ->
-	post_proofs(Peer, B, TX, Chunks, false).
-post_proofs(Peer, B, TX, Chunks, IsTemporary) ->
+	post_proofs(Peer, B, TX, Chunks, infinity).
+post_proofs(Peer, B, TX, Chunks, DiskPoolThreshold) ->
 	Proofs = build_proofs(B, TX, Chunks),
-
-	HttpStatus = case IsTemporary of
-		true -> <<"303">>;
-		false -> <<"200">>
-	end,
 
 	lists:foreach(
 		fun({_, Proof}) ->
+			Offset = binary_to_integer(maps:get(offset, Proof)),
+			HttpStatus = case Offset > DiskPoolThreshold of
+				true -> <<"303">>;
+				false -> <<"200">>
+			end,
 			{ok, {{HttpStatus, _}, _, _, _, _}} =
 				ar_test_node:post_chunk(Peer, ar_serialize:jsonify(Proof))
 		end,
@@ -362,7 +423,7 @@ wait_until_syncs_chunk(Offset, ExpectedProof) ->
 					false
 			end
 		end,
-		100,
+		1000,
 		20_000
 	).
 

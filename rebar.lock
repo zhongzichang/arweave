@@ -6,6 +6,11 @@
   0},
  {<<"cowboy">>,{pkg,<<"cowboy">>,<<"2.12.0">>},0},
  {<<"cowlib">>,{pkg,<<"cowlib">>,<<"2.15.0">>},0},
+ {<<"eqwalizer_support">>,
+  {git_subdir,"https://github.com/whatsapp/eqwalizer.git",
+              {ref,"80d961978515425b7c897f32da31941cb180d2eb"},
+              "eqwalizer_support"},
+  0},
  {<<"gun">>,{pkg,<<"gun">>,<<"2.2.0">>},0},
  {<<"jiffy">>,
   {git,"https://github.com/ArweaveTeam/jiffy.git",
@@ -27,6 +32,14 @@
  {<<"rocksdb">>,
   {git,"https://github.com/ArweaveTeam/erlang-rocksdb.git",
        {ref,"0e0b2f051e8f5720ceaea19dc51a7561f2472279"}},
+  0},
+ {<<"tomerl">>,
+  {git,"https://github.com/ArweaveTeam/tomerl",
+       {ref,"be6d7ccf9fe357c5ec3b6411d2245a21b97e48d7"}},
+  0},
+ {<<"yamerl">>,
+  {git,"https://github.com/ArweaveTeam/yamerl",
+       {ref,"bdb3b032f972a397c527667254393cd3c8942df3"}},
   0}]}.
 [
 {pkg_hash,[

@@ -6,8 +6,7 @@
 
 -export([init/1]).
 
--include_lib("ar_sup.hrl").
--include_lib("arweave_config/include/arweave_config.hrl").
+-include_lib("arweave/include/ar_data_sync.hrl").
 
 %%%===================================================================
 %%% Public interface.
@@ -21,8 +20,23 @@ start_link() ->
 %% ===================================================================
 
 init([]) ->
+	%% ETS tables owned by this subtree. Created here (sup convention) so they
+	%% survive child restarts.
+	ets:new(?WORKER_LOAD_TABLE,
+		[named_table, public, set,
+			{read_concurrency, true}, {write_concurrency, true}]),
+	%% Peer worker supervisor must start before worker master
+	PeerWorkerSup = #{
+		id => ar_peer_worker_sup,
+		start => {ar_peer_worker_sup, start_link, []},
+		restart => permanent,
+		shutdown => infinity,
+		type => supervisor,
+		modules => [ar_peer_worker_sup]
+	},
 	Children = 
-		ar_data_sync_worker_master:register_workers() ++
+		[PeerWorkerSup] ++
+		ar_data_sync_coordinator:register_workers() ++
 		ar_chunk_copy:register_workers() ++
 		ar_data_sync:register_workers(),
 	{ok, {{one_for_one, 5, 10}, Children}}.

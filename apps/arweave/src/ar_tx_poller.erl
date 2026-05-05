@@ -13,8 +13,10 @@
 	terminate/2
 ]).
 
--include("../include/ar.hrl").
 -include_lib("arweave_config/include/arweave_config.hrl").
+
+-include("ar.hrl").
+
 -record(state, {
 	last_seen_tx_timestamp = 0,
 	pending_txids = [],
@@ -155,7 +157,7 @@ download_and_verify_tx(TXID, TXIDPeer) ->
 					log_invalid_tx(Code, TXID, TX, Peer, TXIDPeer);
 				{valid, TX2} ->
 					ar_peers:rate_fetched_data(Peer, tx, Time, Size),
-					ar_data_sync:add_data_root_to_disk_pool(TX2#tx.data_root,
+					ar_disk_pool:add_data_root(TX2#tx.data_root,
 							TX2#tx.data_size, TX#tx.id),
 					ar_events:send(tx, {new, TX2, {pulled, Peer}}),
 					TXID = TX2#tx.id,

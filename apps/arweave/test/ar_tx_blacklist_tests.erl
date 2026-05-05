@@ -4,8 +4,9 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
--include("../include/ar.hrl").
 -include_lib("arweave_config/include/arweave_config.hrl").
+
+-include("ar.hrl").
 
 -import(ar_test_node, [
 		sign_v1_tx/2, random_v1_data/1, 
@@ -52,7 +53,7 @@ test_uses_blacklists() ->
 	ok = file:write_file(WhitelistFile, <<>>),
 	RewardAddr = ar_wallet:to_address(ar_wallet:new_keyfile()),
 	{ok, Config} = arweave_config:get_env(),
-	StorageModule = {30 * 1024 * 1024, 0, {composite, RewardAddr, 1}},
+	StorageModule = {30 * ?MiB, 0, {composite, RewardAddr, 1}},
 	try
 		ar_test_node:start(#{ b0 => B0, addr => RewardAddr,
 				config => Config#config{
@@ -96,7 +97,7 @@ test_uses_blacklists() ->
 		assert_present_offsets(GoodOffsets),
 		assert_removed_offsets(BadOffsets),
 		StoreID = ar_storage_module:id(StorageModule),
-		Chunks = ar_chunk_storage:get_range(0, 30 * 1024 * 1024, StoreID),
+		Chunks = ar_chunk_storage:get_range(0, 30 * ?MiB, StoreID),
 		ChunkOffsets = [Offset || {Offset, _Chunk} <- Chunks],
 		?debugFmt("chunk offsets: ~p ~n good offsets: ~p ~n bad offsets: ~p~n",
 		[ChunkOffsets, GoodOffsets, BadOffsets]),

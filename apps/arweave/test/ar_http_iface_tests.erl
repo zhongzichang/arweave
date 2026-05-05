@@ -24,6 +24,7 @@ start_node() ->
 
 reset_node() ->
 	ar_blacklist_middleware:reset(),
+	arweave_limiter_sup:reset_all(),
 	ar_test_node:remote_call(peer1, ar_blacklist_middleware, reset, []),
 	ar_test_node:connect_to_peer(peer1).
 
@@ -86,6 +87,7 @@ batch_test_() ->
 				test_register(fun test_get_block_by_hash/1, GenesisData),
 				test_register(fun test_get_block_by_height/1, GenesisData),
 				test_register(fun test_get_non_existent_block/1, GenesisData),
+				test_register(fun test_price_endpoints/1, GenesisData),
 				%% ---------------------------------------------------------
 				%% The following tests are *not* read-only and may modify
 				%% state. They can *not* assume a fixed blockchain state.
@@ -121,6 +123,7 @@ get_time_test() ->
 	?assert(Now < Max).
 
 test_addresses_with_checksum({_, Wallet1, {_, Pub2}, _}) ->
+	LocalHeight = ar_node:get_height(),
 	RemoteHeight = height(peer1),
 	Address19 = crypto:strong_rand_bytes(19),
 	Address65 = crypto:strong_rand_bytes(65),
@@ -168,10 +171,12 @@ test_addresses_with_checksum({_, Wallet1, {_, Pub2}, _}) ->
 		end,
 		ValidPayloads
 	),
+	ar_test_node:assert_wait_until_receives_txs(main, [TX, TX2]),
 	ar_test_node:assert_wait_until_receives_txs(peer1, [TX, TX2]),
 	ar_test_node:mine(),
-	[{H, _, _} | _] = ar_test_node:wait_until_height(peer1, RemoteHeight + 1),
-	B = read_block_when_stored(H),
+	[{H, _, _} | _] = ar_test_node:wait_until_height(main, LocalHeight + 1),
+	ar_test_node:assert_wait_until_height(peer1, RemoteHeight + 1),
+	B = read_block_when_stored(H, true),
 	ChecksumAddr = << (ar_util:encode(Address32))/binary, <<":">>/binary,
 			(ar_util:encode(<< (erlang:crc32(Address32)):32 >>))/binary >>,
 	?assertEqual(2, length(B#block.txs)),
@@ -219,6 +224,63 @@ get_price(EncodedAddr) ->
 			headers => [{<<"x-p2p-port">>, integer_to_binary(Port)}]
 		}),
 	binary_to_integer(Reply).
+
+test_price_endpoints({_B0, _Wallet1, _Wallet2, {_, StaticPub}}) ->
+	Peer = ar_test_node:peer_ip(main),
+	Addr = binary_to_list(ar_util:encode(ar_wallet:to_address(StaticPub))),
+	ExpectedFee = ?AR(1),
+	ExpectedDenomination = 1,
+	assert_price_endpoint(Peer, "/price/100", [], binary,
+		ExpectedFee, ExpectedDenomination),
+	assert_price_endpoint(Peer, "/price/100/" ++ Addr, [], binary,
+		ExpectedFee, ExpectedDenomination),
+	assert_price_endpoint(Peer, "/price/100",
+		[{<<"accept">>, <<"application/json">>}], json,
+		ExpectedFee, ExpectedDenomination),
+	assert_price_endpoint(Peer, "/price/100/" ++ Addr,
+		[{<<"accept">>, <<"application/json">>}], json,
+		ExpectedFee, ExpectedDenomination),
+	assert_price_endpoint(Peer, "/price2/100", [], json,
+		ExpectedFee, ExpectedDenomination),
+	assert_price_endpoint(Peer, "/price2/100/" ++ Addr, [], json,
+		ExpectedFee, ExpectedDenomination),
+	assert_price_endpoint(Peer, "/optimistic_price/100", [], json,
+		ExpectedFee, ExpectedDenomination),
+	assert_price_endpoint(Peer, "/optimistic_price/100/" ++ Addr, [], json,
+		ExpectedFee, ExpectedDenomination).
+
+assert_price_endpoint(Peer, Path, Headers, binary, ExpectedFee, ExpectedDenomination) ->
+	{ok, {{<<"200">>, _}, ResponseHeaders, Body, _, _}} =
+		ar_http:req(#{
+			method => get,
+			peer => Peer,
+			path => Path,
+			headers => Headers
+		}),
+	?assertEqual(expected_denomination_header(ExpectedDenomination),
+		proplists:lookup_all(<<"arweave-denomination">>, ResponseHeaders)),
+	?assertEqual(ExpectedFee, binary_to_integer(Body)),
+	ok;
+assert_price_endpoint(Peer, Path, Headers, json, ExpectedFee, ExpectedDenomination) ->
+	{ok, {{<<"200">>, _}, ResponseHeaders, Body, _, _}} =
+		ar_http:req(#{
+			method => get,
+			peer => Peer,
+			path => Path,
+			headers => Headers
+		}),
+	?assertEqual(expected_denomination_header(ExpectedDenomination),
+		proplists:lookup_all(<<"arweave-denomination">>, ResponseHeaders)),
+	Json = jiffy:decode(Body, [return_maps]),
+	?assertEqual(expected_price_json(ExpectedFee, ExpectedDenomination), Json),
+	ok.
+
+expected_denomination_header(ExpectedDenomination) ->
+	[{<<"arweave-denomination">>, integer_to_binary(ExpectedDenomination)}].
+
+expected_price_json(ExpectedFee, ExpectedDenomination) ->
+	#{<<"fee">> => integer_to_binary(ExpectedFee),
+		<<"denomination">> => ExpectedDenomination}.
 
 get_tx(ID) ->
 	Peer = ar_test_node:peer_ip(main),
@@ -281,18 +343,22 @@ test_single_regossip(_) ->
 test_node_blacklisting_get_spammer() ->
 	{ok, Config} = arweave_config:get_env(),
 	{RequestFun, ErrorResponse} = get_fun_msg_pair(get_info),
+	LimitWithBursts = Config#config.'http_api.limiter.general.sliding_window_limit'
+		+ Config#config.'http_api.limiter.general.leaky_limit',
 	node_blacklisting_test_frame(
 		RequestFun,
 		ErrorResponse,
-		Config#config.requests_per_minute_limit div 2 + 1,
+		LimitWithBursts,
 		1
 	).
 
 test_node_blacklisting_post_spammer() ->
 	{ok, Config} = arweave_config:get_env(),
+	LimitWithBursts = Config#config.'http_api.limiter.general.sliding_window_limit'
+		+ Config#config.'http_api.limiter.general.leaky_limit',
 	{RequestFun, ErrorResponse} = get_fun_msg_pair(send_tx_binary),
 	NErrors = 11,
-	NRequests = Config#config.requests_per_minute_limit div 2 + NErrors,
+	NRequests = LimitWithBursts + NErrors,
 	node_blacklisting_test_frame(
 		RequestFun,
 		ErrorResponse,
@@ -333,6 +399,7 @@ send_tx_binary(Index, InvalidTX) ->
 -spec node_blacklisting_test_frame(fun(), any(), non_neg_integer(), non_neg_integer()) -> ok.
 node_blacklisting_test_frame(RequestFun, ErrorResponse, NRequests, ExpectedErrors) ->
 	ar_blacklist_middleware:reset(),
+	arweave_limiter_sup:reset_all(),
 	ar_rate_limiter:off(),
 	Responses = ar_util:batch_pmap(
 		RequestFun,
@@ -342,13 +409,15 @@ node_blacklisting_test_frame(RequestFun, ErrorResponse, NRequests, ExpectedError
 	),
 	?assertEqual(length(Responses), NRequests),
 	ar_blacklist_middleware:reset(),
+	arweave_limiter_sup:reset_all(),
 	Got = count_by_response_type(ErrorResponse, Responses),
 	%% Other test nodes may occasionally make some requests in the background disturbing the stats.
 	Tolerance = 5,
-	?debugFmt("ExpectedErrors: ~p, Tolerance: ~p, Got: ~p~n", [ExpectedErrors, Tolerance, maps:get(error_responses, Got)]),
-	?assert(maps:get(error_responses, Got) =< ExpectedErrors + Tolerance),
-	?assert(maps:get(error_responses, Got) >= ExpectedErrors - Tolerance),
-	?assertEqual(NRequests - maps:get(error_responses, Got), maps:get(ok_responses, Got)),
+	?debugFmt("Requests sent: ~p, ExpectedErrors: ~p, Tolerance: ~p, Got: ~p~n",
+		[NRequests, ExpectedErrors, Tolerance, maps:get(error_responses, Got, 0)]),
+	?assert(maps:get(error_responses, Got, 0) =< ExpectedErrors + Tolerance),
+	?assert(maps:get(error_responses, Got, 0) >= ExpectedErrors - Tolerance),
+	?assertEqual(NRequests - maps:get(error_responses, Got, 0), maps:get(ok_responses, Got, 0)),
 	ar_rate_limiter:on().
 
 %% @doc Count the number of successful and error responses.
@@ -756,7 +825,7 @@ test_get_tx_status(_) ->
 			case FetchStatus() of
 				{ok, {{<<"200">>, _}, _, _, _, _}} -> true;
 				_ -> false
-			end	
+			end
 		end,
 		200,
 		5000
@@ -930,9 +999,9 @@ test_get_error_of_data_limit(_) ->
 	?assertEqual({error, too_much_data}, Resp).
 
 test_send_missing_tx_with_the_block({_B0, Wallet1, _Wallet2, _StaticWallet}) ->
+	ar_test_node:disconnect_from(peer1),
 	LocalHeight = ar_node:get_height(),
 	RemoteHeight = height(peer1),
-	ar_test_node:disconnect_from(peer1),
 	TXs = [ar_test_node:sign_tx(Wallet1, #{ last_tx => ar_test_node:get_tx_anchor(peer1) }) || _ <- lists:seq(1, 10)],
 	lists:foreach(fun(TX) -> ar_test_node:assert_post_tx_to_peer(main, TX) end, TXs),
 	EverySecondTX = element(2, lists:foldl(fun(TX, {N, Acc}) when N rem 2 /= 0 ->
@@ -947,9 +1016,9 @@ test_send_missing_tx_with_the_block({_B0, Wallet1, _Wallet2, _StaticWallet}) ->
 	assert_wait_until_height(peer1, RemoteHeight + 1).
 
 test_fallback_to_block_endpoint_if_cannot_send_tx({_B0, Wallet1, _Wallet2, _StaticWallet}) ->
+	ar_test_node:disconnect_from(peer1),
 	LocalHeight = ar_node:get_height(),
 	RemoteHeight = height(peer1),
-	ar_test_node:disconnect_from(peer1),
 	TXs = [ar_test_node:sign_tx(Wallet1, #{ last_tx => ar_test_node:get_tx_anchor(peer1) }) || _ <- lists:seq(1, 10)],
 	lists:foreach(fun(TX) -> ar_test_node:assert_post_tx_to_peer(main, TX) end, TXs),
 	EverySecondTX = element(2, lists:foldl(fun(TX, {N, Acc}) when N rem 2 /= 0 ->

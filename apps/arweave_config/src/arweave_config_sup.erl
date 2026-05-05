@@ -47,8 +47,7 @@ children() ->
 				arweave_config,
 				start_link,
 				[]
-			},
-			type => worker
+			}
 		},
 	 	#{
 			id => arweave_config_environment,
@@ -56,17 +55,49 @@ children() ->
 				arweave_config_environment,
 				start_link,
 				[]
-			},
-			type => worker
+			}
 		},
+		#{
+			id => arweave_config_arguments,
+			start => {
+				arweave_config_arguments,
+				start_link,
+				[]
+			}
+		},
+		#{
+			id => arweave_config_file,
+			start => {
+				arweave_config_file,
+				start_link,
+				[]
+			}
+		},
+		#{
+			id => arweave_config_arguments_legacy,
+			start => {
+				arweave_config_arguments_legacy,
+				start_link,
+				[]
+			}
+		},
+		% @TODO at this time, this process/feature is not
+		% stable enough to be started.
+		% #{
+		% 	id => arweave_config_file_legacy,
+		% 	start => {
+		% 		arweave_config_file_legacy,
+		% 		start_link,
+		% 		[]
+		% 	}
+		% },
 		#{
 			id => arweave_config_store,
 			start => {
 				arweave_config_store,
 				start_link,
 				[]
-			},
-			type => worker
+			}
 		},
 		#{
 			id => arweave_config_spec,
@@ -74,8 +105,7 @@ children() ->
 				arweave_config_spec,
 				start_link,
 				[]
-			},
-			type => worker
+			}
 		},
 		#{
 			id => arweave_config_legacy,
@@ -83,7 +113,14 @@ children() ->
 				arweave_config_legacy,
 				start_link,
 				[]
-			},
-			type => worker
+			}
+		},
+		#{
+			id => arweave_config_signal_handler,
+			start => {
+				arweave_config_signal_handler,
+				start_link,
+				[]
+			}
 		}
 	].

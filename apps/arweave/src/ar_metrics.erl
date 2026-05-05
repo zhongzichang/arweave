@@ -58,7 +58,7 @@ register() ->
 	%%       See: https://github.com/deadtrickster/prometheus.erl/blob/6dd56bf321e99688108bb976283a80e4d82b3d30/src/prometheus_time.erl#L2-L84
 	prometheus_histogram:new([
 		{name, ar_http_request_duration_seconds},
-		{buckets, [0.01, 0.1, 0.5, 1, 5, 10, 30, 60]},
+		{buckets, [infinity]}, %% we don't care about the histogram portion
         {labels, [http_method, route, status_class]},
 		{
 			help,
@@ -68,7 +68,7 @@ register() ->
 	]),
 	prometheus_histogram:new([
 		{name, http_client_get_chunk_duration_seconds},
-		{buckets, [0.1, 1, 10, 60]},
+		{buckets, [infinity]}, %% we don't care about the histogram portion
         {labels, [status_class, peer]},
 		{
 			help,
@@ -100,7 +100,7 @@ register() ->
 	]),
 	prometheus_histogram:declare([
 		{name, tx_propagation_bits_per_second},
-		{buckets, [10, 100, 1000, 100000, 1000000, 100000000, 1000000000]},
+		{buckets, [infinity]}, %% we don't care about the histogram portion
 		{help, "The throughput (in bits/s) of transaction propagation."}
 	]),
 	prometheus_gauge:new([
@@ -140,24 +140,24 @@ register() ->
 					" processing of POST /block2."}]),
 	prometheus_histogram:new([
 		{name, ar_mempool_add_tx_duration_milliseconds},
-		{buckets, [0.1, 1, 10, 100, 1000]},
+		{buckets, [infinity]}, %% we don't care about the histogram portion
 		{help, "The duration in milliseconds it took to add a transaction to the mempool."}
 	]),
 	prometheus_histogram:new([
 		{name, reverify_mempool_chunk_duration_milliseconds},
-		{buckets, [0.1, 1, 10, 100, 1000]},
+		{buckets, [infinity]}, %% we don't care about the histogram portion
 		{help, "The duration in milliseconds it took to reverify a chunk of transactions "
 				"in the mempool."}
 	]),
 	prometheus_histogram:new([
 		{name, drop_txs_duration_milliseconds},
-		{buckets, [0.1, 1, 10, 100, 1000]},
+		{buckets, [infinity]}, %% we don't care about the histogram portion
 		{help, "The duration in milliseconds it took to drop a chunk of transactions "
 				"from the mempool."}
 	]),
 	prometheus_histogram:new([
 		{name, del_from_propagation_queue_duration_milliseconds},
-		{buckets, [0.1, 1, 10, 100, 1000]},
+		{buckets, [infinity]}, %% we don't care about the histogram portion
 		{help, "The duration in milliseconds it took to remove a transaction from the "
 				"propagation queue after it was emitted to peers."}
 	]),
@@ -224,12 +224,6 @@ register() ->
 		{help, "The number of the VDF steps a received block is ahead of our current step."}
 	]),
 
-	prometheus_histogram:new([
-		{name, fork_recovery_depth},
-		{buckets, lists:seq(1, 50)},
-		{help, "Fork recovery depth metric"}
-	]),
-
 	prometheus_counter:new([
 		{name, wallet_list_size},
 		{
@@ -239,14 +233,14 @@ register() ->
 	]),
 	prometheus_histogram:new([
 		{name, block_pre_validation_time},
-		{buckets, [0.1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 50, 100, 1000, 2000, 5000, 10000]},
+		{buckets, [infinity]}, %% we don't care about the histogram portion
 		{help,
 			"The time in milliseconds taken to parse the POST /block input and perform a "
 			"preliminary validation before relaying the block to peers."}
 	]),
 	prometheus_histogram:new([
 		{name, block_processing_time},
-		{buckets, [0.1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 30, 40, 50, 60]},
+		{buckets, [infinity]}, %% we don't care about the histogram portion
 		{help,
 			"The time in seconds taken to validate the block and apply it on top of "
 			"the current state, possibly involving a chain reorganisation."}
@@ -313,14 +307,9 @@ register() ->
 	prometheus_histogram:new([
 		{name, chunk_storage_sync_record_check_duration_milliseconds},
 		{labels, [requested_chunk_count]},
-		{buckets, [0.1, 1, 10, 100, 1000, 10000]},
+		{buckets, [infinity]}, %% we don't care about the histogram portion
 		{help, "The time in milliseconds it took to check the fetched chunk range "
 				"is actually registered by the chunk storage."}
-	]),
-	prometheus_gauge:new([
-		{name, fixed_broken_chunk_storage_records},
-		{help, "The number of fixed broken chunk storage records detected when "
-				"reading a range of chunks."}
 	]),
 	prometheus_gauge:new([
 		{name, mining_server_tasks},
@@ -498,11 +487,22 @@ register() ->
 		{help, "The rate, in bytes per second, at which chunks are written to storage."}
 	]),
 
-	prometheus_gauge:new([{name, sync_tasks},
-		{labels, [state, type, peer]},
-		{help, "The number of syncing tasks. 'state' can be 'queued' or 'scheduled'. "
-				"'type' can be 'sync_range' or 'read_range'. 'peer' is the peer the task "
-				"is intended for - for 'read_range' tasks this will be 'localhost'."}]),
+	prometheus_gauge:new([{name, data_discovery},
+		{labels, [type, store_id, stat]},
+		{help, "Tracks peer availability statistics from data discovery across buckets. "
+				"'type' is 'normal' or 'footprint'. "
+				"'stat' is 'num_peers', 'total_buckets', 'zero_peer_count', or 'healthy_peer_count'."}]),
+
+	prometheus_counter:new([{name, sync_tasks},
+		{labels, [state, peer]},
+		{help, "The number of syncing tasks. 'state' can be "
+				"'queued_in', 'queued_out', 'dispatched', 'completed', "
+				"'activate_footprint', or 'deactivate_footprint'. "
+				" 'peer' is the peer the task is intended for."}]),
+
+	prometheus_counter:new([{name, sync_chunks_skipped},
+		{labels, [reason]},
+		{help, "The number of chunks skipped during syncing."}]),
 
 	prometheus_gauge:new([{name, device_lock_status},
 		{labels, [store_id, mode]},
@@ -525,6 +525,12 @@ register() ->
 		{help, "The number of bytes of replica.2.9 entropy written to chunk storage."}]),
 	prometheus_counter:new([{name, replica_2_9_entropy_generated},
 		{help, "The number of bytes of replica.2.9 entropy generated."}]),
+	prometheus_gauge:new([{name, replica_2_9_entropy_cache},
+		{help, "The size (in bytes) of the replica.2.9 entropy cache."}]),
+	prometheus_counter:new([{name, replica_2_9_entropy_stats},
+		{labels, [partition, stat]},
+		{help, "Count of different replica_2_9 entropy events: 'cache_hit', 'cache_miss', "
+			   "'redundant'."}]),
 	prometheus_histogram:new([
 		{name, replica_2_9_entropy_duration_milliseconds},
 		{buckets, [infinity]}, %% we don't care about the histogram portion
@@ -604,22 +610,22 @@ get_status_class({error, {closed,_}}) ->
 	"closed";
 get_status_class({error, noproc}) ->
 	"noproc";
-get_status_class(208) ->
-	"already_processed";
-get_status_class(418) ->
-	"missing_transactions";
-get_status_class(419) ->
-	"missing_chunk";
+get_status_class({error, {down,_}}) ->
+	"down";
+get_status_class({error, {stream_error,_}}) ->
+	"stream_error";
 get_status_class(Data) when is_integer(Data), Data > 0 ->
-	prometheus_http:status_class(Data);
+	integer_to_list(Data);
 get_status_class(Data) when is_binary(Data) ->
 	case catch binary_to_integer(Data) of
 		{_, _} ->
+			?LOG_DEBUG([{event, unknown_status}, {status, Data}]),
 			"unknown";
 		Status ->
 			get_status_class(Status)
 	end;
 get_status_class(Data) when is_atom(Data) ->
 	atom_to_list(Data);
-get_status_class(_) ->
+get_status_class(Data) ->
+	?LOG_DEBUG([{event, unknown_status}, {status, Data}]),
 	"unknown".

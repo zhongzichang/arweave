@@ -6,10 +6,10 @@
 	block_passes_diff_check/1, block_passes_diff_check/2, passes_diff_check/4,
 	scaled_diff/2, update_account/6, is_account_banned/2]).
 
--include("../include/ar.hrl").
--include("../include/ar_pricing.hrl").
--include("../include/ar_consensus.hrl").
--include("../include/ar_mining.hrl").
+-include("ar.hrl").
+-include("ar_pricing.hrl").
+-include("ar_consensus.hrl").
+-include("ar_mining.hrl").
 
 -include_lib("eunit/include/eunit.hrl").
 
@@ -25,7 +25,7 @@ apply_tx(Accounts, Denomination, TX) ->
 		not_found ->
 			Accounts;
 		_ ->
-			apply_tx2(Accounts, Denomination, TX)
+			apply_tx2(Accounts, Denomination, Addr, TX)
 	end.
 
 %% @doc Update the given accounts by applying the given transactions.
@@ -55,14 +55,41 @@ update_accounts(B, PrevB, Accounts) ->
 	true = B#block.height >= ar_fork:height_2_6(),
 	update_accounts2(B, PrevB, Accounts2, Args).
 
-%% @doc Perform the last stage of block validation. The majority of the checks
-%% are made in ar_block_pre_validator.erl, ar_nonce_limiter.erl, and
-%% ar_node_utils:update_accounts/3.
+%%--------------------------------------------------------------------
+%% @doc Perform the last stage of block validation. The majority of
+%% the checks are made in `ar_block_pre_validator.erl',
+%% `ar_nonce_limiter.erl', and `ar_node_utils:update_accounts/3'.
+%% @end
+%%--------------------------------------------------------------------
+-spec validate(NewB, B, Wallets, BlocksAnchors, RecentTXMap, PartitionUpperBound) -> Return when
+	NewB :: #block{},
+	B :: #block{},
+	Wallets :: term(),
+	BlocksAnchors :: term(),
+	RecentTXMap :: term(),
+	PartitionUpperBound :: term(),
+	Return :: valid | {invalid, Reason},
+	Reason :: term().
+
 validate(NewB, B, Wallets, BlockAnchors, RecentTXMap, PartitionUpperBound) ->
 	?LOG_INFO([{event, validating_block}, {hash, ar_util:encode(NewB#block.indep_hash)}]),
 	case timer:tc(
 		fun() ->
-			do_validate(NewB, B, Wallets, BlockAnchors, RecentTXMap, PartitionUpperBound)
+			try
+				do_validate(NewB, B, Wallets, BlockAnchors, RecentTXMap, PartitionUpperBound)
+			catch
+				C:R:S ->
+					?LOG_ERROR([
+						{event, block_validation_exception},
+						{class, C},
+						{reason, R},
+						{stacktrace, S},
+						{hash, ar_util:encode(NewB#block.indep_hash)},
+						{height, NewB#block.height}
+					]),
+					{invalid, validation_exception}
+			end
+
 		end
 	) of
 		{TimeTaken, valid} ->
@@ -74,7 +101,18 @@ validate(NewB, B, Wallets, BlockAnchors, RecentTXMap, PartitionUpperBound) ->
 			?LOG_INFO([{event, block_validation_failed}, {reason, Reason},
 					{hash, ar_util:encode(NewB#block.indep_hash)},
 					{time_taken_us, TimeTaken}]),
-			{invalid, Reason}
+			{invalid, Reason};
+		{TimeTaken, {error, Reason}} ->
+			?LOG_INFO([{event, block_validation_failed}, {reason, Reason},
+					{hash, ar_util:encode(NewB#block.indep_hash)},
+					{time_taken_us, TimeTaken}]),
+			{invalid, Reason};
+		{TimeTaken, Else} ->
+			?LOG_ERROR([{event, block_validation_failed}, {reason, Else},
+					{hash, ar_util:encode(NewB#block.indep_hash)},
+					{time_taken_us, TimeTaken}]),
+			{invalid, Else}
+
 	end.
 
 h1_passes_diff_check(H1, DiffPair, PackingDifficulty) ->
@@ -99,6 +137,12 @@ block_passes_diff_check(SolutionHash, Block) ->
 	DiffPair = ar_difficulty:diff_pair(Block),
 	passes_diff_check(SolutionHash, IsPoA1, DiffPair, PackingDifficulty).
 
+-ifdef(LOCALNET).
+%% We skip difficulty checks on localnet for faster block production.
+passes_diff_check(_SolutionHash, _IsPoA1, _DiffPair, _PackingDifficulty) ->
+	true.
+
+-else.
 passes_diff_check(SolutionHash, IsPoA1, not_set, _PackingDifficulty) ->
 	?LOG_ERROR([{event, diff_check_not_set}, {solution_hash, SolutionHash}, {is_poa1, IsPoA1}]),
 	false;
@@ -111,6 +155,7 @@ passes_diff_check(SolutionHash, IsPoA1, {PoA1Diff, Diff}, PackingDifficulty) ->
 				Diff
 		end,
 	binary:decode_unsigned(SolutionHash) > scaled_diff(Diff2, PackingDifficulty).
+-endif.
 
 scaled_diff(RawDiff, PackingDifficulty) ->
 	case PackingDifficulty of
@@ -147,18 +192,17 @@ is_account_banned(Addr, Accounts) ->
 %%% Private functions.
 %%%===================================================================
 
-apply_tx2(Accounts, Denomination, TX) ->
-	update_recipient_balance(update_sender_balance(Accounts, Denomination, TX), Denomination,
-			TX).
+apply_tx2(Accounts, Denomination, Addr, TX) ->
+	update_recipient_balance(
+			update_sender_balance(Accounts, Denomination, Addr, TX), Denomination, TX).
 
-update_sender_balance(Accounts, Denomination,
+update_sender_balance(Accounts, Denomination, Addr,
 		#tx{
 			id = ID,
 			quantity = Qty,
 			reward = Reward,
 			denomination = TXDenomination
-		} = TX) ->
-	Addr = ar_tx:get_owner_address(TX),
+		}) ->
 	case maps:get(Addr, Accounts, not_found) of
 		{Balance, _LastTX} ->
 			Balance2 = ar_pricing:redenominate(Balance, 1, Denomination),
@@ -523,7 +567,7 @@ validate_block(next_vdf_difficulty, {NewB, OldB, Wallets, BlockAnchors, RecentTX
 					RecentTXMap});
 		true ->
 			ExpectedNextVDFDifficulty = ar_block:compute_next_vdf_difficulty(OldB),
-			#nonce_limiter_info{ next_vdf_difficulty = NextVDFDifficulty } = 
+			#nonce_limiter_info{ next_vdf_difficulty = NextVDFDifficulty } =
 				NewB#block.nonce_limiter_info,
 			case ExpectedNextVDFDifficulty == NextVDFDifficulty of
 				false ->
@@ -693,7 +737,7 @@ test_block_validation() ->
 	%% Add at least 10 KiB of data to the weave and mine a block on top,
 	%% to make sure SPoRA mining activates.
 	PrevTX = ar_test_node:sign_tx(main, Wallet, #{ reward => ?AR(10),
-			data => crypto:strong_rand_bytes(10 * 1024 * 1024) }),
+			data => crypto:strong_rand_bytes(10 * ?MiB) }),
 	ar_test_node:assert_post_tx_to_peer(main, PrevTX),
 	ar_test_node:mine(),
 	[_ | _] = ar_test_node:wait_until_height(main, 1),
@@ -705,7 +749,7 @@ test_block_validation() ->
 	BlockAnchors = ar_node:get_block_anchors(),
 	RecentTXMap = ar_node:get_recent_txs_map(),
 	TX = ar_test_node:sign_tx(main, Wallet, #{ reward => ?AR(10),
-			data => crypto:strong_rand_bytes(7 * 1024 * 1024), last_tx => PrevH }),
+			data => crypto:strong_rand_bytes(7 * ?MiB), last_tx => PrevH }),
 	ar_test_node:assert_post_tx_to_peer(main, TX),
 	ar_test_node:mine(),
 	[{H, _, _} | _] = ar_test_node:wait_until_height(main, 3),
@@ -720,6 +764,23 @@ test_block_validation() ->
 	?assertEqual({invalid, invalid_previous_block},
 			validate(B#block{ previous_block = B#block.indep_hash }, PrevB, Wallets,
 					BlockAnchors, RecentTXMap, PartitionUpperBound)),
+
+	% AVDE-2026-4: invalid block
+	?assertMatch(
+		{invalid, _},
+		validate(
+			B,
+			PrevB#block{
+				strict_data_split_threshold =
+					PrevB#block.strict_data_split_threshold + 1
+			},
+			Wallets,
+			BlockAnchors,
+			RecentTXMap,
+			PartitionUpperBound
+		)
+	),
+
 	InvLastRetargetB = B#block{ last_retarget = B#block.timestamp },
 	InvDataRootB = B#block{ tx_root = crypto:strong_rand_bytes(32) },
 	InvBlockIndexRootB = B#block{ hash_list_merkle = crypto:strong_rand_bytes(32) },
@@ -762,6 +823,7 @@ test_block_validation() ->
 		{invalid, invalid_cumulative_difficulty},
 		validate_block(cumulative_diff, {
 				InvCDiffB#block{ indep_hash = ar_block:indep_hash(InvCDiffB) }, PrevB})),
+
 	BI2 = ar_node:get_block_index(),
 	PartitionUpperBound2 = ar_node:get_partition_upper_bound(BI2),
 	BlockAnchors2 = ar_node:get_block_anchors(),
