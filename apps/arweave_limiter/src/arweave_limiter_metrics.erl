@@ -2,6 +2,10 @@
 
 -export([register/0]).
 
+-ifdef(AR_TEST).
+-export([cleanup/0]).
+-endif.
+
 %%%===================================================================
 %%% Public interface.
 %%%===================================================================
@@ -12,14 +16,16 @@ register() ->
                                    {name, ar_limiter_response_time_microseconds},
                                    {help, "Time it took for the limiter to respond to requests"},
                                    %% buckets might be reduced for production
-                                   {buckets, [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 50]},
+                                   {buckets, [0.01, 0.05, 0.1, 0.5, 1, 5, 10, 50, 100, 500, 1000]},
                                    {labels, [limiter_id]}]),
-
-    ok = prometheus_counter:new([
-                                 {name, ar_limiter_requests_total},
+    ok = prometheus_counter:new([{name, ar_limiter_requests_total},
                                  {help, "The number of requests the limiter has processed"},
                                  {labels, [limiter_id]}]),
     ok = prometheus_counter:new([{name, ar_limiter_rejected_total},
+                                 {help, "The number of request were rejected by the limiter"},
+                                 {labels, [limiter_id, reason]}
+                                ]),
+    ok = prometheus_counter:new([{name, ar_limiter_requests_error},
                                  {help, "The number of request were rejected by the limiter"},
                                  {labels, [limiter_id, reason]}
                                 ]),
@@ -61,4 +67,22 @@ register() ->
                                  {name, ar_limiter_leaky_tick_reductions_peer},
                                  {help, "The times a leaky bucket token reduction had have to be performed for a peer"},
                                  {labels, [limiter_id]}]),
+    ok.
+
+cleanup() ->
+    prometheus_histogram:deregister(ar_limiter_response_time_microseconds),
+    
+    prometheus_counter:deregister(ar_limiter_requests_total),
+    prometheus_counter:deregister(ar_limiter_rejected_total),
+    prometheus_counter:deregister(ar_limiter_requests_error),
+    prometheus_counter:deregister(ar_limiter_reduce_requests_total),
+    prometheus_counter:deregister(ar_limiter_leaky_ticks),
+    prometheus_counter:deregister(ar_limiter_leaky_tick_delete_peer_total),
+    prometheus_counter:deregister(ar_limiter_cleanup_tick_expired_sliding_peers_deleted_total),
+    prometheus_counter:deregister(ar_limiter_leaky_tick_token_reductions_total),
+    prometheus_counter:deregister(ar_limiter_leaky_tick_reductions_peer),
+
+    prometheus_gauge:deregister(ar_limiter_peers),
+    prometheus_gauge:deregister(ar_limiter_tracked_items_total),
+
     ok.

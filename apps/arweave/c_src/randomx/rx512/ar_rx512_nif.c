@@ -1,4 +1,5 @@
 #include <string.h>
+#include <stdlib.h>
 #include <openssl/sha.h>
 #include <ar_nif.h>
 #include "../randomx_long_with_entropy.h"
@@ -46,16 +47,23 @@ static ERL_NIF_TERM decrypt_chunk(ErlNifEnv* envPtr,
 	return make_output_binary(envPtr, outChunk, outChunkSize);
 }
 
-static ERL_NIF_TERM encrypt_chunk(ErlNifEnv* envPtr,
+static int encrypt_chunk(ErlNifEnv* envPtr,
 		randomx_vm *machine, const unsigned char *input, const size_t inputSize,
 		const unsigned char *inChunk, const size_t inChunkSize,
-		const int randomxProgramCount) {
+		const int randomxProgramCount,
+		ERL_NIF_TERM *outTerm) {
 	ERL_NIF_TERM encryptedChunkTerm;
 	unsigned char* encryptedChunk = enif_make_new_binary(
 										envPtr, MAX_CHUNK_SIZE, &encryptedChunkTerm);
+	if (encryptedChunk == NULL) {
+		return 0;
+	}
 
 	if (inChunkSize < MAX_CHUNK_SIZE) {
 		unsigned char *paddedInChunk = (unsigned char*)malloc(MAX_CHUNK_SIZE);
+		if (paddedInChunk == NULL) {
+			return 0;
+		}
 		memset(paddedInChunk, 0, MAX_CHUNK_SIZE);
 		memcpy(paddedInChunk, inChunk, inChunkSize);
 		randomx_encrypt_chunk(
@@ -68,7 +76,8 @@ static ERL_NIF_TERM encrypt_chunk(ErlNifEnv* envPtr,
 			encryptedChunk, randomxProgramCount);
 	}
 
-	return encryptedChunkTerm;
+	*outTerm = encryptedChunkTerm;
+	return 1;
 }
 
 static ERL_NIF_TERM rx512_encrypt_chunk_nif(
@@ -118,8 +127,13 @@ static ERL_NIF_TERM rx512_encrypt_chunk_nif(
 		return error_tuple(envPtr, "randomx_create_vm failed");
 	}
 
-	ERL_NIF_TERM outChunkTerm = encrypt_chunk(envPtr, vmPtr,
-		inputData.data, inputData.size, inputChunk.data, inputChunk.size, randomxRoundCount);
+	ERL_NIF_TERM outChunkTerm;
+	if (!encrypt_chunk(envPtr, vmPtr,
+		inputData.data, inputData.size, inputChunk.data, inputChunk.size, randomxRoundCount,
+		&outChunkTerm)) {
+		destroy_vm(statePtr, vmPtr);
+		return error_tuple(envPtr, "malloc failed");
+	}
 
 	destroy_vm(statePtr, vmPtr);
 	return ok_tuple(envPtr, outChunkTerm);
@@ -130,7 +144,8 @@ static ERL_NIF_TERM rx512_decrypt_chunk_nif(
 	int argc,
 	const ERL_NIF_TERM argv[]
 ) {
-	int outChunkLen, randomxRoundCount, jitEnabled, largePagesEnabled, hardwareAESEnabled;
+	unsigned int outChunkLen;
+	int randomxRoundCount, jitEnabled, largePagesEnabled, hardwareAESEnabled;
 	struct state* statePtr;
 	ErlNifBinary inputData;
 	ErlNifBinary inputChunk;
@@ -144,12 +159,20 @@ static ERL_NIF_TERM rx512_decrypt_chunk_nif(
 	if (!enif_inspect_binary(envPtr, argv[1], &inputData)) {
 		return enif_make_badarg(envPtr);
 	}
+	// A packed chunk is always a full MAX_CHUNK_SIZE - encrypt_chunk pads to it and
+	// ar_packing_server:validate_chunk_size/3 rejects anything else before we get here. It is
+	// also what fills the MAX_CHUNK_SIZE output buffer below: randomx_decrypt_chunk writes
+	// inputChunk.size bytes into it and the rest would be returned as uninitialised memory.
 	if (!enif_inspect_binary(envPtr, argv[2], &inputChunk) ||
-		inputChunk.size == 0 ||
-		inputChunk.size > MAX_CHUNK_SIZE) {
+		inputChunk.size != (size_t)MAX_CHUNK_SIZE) {
 		return enif_make_badarg(envPtr);
 	}
-	if (!enif_get_int(envPtr, argv[3], &outChunkLen)) {
+	// outChunkLen only truncates the output binary, so the upper bound is what keeps
+	// make_output_binary inside the buffer. There is no lower bound: ar_packing_server
+	// accepts any chunk size in [1, ?DATA_CHUNK_SIZE], and chunks shorter than one feistel
+	// stride are legitimate - a transaction with a few bytes of data produces one.
+	if (!enif_get_uint(envPtr, argv[3], &outChunkLen) ||
+		outChunkLen > (unsigned int)MAX_CHUNK_SIZE) {
 		return enif_make_badarg(envPtr);
 	}
 	if (!enif_get_int(envPtr, argv[4], &randomxRoundCount)) {
@@ -178,12 +201,17 @@ static ERL_NIF_TERM rx512_decrypt_chunk_nif(
 	// NOTE. Because randomx_decrypt_chunk will unpack padding too, decrypt always uses the
 	// full 256KB chunk size. We'll then truncate the output to the correct feistel-padded
 	// outChunkSize.
-	unsigned char outChunk[MAX_CHUNK_SIZE];
+	unsigned char *outChunk = (unsigned char*)malloc(MAX_CHUNK_SIZE);
+	if (outChunk == NULL) {
+		destroy_vm(statePtr, vmPtr);
+		return error_tuple(envPtr, "malloc failed");
+	}
 	ERL_NIF_TERM decryptedChunkTerm = decrypt_chunk(envPtr, vmPtr,
 		inputData.data, inputData.size, inputChunk.data, inputChunk.size,
 		outChunk, outChunkLen, randomxRoundCount);
 
 	destroy_vm(statePtr, vmPtr);
+	free(outChunk);
 
 	return ok_tuple(envPtr, decryptedChunkTerm);
 }
@@ -212,11 +240,15 @@ static ERL_NIF_TERM rx512_reencrypt_chunk_nif(
 	if (!enif_inspect_binary(envPtr, argv[2], &encryptKey)) {
 		return enif_make_badarg(envPtr);
 	}
-	if (!enif_inspect_binary(envPtr, argv[3], &inputChunk) || inputChunk.size == 0) {
+	// The input is a packed chunk, so a full MAX_CHUNK_SIZE - see decrypt above.
+	if (!enif_inspect_binary(envPtr, argv[3], &inputChunk) ||
+		inputChunk.size != (size_t)MAX_CHUNK_SIZE) {
 		return enif_make_badarg(envPtr);
 	}
+	// chunkSize is the unpadded size of the chunk - same bound as outChunkLen in decrypt
+	// above, except that here it also sizes the input of the re-encrypt step.
 	if (!enif_get_int(envPtr, argv[4], &chunkSize)  ||
-		chunkSize == 0 ||
+		chunkSize <= 0 ||
 		chunkSize > MAX_CHUNK_SIZE) {
 		return enif_make_badarg(envPtr);
 	}
@@ -249,13 +281,24 @@ static ERL_NIF_TERM rx512_reencrypt_chunk_nif(
 	// NOTE. Because randomx_decrypt_chunk will unpack padding too, decrypt always uses the
 	// full 256KB chunk size. We'll then truncate the output to the correct feistel-padded
 	// outChunkSize.
-	unsigned char decryptedChunk[MAX_CHUNK_SIZE];
+	unsigned char *decryptedChunk = (unsigned char*)malloc(MAX_CHUNK_SIZE);
+	if (decryptedChunk == NULL) {
+		destroy_vm(statePtr, vmPtr);
+		return error_tuple(envPtr, "malloc failed");
+	}
 	ERL_NIF_TERM decryptedChunkTerm = decrypt_chunk(envPtr, vmPtr,
 		decryptKey.data, decryptKey.size, inputChunk.data, inputChunk.size,
 		decryptedChunk, chunkSize, decryptRandomxRoundCount);
 
-	ERL_NIF_TERM reencryptedChunkTerm = encrypt_chunk(envPtr, vmPtr,
-		encryptKey.data, encryptKey.size, decryptedChunk, chunkSize, encryptRandomxRoundCount);
+	ERL_NIF_TERM reencryptedChunkTerm;
+	if (!encrypt_chunk(envPtr, vmPtr,
+		encryptKey.data, encryptKey.size, decryptedChunk, chunkSize, encryptRandomxRoundCount,
+		&reencryptedChunkTerm)) {
+		free(decryptedChunk);
+		destroy_vm(statePtr, vmPtr);
+		return error_tuple(envPtr, "malloc failed");
+	}
+	free(decryptedChunk);
 
 	destroy_vm(statePtr, vmPtr);
 

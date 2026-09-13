@@ -9,6 +9,11 @@ on:
     branches: ["**"]
   workflow_dispatch:
 
+# One run per branch at a time; see test-amd64-ubuntu-22.04.yml.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     uses: ./.github/workflows/x-build.yml
@@ -27,8 +32,14 @@ jobs:
       os_name: macos
       os_release: 26
 
+  # test-canary, common-test, and test all need only the build artifact.
+  # We don't gate test/common-test on test-canary because canary is a
+  # sanity check on the test harness itself, and serializing them adds
+  # ~5-7 min of artifact-download cost on every push to defend against
+  # a near-zero-probability condition. If canary fails the PR's
+  # required-checks reflects that; test runs in parallel anyway.
   common-test:
-    needs: [test-canary]
+    needs: [build]
     uses: ./.github/workflows/x-common-test.yml
     secrets: inherit
     with:
@@ -37,7 +48,7 @@ jobs:
       os_release: 26
 
   test:
-    needs: [test-canary]
+    needs: [build]
     uses: ./.github/workflows/x-test-vdf.yml
     secrets: inherit
     with:

@@ -3,6 +3,7 @@
 %%% @end
 %%%===================================================================
 -module(ar_canary).
+-test_category([canary]).
 -include_lib("eunit/include/eunit.hrl").
 
 canary_test_() ->

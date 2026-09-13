@@ -1,380 +1,395 @@
-%%%===================================================================
-%%% GNU General Public License, version 2 (GPL-2.0)
-%%% The GNU General Public License (GPL-2.0)
-%%% Version 2, June 1991
+%%% @doc Public facade and lifecycle coordinator for Arweave configuration.
 %%%
-%%% ------------------------------------------------------------------
+%%% The `arweave_config` app owns the node configuration. Most callers
+%%% should treat this module as the public boundary.
 %%%
-%%% @copyright 2025 (c) Arweave
-%%% @author Arweave Team
-%%% @author Mathieu Kerjouan
-%%% @doc Arweave Configuration Interface.
+%%% == Process topology ==
 %%%
-%%% `arweave_config' module is an interface to the Arweave
-%%% configuration data store where all configuration parameters are
-%%% stored and specified.
+%%% Starting the application brings up a one-for-all supervisor with
+%%% three long-lived pieces:
+%%% - the value store (arweave_config_store)
+%%% - the option-spec registry (arweave_config_options_registry)
+%%% - the signal handler (arweave_config_signal_handler)
 %%%
-%%% WARNING: this module/application is in active development, the
-%%% interfaces can change.
+%%% This module is a pure public facade plus the OTP `application`
+%%% callback. The registry owns spec lookup, mutation semantics, and
+%%% the load/runtime lifecycle flag; the store owns the actual values.
 %%%
-%%% == Usage ==
+%%% Configuration options are declared as maps in the
+%%% `arweave_config_options_*` modules. These spec maps define the option
+%%% name, defaults, types, read/write hooks, etc...
 %%%
-%%% `arweave_config' application needs to be started to work
-%%% correctly, many processes are mandatory and will be in charge to
-%%% deal with stored configuration.
+%%% == Load and runtime lifecycle ==
 %%%
-%%% ```
-%%% % start arweave_config
-%%% arweave_config:start().
-%%% '''
+%%% Startup begins in load mode, where every option may be written
+%%% freely. `bootstrap/1` loads OS environment variables and then
+%%% selects either the legacy CLI / `config.json` path or the new
+%%% long-flag + JSON/YAML path. It returns a legacy-shaped
+%%% proplist because the surrounding `ar` application still starts from
+%%% that shape.
 %%%
-%%% Parameters keys are defined as list and can be retrieve using
-%%% `arweave_config:get/1' or `arweave_config:get/2'.
+%%% `ar:start/1` loads that proplist back through this facade,
+%%% normalizes the assembled state, starts the rest of the node, and
+%%% then calls `runtime/0`. The runtime transition runs all contributor
+%%% validators once and flips a one-way lifecycle flag. After that,
+%%% only `runtime => true` specs accept writes; the rest reject them.
+%%% Each successful runtime write is followed by validation and is
+%%% rolled back if the full configuration becomes invalid.
 %%%
-%%% ```
-%%% % get debug parameter.
-%%% arweave_config:get([debug]).
+%%% == Compatibility and list-backed values ==
 %%%
-%%% % get debug parameter, if undefined, use false instead.
-%%% arweave_config:get([debug], false).
-%%% '''
+%%% Much of the node still speaks the historical config language.
+%%% Specs with a `legacy` field map old atom names to canonical
+%%% option_keys. List-backed values (peers, storage modules, webhooks)
+%%% are stored under their canonical roots and validated by their specs.
 %%%
-%%% Parameters keys can be dynamically set using
-%%% `arweave_config:set/2'.
+%%% In short: parsers and legacy bridges translate input into canonical
+%%% option_keys; the registry enforces specs; the store holds values;
+%%% normalization and validation turn the loaded state into a runtime
+%%% contract for the rest of the node.
 %%%
-%%% ```
-%%% % set debug parameter to true
-%%% arweave_config:set([debug], true).
-%%%
-%%% % set debug parameter to false
-%%% arweave_config:set([debug], false).
-%%% '''
-%%%
-%%% Parameters are defined in parameter specification, defined as
-%%% callback modules or as map. If a specification is not containing
-%%% the parameter key, the interface will return and error.
-%%%
-%%% @end
-%%%===================================================================
 -module(arweave_config).
 -compile(warnings_as_errors).
 -vsn(1).
 -behavior(application).
--behavior(gen_server).
 -export([
-	get/1,
-	get/2,
-	get_env/0,
-	is_runtime/0,
-	runtime/0,
-	set/2,
-	set_env/1,
-	start/0,
-	start_link/0,
-	stop/0
+    get/1,
+    get_all_with_prefix/1,
+    is_runtime/0,
+    runtime/0,
+    set/2,
+    load/1,
+    start/0,
+    stop/0
+]).
+
+%% Public API: webhooks, semaphores, features, limiter
+-export([
+    feature_enabled/1,
+    limiter_groups/0
+]).
+
+%% Public API: serialization / logging
+-export([
+    log/0
+]).
+%% Public API: bootstrap and orchestration helpers
+-export([
+    bootstrap/1,
+    normalize/0,
+    show_cli_help/0,
+    parse_storage_module_arg/1,
+    storage_modules/0,
+    defrag_storage_modules/0,
+    repack_modules/1,
+    is_legacy_launch/0,
+    convert_config/3
 ]).
 % application behavior callbacks.
 -export([start/2, stop/1]).
-% gen_server behavior callbacks
--export([init/1, terminate/2, handle_call/3, handle_cast/2, handle_info/2]).
+-ifdef(AR_TEST).
+-export([
+    force_config/1,
+    restore/1,
+    snapshot/0,
+    with_test_config/1
+]).
+-endif.
 -compile({no_auto_import,[get/1]}).
--include("arweave_config.hrl").
 -include_lib("kernel/include/logger.hrl").
 
-%%--------------------------------------------------------------------
-%% @doc helper function to started `arweave_config' application.
-%% @end
-%%--------------------------------------------------------------------
+%% @doc Start the `arweave_config` application and its dependencies.
 -spec start() -> ok | {error, term()}.
-
 start() ->
-	case application:ensure_all_started(?MODULE, permanent) of
-		{ok, Dependencies} ->
-			?LOG_DEBUG("arweave_config started dependencies: ~p", Dependencies),
-			ok;
-		Elsewise ->
-			Elsewise
-	end.
+    case application:ensure_all_started(?MODULE, permanent) of
+        {ok, Dependencies} ->
+            ?LOG_DEBUG("arweave_config started dependencies: ~p", Dependencies),
+            ok;
+        Else ->
+            Else
+    end.
 
-%%--------------------------------------------------------------------
-%% @doc help function to stop `arweave_config' application.
-%% @end
-%%--------------------------------------------------------------------
+%% @doc Stop the `arweave_config` application.
 -spec stop() -> ok.
-
 stop() ->
-	application:stop(?MODULE).
+    application:stop(?MODULE).
 
-%%--------------------------------------------------------------------
-%% @doc A wrapper for `application:get_env/2'.
-%% @deprecated this function is a temporary interface and will be
-%%             replaced by `arweave_config:get/1' function.
-%% @see application:get_env/2
-%% @end
-%%--------------------------------------------------------------------
--spec get_env() -> {ok, #config{}}.
-
-get_env() ->
-	arweave_config_legacy:get_env().
-
-%%--------------------------------------------------------------------
-%% @doc A wrapper for `application:set_env/3'.
-%% @deprecated this function is a temporary interface and will be
-%%             replaced by `arweave_config:set/2' function.
-%% @see application:set_env/3
-%% @end
-%%--------------------------------------------------------------------
--spec set_env(term()) -> ok.
-
-set_env(Value) ->
-	arweave_config_legacy:set_env(Value).
-
-%%--------------------------------------------------------------------
-%% @doc Get a value from the configuration.
+%% @doc Read a configuration value by its canonical option_key.
 %%
-%% Note: the behavior of this function is not the same depending of
-%% the kind of parameter desired. Indeed, to help the transition to
-%% the new configuration format, when an `atom' is set as first
-%% argument,   `arweave_config'  will   act  as   proxy  to   the  old
-%% configuration method (using a record).
+%% Returns the raw value, or the spec's `default` if the store has no
+%% entry, or `undefined` if the key is not registered.
 %%
 %% == Examples ==
 %%
 %% ```
-%% > get(<<"global.debug">>).
-%% {ok, false}
+%% > arweave_config:get([rocksdb, flush_interval]).
+%% 1800
 %%
-%% > get([global, debug]).
-%% {ok, false}
-%%
-%% > get([test]).
-%% {error, #{ reason => not_found }}.
+%% > arweave_config:get([does, not, exist]).
+%% undefined
 %% '''
-%%
-%% @end
-%%--------------------------------------------------------------------
--spec get(ParameterKey) -> Return when
-	ParameterKey :: atom() | string() | binary() | list(),
-	Return :: {ok, term()} | {error, term()}.
+-spec get(OptionKey) -> Return when
+    OptionKey :: [atom() | integer() | binary()],
+    Return :: term() | undefined.
+get(Option) when is_list(Option) ->
+    case arweave_config_options_registry:get(Option) of
+        {ok, Value} -> Value;
+        _ -> undefined
+    end.
 
-get(Key) when is_atom(Key) ->
-	% TODO: pattern to remove.
-	% this pattern is ONLY for legacy purpose, it should be
-	% removed after the full migration to the new arweave
-	% configuration format.
-	?LOG_DEBUG([
-		{function, ?FUNCTION_NAME},
-		{module, ?MODULE},
-		{key, Key}
-	]),
-	arweave_config_legacy:get(Key);
-get(Key) ->
-	case arweave_config_parser:key(Key) of
-		{ok, Parameter} ->
-			arweave_config_spec:get(Parameter);
-		Elsewise ->
-			Elsewise
-	end.
-
-%%--------------------------------------------------------------------
-%% @doc Get a value from the  configuration, if not defined, a default
-%% value can be returned instead.
-%%
-%% == Examples ==
-%%
-%% ```
-%% > get(<<"global.debug">>, true).
-%% false
-%%
-%% > get([global, debug], true).
-%% false
-%%
-%% > get([test], true).
-%% true
-%% '''
-%% @end
-%%--------------------------------------------------------------------
--spec get(ParameterKey, Default) -> Return when
-	ParameterKey :: atom() | string() | binary() | list(),
-	Default :: term(),
-	Return :: term().
-
-get(Key, Default) ->
-	try get(Key) of
-		{ok, Value} ->
-			Value;
-		_Else ->
-			Default
-	catch
-		_:_ -> Default
-	end.
-
-%%--------------------------------------------------------------------
 %% @doc Set a configuration value using a key.
 %%
 %% == Examples==
 %%
 %% ```
 %% > set(<<"global.debug">>, <<"true">>).
-%% {ok, true}
+%% ok
 %%
-%% > set([global, debug]), true).
-%% {ok, true}
+%% > set([global, debug], true).
+%% ok
 %%
 %% > set("global.debug", "true").
-%% {ok, true}
+%% ok
 %%
 %% > set("global.debug", 1234).
 %% {error, #{ reason => not_boolean }}
 %% '''
 %%
-%% @end
-%%--------------------------------------------------------------------
--spec set(ParameterKey, Value) -> Return when
-	ParameterKey :: atom() | string() | iolist() | binary() | list(),
-	Value :: term(),
-	Return :: {ok, term()} | {error, term()}.
-
-set(Key, Value) when is_atom(Key) ->
-	% TODO: pattern to remove.
-	% this pattern is ONLY for legacy purpose and should be
-	% removed after the migration to the new arweave configuration
-	% format.
-	?LOG_DEBUG([
-		{function, ?FUNCTION_NAME},
-		{module, ?MODULE},
-		{key, Key},
-		{value, Value}
-	]),
-	case arweave_config_legacy:set(Key, Value) of
-		{ok, V} ->
-			case arweave_config_spec:get_legacy(Key) of
-				{ok, PK} ->
-					_ = set(PK, Value),
-					{ok, V};
-				Else ->
-					Else
-			end;
-		Else ->
-			Else
-	end;
+-spec set(OptionKey, Value) -> Return when
+    OptionKey :: atom() | string() | binary() | list(),
+    Value :: term(),
+    Return :: ok | {error, term()}.
 set(Key, Value) ->
-	case arweave_config_parser:key(Key) of
-		{ok, Parameter} ->
-			arweave_config_spec:set(Parameter, Value);
-		Elsewise ->
-			Elsewise
-	end.
+    case arweave_config_parser:key(Key) of
+        {ok, Option} ->
+            case arweave_config_options_registry:set(Option, Value) of
+                {ok, _NewValue} -> ok;
+                Else -> Else
+            end;
+        Else ->
+            Else
+    end.
 
-%%--------------------------------------------------------------------
+%% @doc Boot-time bulk mutator. Apply a leaf map emitted by the format
+%% parsers to the options registry.
 %%
-%% == Examples ==
+%% Only canonical option_key paths are accepted. Legacy field names
+%% are handled by the legacy parsers before values reach this function.
 %%
-%% ```
-%% 10 = getm(#{}, logdir, [logging,default,path], 10).
-%% parameter_value = getm(#{}, logdir, [logging,default,path], 10).
-%% 1 = getm(#{ logdir => 1 }, logdir, [logging,default,path], 10).
-%% '''
+%% Fails fast on the first set that returns an error and reports the
+%% offending key. Map iteration order is unspecified, so when more
+%% than one entry would fail the specific one surfaced may vary
+%% between runs — callers must not rely on a particular failure being
+%% reported first.
 %%
-%%--------------------------------------------------------------------
-% getm(MapKey, Map, Parameter, Default) ->
+%% Load-only specs are locked once `runtime/0` has flipped the
+%% lifecycle flag; callers that need to mutate config after that point
+%% should use `with_test_config/1` (tests only).
+-spec load(Map) -> Return when
+    Map :: #{[term()] => term()},
+    Return :: ok | {error, {[term()], term()}}.
+load(Map) when is_map(Map) ->
+    maps:fold(
+        fun(_, _, {error, _} = Err) -> Err;
+           (Key, Value, ok) ->
+                case set(Key, Value) of
+                    ok -> ok;
+                    Else -> {error, {Key, Else}}
+                end
+        end, ok, Map).
 
-%%--------------------------------------------------------------------
-%% @doc Start arweave_config process.
-%% @end
-%%--------------------------------------------------------------------
-start_link() ->
-	gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
-
-%%--------------------------------------------------------------------
-%% @doc Switch to runtime mode. No rollback is possible there, this is
-%% a one time operation to announce arweave config is ready to deal
-%% with dynamic configuration.
-%% @end
-%%--------------------------------------------------------------------
--spec runtime() -> ok.
-
+%% @doc Switch to runtime mode. Validators run against the assembled
+%% config first; if any rejects, the transition is refused and the
+%% system stays in load mode. Once flipped, the transition is
+%% one-way.
+-spec runtime() -> ok | {error, term()}.
 runtime() ->
-	gen_server:call(?MODULE, runtime, 10_000).
+    case arweave_config_validate:run() of
+        ok ->
+            arweave_config_options_registry:set_runtime(true);
+        {error, _} = Err ->
+            Err
+    end.
 
-%%--------------------------------------------------------------------
-%% @doc Returns if arweave config is in runtime mode or not.
-%% @end
-%%--------------------------------------------------------------------
+%% @doc Whether arweave_config is in runtime mode.
 -spec is_runtime() -> boolean().
-
 is_runtime() ->
-	case ets:lookup(?MODULE, runtime) of
-		[{runtime, true}] -> true;
-		_Elsewise -> false
-	end.
+    arweave_config_options_registry:is_runtime().
 
-%%--------------------------------------------------------------------
-%% @hidden
-%% @doc `gen_server' callback.
-%% @end
-%%--------------------------------------------------------------------
-init(_) ->
-	ets:new(?MODULE, [named_table, protected]),
-	{ok, ?MODULE}.
+%% @doc Return `[{OptionKey, Value}]` for every registered spec whose
+%% option_key starts with `Prefix`. Defaults fill in for unset options.
+%% Wildcard specs are skipped (see registry's `get_all_with_prefix/1').
+-spec get_all_with_prefix(list()) -> [{list(), term()}].
+get_all_with_prefix(Prefix) ->
+    arweave_config_options_registry:get_all_with_prefix(Prefix).
 
-%%--------------------------------------------------------------------
-%% @hidden
-%% @doc `gen_server' callback.
-%% @end
-%%--------------------------------------------------------------------
-terminate(_, _) ->
-	?LOG_INFO("arweave_config process stopped").
+%% @doc Whether `Flag` is enabled. Reads `[features, Flag]` from the
+%% options registry with fallback to the catalog default for the flag.
+%% Unknown flags return `false`.
+-spec feature_enabled(atom()) -> boolean().
+feature_enabled(Flag) ->
+    arweave_config_features:enabled(Flag).
 
-%%--------------------------------------------------------------------
-%% @hidden
-%% @doc `gen_server' callback.
-%% @end
-%%--------------------------------------------------------------------
-handle_call(runtime, _From, State) ->
-	try
-		ets:insert(?MODULE, {runtime, true})
-	of
-		true -> ok;
-		_ -> ok
-	catch
-		_:_ -> ok
-	end,
-	{reply, ok, State};
-handle_call(_, _, State) -> {noreply, State}.
+%% @doc Return the list of rate-limiter group IDs used by
+%% `arweave_limiter_sup` to build one supervisor branch per group.
+%% Per-field values for a given group are read via
+%% `arweave_config:get([limiter, GroupID, Field])'.
+-spec limiter_groups() -> [atom()].
+limiter_groups() ->
+    arweave_config_options_limiter:group_ids().
 
-%%--------------------------------------------------------------------
-%% @hidden
-%% @doc `gen_server' callback.
-%% @end
-%%--------------------------------------------------------------------
-handle_cast(_, State) ->
-	{noreply, State}.
+%% @doc Log the current configuration to `?LOG_INFO`.
+-spec log() -> ok.
+log() ->
+    arweave_config_store:log().
 
-%%--------------------------------------------------------------------
-%% @hidden
-%% @doc `gen_server' callback.
-%% @end
-%%--------------------------------------------------------------------
-handle_info(_, State) -> {noreply, State}.
+%% @doc Bootstrap arweave_config from a list of CLI arguments. Loads
+%% the environment, parses the config file, parses CLI arguments, and
+%% writes the assembled state into the options registry. The `ar` application
+%% calls `normalize/0` and `runtime/0` later in its boot sequence.
+-spec bootstrap([string() | binary()]) -> ok | {error, term()}.
+bootstrap(Args) ->
+    arweave_config_bootstrap:start(Args).
 
-%%--------------------------------------------------------------------
-%% @hidden
-%% @doc `application' callback.
-%% @end
-%%--------------------------------------------------------------------
+%% @doc Normalize the assembled configuration. Promotes legacy
+%% enable/disable lists into per-flag `[features, Flag]` entries and
+%% performs other post-parse fixups.
+-spec normalize() -> ok.
+normalize() ->
+    arweave_config_normalize:run().
+
+%% @doc Print the command-line help text to standard output.
+show_cli_help() ->
+    arweave_config_help:print().
+
+%% @doc Parse a single CLI storage_module argument (data doctor): a
+%% JSON object with the same fields as a `storage_modules` config
+%% entry, e.g. `{"partition": 0, ...}` or
+%% `{"range_start": ..., "range_end": ..., ...}`. Returns
+%% `{ok, Entry}` where Entry can be passed to
+%% `set([storage_modules], [Entry])`, or `{error, Reason}`.
+parse_storage_module_arg(Arg) ->
+    case arweave_config_format_json:decode_maybe(Arg) of
+        Map when is_map(Map) ->
+            {ok, Map};
+        _ ->
+            {error, invalid_storage_module}
+    end.
+
+%% @doc Return the configured storage modules as runtime tuples
+%% `{RangeStart, RangeEnd, Packing}`.
+storage_modules() ->
+    arweave_config_options_storage_modules:storage_modules().
+
+%% @doc Return the storage modules flagged for defragmentation, as
+%% runtime tuples.
+defrag_storage_modules() ->
+    arweave_config_options_storage_modules:defrag_storage_modules().
+
+%% @doc Return the configured repack-in-place modules. With
+%% `module_only' only the source storage module of each entry is
+%% returned (`{RangeStart, RangeEnd, FromPacking}`); with `full' the
+%% full repack spec pairs
+%% `{{RangeStart, RangeEnd, FromPacking}, ToPacking}`.
+repack_modules(Shape) ->
+    arweave_config_options_repack_modules:repack_modules(Shape).
+
+%% @doc Whether this node was configured using the legacy notation
+%% (space-separated arguments / flat config.json). Stamped at
+%% bootstrap; false when bootstrap has not run. Drives the legacy
+%% bucket-notation directory naming in
+%% `ar_storage_module:disk_dir_name/1`.
+is_legacy_launch() ->
+    arweave_config:get([config_dialect]) =:= legacy.
+
+
+-spec convert_config(term(), term(), term()) -> ok | {error, term()}.
+convert_config(Format, InputFile, OutputFile) ->
+    arweave_config_convert:convert(Format, InputFile, OutputFile).
+
+%% @doc `application` callback.
 start(_StartType, _StartArgs) ->
-	?LOG_INFO("arweave_config application starting"),
+    ?LOG_INFO("arweave_config application starting"),
+    arweave_config_sup:start_link().
 
-	% start application supervisor
-	arweave_config_sup:start_link().
-
-%%--------------------------------------------------------------------
-%% @hidden
-%% @doc `application' callback.
-%% @end
-%%--------------------------------------------------------------------
+%% @doc `application` callback.
 stop(_Args) ->
-	?LOG_INFO("arweave_config application stopped"),
-	ok.
+    ?LOG_INFO("arweave_config application stopped"),
+    ok.
 
+
+%%%===================================================================
+%%% Test-only API gated under `-ifdef(AR_TEST)`.
+%%%===================================================================
+
+-ifdef(AR_TEST).
+
+%% @doc Capture the store and runtime flag as an opaque snapshot for
+%% restoration via `restore/1`, so tests can mutate config without
+%% leaking into siblings.
+-spec snapshot() -> #{store := list(), runtime := boolean()}.
+snapshot() ->
+    #{
+        store => arweave_config_store:snapshot(),
+        runtime => is_runtime()
+    }.
+
+%% @doc Restore a `snapshot/0`: replace every store row with the
+%% snapshot's rows and restore the captured runtime flag.
+-spec restore(#{store := list(), runtime := boolean()}) -> ok.
+restore(#{store := StoreSnapshot, runtime := Runtime}) when is_boolean(Runtime) ->
+    ok = arweave_config_store:restore(StoreSnapshot),
+    ok = arweave_config_options_registry:set_runtime(Runtime).
+
+%% @doc Test-only scaffolding. Snapshot the store, run `Fun`, and
+%% restore the snapshot on exit (even when `Fun` raises).
+%%
+%% Single-threaded: concurrent setters during a `with_test_config/1`
+%% call are not safe.
+%%
+%% Example:
+%% ```
+%% arweave_config:with_test_config(fun() ->
+%%     ok = arweave_config:force_config(#{[storage_modules] => [...]}),
+%%     %% test body
+%% end).
+%% '''
+-spec with_test_config(fun(() -> Result)) -> Result.
+with_test_config(Fun) when is_function(Fun, 0) ->
+    Snapshot = snapshot(),
+    try
+        Fun()
+    after
+        restore(Snapshot)
+    end.
+
+%% @doc Apply overrides via `load/1` with the runtime guard
+%% temporarily disabled. The flag is snapshotted, flipped to `false`
+%% for the duration of the load, then restored (even on raise).
+%%
+%% Map must contain per-leaf option_keys only (lists of segments).
+%% Legacy list shorthands (`storage_modules => [...]`,
+%% `{peers, Role} => [...]`, etc.) are NOT accepted — callers should
+%% use canonical option paths such as `[peers, trusted]`.
+%%
+%% Use `with_test_config/1` when the store contents must also be
+%% snapshotted and restored.
+-spec force_config(Map) -> Return when
+    Map :: #{[term()] => term()},
+    Return :: ok | {error, term()}.
+force_config(Map) when is_map(Map) ->
+    WasRuntime = is_runtime(),
+    case WasRuntime of
+        true -> ok = arweave_config_options_registry:set_runtime(false);
+        false -> ok
+    end,
+    try
+        load(Map)
+    after
+        case WasRuntime of
+            true -> ok = arweave_config_options_registry:set_runtime(true);
+            false -> ok
+        end
+    end.
+
+-endif.

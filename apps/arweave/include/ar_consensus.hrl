@@ -11,15 +11,10 @@
 -define(RANDOMX_PACKING_ROUNDS, 8 * (?PACKING_DIFFICULTY)).
 -define(RANDOMX_PACKING_ROUNDS_2_6, 8 * (?PACKING_DIFFICULTY_2_6)).
 
-%% Stop supporting the legacy non-composite packing after this number of blocks
+%% Stop supporting the legacy packing after this number of blocks
 %% passed since the fork 2.8. 365 * 24 * 60 * 60 / 128 = 246375.
 -define(SPORA_PACKING_EXPIRATION_PERIOD_BLOCKS, (246375 * 4)).
 
-%% Stop supporting the composite packing ~60 days have passed since 2.9 fork.
-%% 30 days = 30 * 24 * 60 * 60 / 128 = 20250.
--ifndef(COMPOSITE_PACKING_EXPIRATION_PERIOD_BLOCKS).
--define(COMPOSITE_PACKING_EXPIRATION_PERIOD_BLOCKS, (20250 * 2)).
--endif.
 
 %% The number of times we apply an RX hash in each RX2 lane in-between every pair
 %% of mixings.
@@ -42,12 +37,12 @@
 %% The size in bytes of the total RX2 entropy (# of lanes * scratchpad size).
 -ifdef(AR_TEST).
 %% 32_768 bytes worth of entropy.
--define(REPLICA_2_9_ENTROPY_SIZE, (4 * ?COMPOSITE_PACKING_SUB_CHUNK_SIZE)).
+-define(REPLICA_2_9_ENTROPY_SIZE, (4 * ?SUB_CHUNK_SIZE)).
 -else.
 %% 8_388_608 bytes worth of entropy.
 -define(REPLICA_2_9_ENTROPY_SIZE, (
-	?REPLICA_2_9_RANDOMX_LANE_COUNT * ?RANDOMX_SCRATCHPAD_SIZE
-)).
+          ?REPLICA_2_9_RANDOMX_LANE_COUNT * ?RANDOMX_SCRATCHPAD_SIZE
+         )).
 -endif.
 
 %% The number of entropies generated per partition.
@@ -56,7 +51,7 @@
 %% 1. Entropy Partition Size =
 %%      REPLICA_2_9_ENTROPY_COUNT * REPLICA_2_9_ENTROPY_SIZE >= PARTITION_SIZE
 %% 2. Sector Size =
-%%      REPLICA_2_9_ENTROPY_COUNT * COMPOSITE_PACKING_SUB_CHUNK_SIZE and
+%%      REPLICA_2_9_ENTROPY_COUNT * SUB_CHUNK_SIZE and
 %%      is divisible by DATA_CHUNK_SIZE
 %% This proves very convenient for chunk-by-chunk syncing.
 %%
@@ -114,11 +109,7 @@
 -endif.
 
 -ifdef(FORKS_RESET).
-	-ifdef(AR_TEST).
-		-define(MERKLE_REBASE_SUPPORT_THRESHOLD, (ar_block:strict_data_split_threshold() * 2)).
-	-else.
-		-define(MERKLE_REBASE_SUPPORT_THRESHOLD, 0).
-	-endif.
+-define(MERKLE_REBASE_SUPPORT_THRESHOLD, 0).
 -else.
 %% The threshold was determined on the mainnet at the 2.7 fork block. The chunks
 %% submitted after the threshold must adhere to a different set of validation rules.
@@ -136,8 +127,8 @@
 %% The maximum mining difficulty. 2 ^ 256. The network difficulty
 %% may theoretically be at most ?MAX_DIFF - 1.
 -define(MAX_DIFF, (
-	115792089237316195423570985008687907853269984665640564039457584007913129639936
-)).
+          115792089237316195423570985008687907853269984665640564039457584007913129639936
+         )).
 
 %% Increase the difficulty of PoA1 solutions by this multiplier (e.g. 100x).
 -ifndef(POA1_DIFF_MULTIPLIER).
@@ -164,17 +155,17 @@
 %% The minimum difficulty allowed.
 -ifndef(SPORA_MIN_DIFFICULTY).
 -define(SPORA_MIN_DIFFICULTY(Height), fun() ->
-	Forks = {
-		ar_fork:height_2_4(),
-		ar_fork:height_2_6()
-	},
-	case Forks of
-		{_Fork_2_4, Fork_2_6} when Height >= Fork_2_6 ->
-			2;
-		{Fork_2_4, _Fork_2_6} when Height >= Fork_2_4 ->
-			21
-	end
-end()).
+                                              Forks = {
+                                                       ar_fork:height_2_4(),
+                                                       ar_fork:height_2_6()
+                                                      },
+                                              case Forks of
+                                                  {_Fork_2_4, Fork_2_6} when Height >= Fork_2_6 ->
+                                                      2;
+                                                  {Fork_2_4, _Fork_2_6} when Height >= Fork_2_4 ->
+                                                      21
+                                              end
+                                      end()).
 -else.
 -define(SPORA_MIN_DIFFICULTY(_Height), ?SPORA_MIN_DIFFICULTY).
 -endif.
@@ -186,10 +177,10 @@ end()).
 %% The size of the search space - a share of the weave randomly sampled
 %% at every block. The solution must belong to the search space.
 -define(SPORA_SEARCH_SPACE_SIZE(SearchSpaceUpperBound), fun() ->
-	%% The divisor must be equal to SPORA_SEARCH_SPACE_SHARE
-	%% defined in c_src/ar_mine_randomx.h.
-	SearchSpaceUpperBound div 10 % 10% of the weave.
-end()).
+                                                                %% The divisor must be equal to SPORA_SEARCH_SPACE_SHARE
+                                                                %% defined in c_src/ar_mine_randomx.h.
+                                                                SearchSpaceUpperBound div 10 % 10% of the weave.
+                                                        end()).
 
 %% The number of contiguous subspaces of the search space, a roughly equal
 %% share of the search space is sampled from each of the subspaces.

@@ -2,21 +2,21 @@
 %%% @doc Cowboy handler to manage server-side rate limiting.
 %%%
 %%% This module provides a routing layer, mapping incoming requests
-%%% to respective rate limiter groups (RLG). 
-%%% The mapping logic can be extended in a quite complex manner if 
+%%% to respective rate limiter groups (RLG).
+%%% The mapping logic can be extended in a quite complex manner if
 %%% required, however it should be  considered that the execute function will be
 %%% called for each HTTP request.
-%%% 
+%%%
 %%% Also, there is nothing limiting the developer from calling multiple RLGs
 %%% for a single request, if necessary.
 %%%
 %%% The LimiterRef reference  in the arweave_limiter:register_or_reject_call/2
 %%% call must match one of the RLGs started by the arweave_limiter application,
 %%% otherwise a noproc error will be raised.
-%%% 
-%%% We currency use IP addresses and ports as Keys for the calling peers. 
+%%%
+%%% We currency use IP addresses and ports as Keys for the calling peers.
 %%% However, any Erlang term might be used as a key in an RLG.
-%%% 
+%%%
 -module(ar_http_iface_rate_limiter_middleware).
 
 -behaviour(cowboy_middleware).
@@ -24,64 +24,68 @@
 -export([execute/2]).
 
 -include_lib("arweave/include/ar.hrl").
--include_lib("arweave_config/include/arweave_config.hrl").
 
-execute(Req, Env) ->
-	LimiterRef = get_limiter_ref(Req),
-	PeerKey = get_peer_key(Req),
+execute(Req0, Env) ->
+    LimiterRef = get_limiter_ref(Req0),
+    PeerKey = get_peer_key(Req0),
 
-	case arweave_limiter:register_or_reject_call(LimiterRef, PeerKey) of
-		{reject, Reason, Data} ->
-			?LOG_DEBUG([{event, rate_limiter_reject}, {reason, Reason}, {data, Data}]),
-			{stop, reject(Req, Reason, Data)};
-		_ ->
-			{ok, Req, Env}
-	end.
+    case arweave_limiter:register_or_reject_call(LimiterRef, PeerKey) of
+        {reject, Reason, Data} = Reject ->
+            ?LOG_DEBUG([{event, rate_limiter_reject}, {reason, Reason}, {data, Data}]),
+            Headers = arweave_limiter_http_headers:to_http_headers(Reject),
+            Req = cowboy_req:set_resp_headers(Headers, Req0),
+            {stop, reject(Req, Headers, Reason, Data)};
+        Accept ->
+            Headers = arweave_limiter_http_headers:to_http_headers(Accept),
+            Req = cowboy_req:set_resp_headers(Headers, Req0),
+            {ok, Req, Env}
+    end.
 
 get_limiter_ref(Req) ->
-	{ok, Config} = arweave_config:get_env(),
-	LocalIPs = [config_peer_to_ip_addr(Peer) || Peer <- Config#config.local_peers],
-	PeerIP = config_peer_to_ip_addr(get_peer_key(Req)),
+    LocalIPs = [
+                arweave_util:peer_to_ip(Peer)
+                || Peer <- arweave_config:get([peers, local])
+               ],
+    PeerIP = arweave_util:peer_to_ip(get_peer_key(Req)),
 
-	case lists:member(PeerIP, LocalIPs) of
-		true ->
-			local_peers;
-		_ ->
-			Path = ar_http_iface_server:split_path(cowboy_req:path(Req)),
-			path_to_limiter_ref(Path)
-	end.
+    case lists:member(PeerIP, LocalIPs) of
+        true ->
+            local_peers;
+        _ ->
+            Path = ar_http_iface_server:split_path(cowboy_req:path(Req)),
+            path_to_limiter_ref(Path)
+    end.
 
-reject(Req, _Reason, _Data) ->
-	cowboy_req:reply(
-		429,
-		#{},
-		<<"Too Many Requests">>,
-		Req
-	).
+reject(Req, _Headers, error, _Data) ->
+    %% On errors, we don't have reasonable data to form Polli headers
+    cowboy_req:reply(503, #{}, <<"Service Unavailable">>, Req);
+reject(Req, Headers, _Reason, _Data) ->
+    cowboy_req:reply(
+      429,
+      Headers,
+      <<"Too Many Requests">>,
+      Req
+     ).
 
 -ifdef(AR_TEST).
 get_peer_key(Req) ->
-	{{A, B, C, D}, _Port} = cowboy_req:peer(Req),
-	case cowboy_req:header(<<"x-p2p-port">>, Req) of
-		undefined ->
-			{A, B, C, D};
-		PortBin ->
-			case catch binary_to_integer(PortBin) of
-				Port when is_integer(Port) ->
-					{A, B, C, D, Port};
-				_ ->
-					{A, B, C, D}
-			end
-	end.
+    {{A, B, C, D}, _Port} = cowboy_req:peer(Req),
+    case cowboy_req:header(<<"x-p2p-port">>, Req) of
+        undefined ->
+            {A, B, C, D};
+        PortBin ->
+            case catch binary_to_integer(PortBin) of
+                Port when is_integer(Port) ->
+                    {A, B, C, D, Port};
+                _ ->
+                    {A, B, C, D}
+            end
+    end.
 -else.
 get_peer_key(Req) ->
-	{{A, B, C, D}, _Port} = cowboy_req:peer(Req),
-	{A, B, C, D}.
+    {{A, B, C, D}, _Port} = cowboy_req:peer(Req),
+    {A, B, C, D}.
 -endif.
-
-config_peer_to_ip_addr({{A, B, C, D}, _Port}) -> {A, B, C, D};
-config_peer_to_ip_addr({A, B, C, D, _Port}) -> {A, B, C, D};
-config_peer_to_ip_addr({A, B, C, D}) -> {A, B, C, D}.
 
 path_to_limiter_ref([<<"chunk">> | _]) -> chunk;
 path_to_limiter_ref([<<"chunk2">> | _]) -> chunk;
@@ -102,7 +106,6 @@ path_to_limiter_ref([<<"vdf3">>, <<"session">>]) -> get_vdf_session;
 path_to_limiter_ref([<<"vdf4">>, <<"session">>]) -> get_vdf_session;
 path_to_limiter_ref([<<"vdf">>, <<"previous_session">>]) -> get_previous_vdf_session;
 path_to_limiter_ref([<<"vdf2">>, <<"previous_session">>]) -> get_previous_vdf_session;
-%% No vdf3 prev_session in ar_blacklist_middleware.hrl ?RPM_BY_PATH
 path_to_limiter_ref([<<"vdf4">>, <<"previous_session">>]) -> get_previous_vdf_session;
 path_to_limiter_ref([<<"metrics">> | _ ])-> metrics;
 path_to_limiter_ref(_) -> general.

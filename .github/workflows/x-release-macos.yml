@@ -22,6 +22,12 @@ on:
         default: "26"
         type: "string"
 
+env:
+  # Authenticate dependency clones; see x-build.yml.
+  GIT_CONFIG_COUNT: 1
+  GIT_CONFIG_KEY_0: 'url.https://x-access-token:${{ github.token }}@github.com/.insteadOf'
+  GIT_CONFIG_VALUE_0: 'https://github.com/'
+
 jobs:
   macos-release:
     runs-on:
@@ -96,8 +102,8 @@ jobs:
         run: |
           cd _extract
           ./bin/arweave foreground dummy 2>&1 \
-            | grep -Ee '^Usage: arweave-server' \
-                   -e '^Compatible with network: arweave.N.1'
+            | grep -Ee '^Unknown argument: dummy.' \
+                   -e "^ERROR: couldn't read configuration:"
 
       - name: Cleanup tests
         if: always()

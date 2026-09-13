@@ -2,7 +2,7 @@
  [
   {id, "arweave_limiter"},
   {description, "Arweave Rate Limiter"},
-  {vsn, "0.0.1"},
+  {vsn, "2.9.7-alpha1"},
   {mod, {arweave_limiter, []}},
   {env, []},
   {applications, [
@@ -18,13 +18,10 @@
                  ]},
   {modules, [
              arweave_limiter,
-             arweave_limiter_sup,
-             arweave_limiter_time,
-             arweave_limiter_metrics,
-             arweave_limiter_metrics_collector
+             arweave_limiter_group,
+             arweave_limiter_sup
             ]},
   {registered, [
-                arweave_limiter,
                 arweave_limiter_sup
                ]}
  ]}.

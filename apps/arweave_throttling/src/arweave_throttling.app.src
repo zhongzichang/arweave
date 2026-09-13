@@ -1,0 +1,27 @@
+{application, arweave_throttling,
+ [
+  {id, "arweave_throttling"},
+  {description, "Arweave client-side request throttling"},
+  {vsn, "2.9.7-alpha1"},
+  {mod, {arweave_throttling, []}},
+  {env, []},
+  {applications, [
+                  kernel,
+                  stdlib,
+                  sasl,
+                  prometheus,
+                  prometheus_cowboy,
+                  prometheus_process_collector,
+                  prometheus_httpd,
+                  runtime_tools,
+                  arweave_metrics
+                 ]},
+  {modules, [
+             arweave_throttling,
+             arweave_throttling_group,
+             arweave_throttling_sup
+            ]},
+  {registered, [
+                arweave_throttling_sup
+               ]}
+ ]}.

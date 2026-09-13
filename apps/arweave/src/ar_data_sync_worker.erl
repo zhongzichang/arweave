@@ -1,358 +1,280 @@
-%%% @doc A process fetching the weave data from the network and from the local
-%%% storage modules, one chunk (or a range of chunks) at a time. The workers
-%%% are coordinated by ar_data_sync_coordinator. The workers do not update the
-%%% storage - updates are handled by ar_data_sync_* processes.
+%%% @doc Transient network-sync fetch worker.
+%%%
+%%% One process per dispatched task, `spawn_monitor`'d by `ar_sync_dispatcher`.
+%%% It performs the chunk HTTP request(s) for the task's byte range and hands
+%%% each fetched chunk to `ar_data_sync` for storage, then reports the outcome
+%%% to `ar_peers` and exits.
+%%%
+%%% Exit contract (read by the dispatcher's `'DOWN'` handler): `normal` covers
+%%% both a fully-processed range and a definitive fetch failure (the range is
+%%% simply re-discovered later); only a genuine crash exits abnormally. The
+%%% dispatcher updates all scheduling/back-pressure/capacity accounting on
+%%%  `'DOWN'` regardless of outcome.
+%%%
+%%% Chunk-cache and disk-space is checkedby `ar_sync_dispatcher`
+%%% before spawn, so this worker does not re-check it.
 -module(ar_data_sync_worker).
+-test_category([fast]).
 
--behaviour(gen_server).
-
--export([start_link/2]).
-
--export([init/1, handle_cast/2, handle_call/3, handle_info/2, terminate/2]).
+-export([run/2]).
 
 -include_lib("arweave/include/ar.hrl").
--include_lib("arweave_config/include/arweave_config.hrl").
 -include_lib("arweave/include/ar_data_sync.hrl").
 
--record(state, {
-	name = undefined,
-	request_packed_chunks = false
-}).
-
- %% # of messages to cast to ar_data_sync at once. Each message carries at least 1 chunk worth
- %% of data (256 KiB). Since there are dozens or hundreds of workers, if each one posts too
- %% many messages at once it can overload the available memory.
--define(READ_RANGE_MESSAGES_PER_BATCH, 40).
-
 %%%===================================================================
-%%% Public interface.
+%%% Entry point.
 %%%===================================================================
 
-start_link(Name, Mode) ->
-	gen_server:start_link({local, Name}, ?MODULE, {Name, Mode}, []).
+%% @doc Fetch the task's range and rate the peer. `Concurrency`
+%% is the peer's in-flight count at dispatch.
+run(#sync_task{ start_offset = Start, end_offset = End, peer = Peer } = Task,
+    Concurrency) ->
+    {ElapsedUs, Result} = timer:tc(fun() -> fetch_range(Task) end),
+    ar_peers:rate_fetched_data(
+      Peer, chunk, Result, ElapsedUs, End - Start, Concurrency),
+    ok.
 
 %%%===================================================================
-%%% Generic server callbacks.
+%%% Internal.
 %%%===================================================================
 
-init({Name, Mode}) ->
-	?LOG_INFO([{event, init}, {module, ?MODULE}, {name, Name}]),
-	{ok, Config} = arweave_config:get_env(),
-	case Mode of
-		sync ->
-			gen_server:cast(self(), pull);
-		_ ->
-			ok
-	end,
-	{ok, #state{
-		name = Name,
-		request_packed_chunks = Config#config.data_sync_request_packed_chunks
-	}}.
+fetch_range(#sync_task{ start_offset = Start, end_offset = End })
+  when Start >= End ->
+    ok;
+fetch_range(#sync_task{ retry_count = 0, peer = Peer,
+                        start_offset = Start, end_offset = End }) ->
+    ?LOG_INFO([{event, fetch_range_retries_exhausted},
+               {peer, arweave_util:format_peer(Peer)},
+               {start_offset, Start}, {end_offset, End}]),
+    {error, timeout};
+fetch_range(#sync_task{ start_offset = Start, end_offset = End, peer = Peer,
+                        store_id = TargetStoreID, retry_count = RetryCount } = Task) ->
+    Start2 = ar_tx_blacklist:get_next_not_blacklisted_byte(Start + 1),
+    Byte = Start2 - 1,
+    IsRecorded = ar_sync_record:is_recorded(Byte + 1, ar_data_sync, TargetStoreID),
+    case {Byte >= End, IsRecorded} of
+        {true, _} ->
+            ok;
+        {_, {true, _}} ->
+            ok;
+        _ ->
+            Packing = get_target_packing(TargetStoreID),
+            case ar_http_iface_client:get_chunk_binary(Peer, Start2, Packing) of
+                {ok, #{ chunk := Chunk } = Proof, _Time, _TransferSize} ->
+                    %% In case we fetched a packed small chunk we may skip some
+                    %% chunks by continuing with Start2 + byte_size(Chunk) — the
+                    %% skipped chunks are requested later.
+                    Start3 = ar_block:get_chunk_padded_offset(
+                               Start2 + byte_size(Chunk)) + 1,
+                    ar_data_sync:store_fetched_chunk(
+                      TargetStoreID, Peer, Byte, Proof),
+                    ar_data_sync:increment_chunk_cache_size(),
+                    fetch_range(Task#sync_task{ start_offset = Start3 });
+                {error, timeout} ->
+                    ?LOG_DEBUG([{event, timeout_fetching_chunk},
+                                {peer, arweave_util:format_peer(Peer)},
+                                {start_offset, Start2}, {end_offset, End}]),
+                    timer:sleep(1000),
+                    fetch_range(Task#sync_task{ retry_count = RetryCount - 1 });
+                {error, {ok, {{<<"404">>, _}, _, _, _, _}} = Reason} ->
+                    {error, Reason};
+                {error, Reason} ->
+                    ar_http_iface_client:log_failed_request({error, Reason}, [
+                                                                              {event, failed_to_fetch_chunk},
+                                                                              {peer, arweave_util:format_peer(Peer)},
+                                                                              {start_offset, Start2}, {end_offset, End},
+                                                                              {reason, io_lib:format("~p", [Reason])}]),
+                    {error, Reason}
+            end
+    end.
 
-handle_call(Request, _From, State) ->
-	?LOG_WARNING([{event, unhandled_call}, {module, ?MODULE}, {request, Request}]),
-	{reply, ok, State}.
-
-handle_cast({read_range, Args}, State) ->
-	case read_range(Args) of
-		recast ->
-			ok;
-		ReadResult ->
-			ar_chunk_copy:task_completed(State#state.name, ReadResult, Args)
-	end,
-	{noreply, State};
-
-handle_cast(pull, State) ->
-	%% Shuffle list to distribute peer load across workers.
-	Peers = ar_util:shuffle_list(ar_peer_worker:get_all_peers()),
-	case try_take_one(Peers) of
-		{ok, SyncTask} ->
-			run_sync_range(SyncTask, State),
-			%% Loop: immediately try to pull again.
-			gen_server:cast(self(), pull),
-			{noreply, State};
-		none ->
-			%% No peer has work right now. Retry after a short delay.
-			ar_util:cast_after(500 + rand:uniform(1000), self(), pull),
-			{noreply, State}
-	end;
-
-handle_cast({sync_range, SyncTask}, State) ->
-	#sync_task{ start_offset = Start, end_offset = End, peer = Peer,
-			footprint_key = FootprintKey } = SyncTask,
-	{ElapsedUs, SyncResult} = timer:tc(fun() -> sync_range(SyncTask, State) end),
-	case SyncResult of
-		recast -> ok;
-		_ ->
-			ar_peer_worker:task_completed(Peer, self(), FootprintKey,
-				SyncResult, ElapsedUs, End - Start)
-	end,
-	{noreply, State};
-
-handle_cast(Cast, State) ->
-	?LOG_WARNING([{event, unhandled_cast}, {module, ?MODULE}, {cast, Cast}]),
-	{noreply, State}.
-
-try_take_one([]) ->
-	none;
-try_take_one([{_Peer, PeerPid} | Rest]) ->
-	case ar_peer_worker:take_one(PeerPid) of
-		{task, SyncTask} ->
-			{ok, SyncTask};
-		none ->
-			try_take_one(Rest)
-	end.
-
-%% @doc Execute one sync_range task and report completion to the owning
-%% peer worker. On recast (cache full / disk full / retryable HTTP error)
-%% sync_range internally schedules a self-cast_after; we leave the slot
-%% claimed and in_flight_count incremented at the peer worker. The
-%% scheduled retry lands in the legacy `{sync_range, _}` cast handler,
-%% which will report completion when the retry succeeds (or definitively
-%% fails after exhausting retries — see sync_range/2 retry-zero clause
-%% which returns {error, timeout} directly, not recast).
-run_sync_range(SyncTask, State) ->
-	#sync_task{ start_offset = Start, end_offset = End, peer = Peer,
-			footprint_key = FootprintKey } = SyncTask,
-	{ElapsedUs, SyncResult} = timer:tc(fun() -> sync_range(SyncTask, State) end),
-	case SyncResult of
-		recast ->
-			%% Slot stays claimed; eventual retry will report completion.
-			ok;
-		_ ->
-			ar_peer_worker:task_completed(Peer, self(), FootprintKey, SyncResult,
-				ElapsedUs, End - Start)
-	end,
-	ok.
-
-handle_info(_Message, State) ->
-	{noreply, State}.
-
-terminate(Reason, _State) ->
-	?LOG_INFO([{event, terminate}, {module, ?MODULE}, {reason, io_lib:format("~p", [Reason])}]),
-	ok.
+%% @doc Read the target packing for this store, gated by the
+%% [sync, request_packed_chunks] config (a cheap ETS read).
+get_target_packing(StoreID) ->
+    case arweave_config:get([sync, request_packed_chunks]) of
+        true -> ar_storage_module:get_packing(StoreID);
+        false -> any
+    end.
 
 %%%===================================================================
-%%% Private functions.
+%%% Tests.
 %%%===================================================================
 
-read_range({Start, End, _OriginStoreID, _TargetStoreID})
-		when Start >= End ->
-	ok;
-read_range({Start, End, _OriginStoreID, TargetStoreID} = Args) ->
-	case ar_data_sync:is_chunk_cache_full() of
-		false ->
-			case ar_data_sync:is_disk_space_sufficient(TargetStoreID) of
-				true ->
-					?LOG_DEBUG([{event, read_range}, {pid, self()},
-						{size_mb, (End - Start) / ?MiB}, {args, Args}]),
-					read_range2(?READ_RANGE_MESSAGES_PER_BATCH, Args);
-				_ ->
-					ar_util:cast_after(30000, self(), {read_range, Args}),
-					recast
-			end;
-		_ ->
-			ar_util:cast_after(200, self(), {read_range, Args}),
-			recast
-	end.
+-ifdef(AR_TEST).
+-include_lib("eunit/include/eunit.hrl").
 
-read_range2(0, Args) ->
-	ar_util:cast_after(1000, self(), {read_range, Args}),
-	recast;
-read_range2(_MessagesRemaining,
-		{Start, End, _OriginStoreID, _TargetStoreID})
-		when Start >= End ->
-	ok;
-read_range2(MessagesRemaining, {Start, End, OriginStoreID, TargetStoreID}) ->
-	CheckIsRecordedAlready =
-		case ar_sync_record:is_recorded(Start + 1, ar_data_sync, TargetStoreID) of
-			{true, _} ->
-				case ar_sync_record:get_next_unsynced_interval(Start, End, ar_data_sync,
-						TargetStoreID) of
-					not_found ->
-						ok;
-					{_, Start2} ->
-						read_range2(MessagesRemaining,
-								{Start2, End, OriginStoreID, TargetStoreID})
-				end;
-			_ ->
-				false
-		end,
-	IsRecordedInTheSource =
-		case CheckIsRecordedAlready of
-			ok ->
-				ok;
-			recast ->
-				ok;
-			false ->
-				case ar_sync_record:is_recorded(Start + 1, ar_data_sync, OriginStoreID) of
-					{true, Packing} ->
-						{true, Packing};
-					SyncRecordReply ->
-						?LOG_ERROR([{event, cannot_read_requested_range},
-								{origin_store_id, OriginStoreID},
-								{missing_start_offset, Start + 1},
-								{end_offset, End},
-								{target_store_id, TargetStoreID},
-								{sync_record_reply, io_lib:format("~p", [SyncRecordReply])}])
-				end
-		end,
-	ReadChunkMetadata =
-		case IsRecordedInTheSource of
-			ok ->
-				ok;
-			{true, Packing2} ->
-				{Packing2, ar_data_sync:get_chunk_by_byte(Start + 1, OriginStoreID)}
-		end,
-	PaddedEnd = ar_block:get_chunk_padded_offset(End),
-	case ReadChunkMetadata of
-		ok ->
-			ok;
-		{_, {error, invalid_iterator}} ->
-			%% get_chunk_by_byte looks for a key with the same prefix or the next
-			%% prefix. Therefore, if there is no such key, it does not make sense to
-			%% look for any key smaller than the prefix + 2 in the next iteration.
-			PrefixSpaceSize = trunc(math:pow(2,
-					?OFFSET_KEY_BITSIZE - ?OFFSET_KEY_PREFIX_BITSIZE)),
-			Start3 = ((Start div PrefixSpaceSize) + 2) * PrefixSpaceSize,
-			read_range2(MessagesRemaining,
-					{Start3, End, OriginStoreID, TargetStoreID});
-		{_, {error, Reason}} ->
-			?LOG_ERROR([{event, failed_to_query_chunk_metadata}, {offset, Start + 1},
-					{reason, io_lib:format("~p", [Reason])}]);
-		{_, {ok, _Key, {AbsoluteOffset, _, _, _, _, _, _}}} when AbsoluteOffset > PaddedEnd ->
-			ok;
-		{Packing3, {ok, _Key, {AbsoluteOffset, ChunkDataKey, TXRoot, DataRoot, TXPath,
-				RelativeOffset, ChunkSize}}} ->
-			ReadChunk = ar_data_sync:read_chunk(AbsoluteOffset, ChunkDataKey, OriginStoreID),
-			case ReadChunk of
-				not_found ->
-					ar_data_sync:invalidate_bad_data_record(
-						AbsoluteOffset, ChunkSize, OriginStoreID, read_range_chunk_not_found),
-					read_range2(MessagesRemaining-1,
-							{Start + ChunkSize, End, OriginStoreID, TargetStoreID});
-				{error, Error} ->
-					?LOG_ERROR([{event, failed_to_read_chunk},
-							{absolute_end_offset, AbsoluteOffset},
-							{chunk_data_key, ar_util:encode(ChunkDataKey)},
-							{reason, io_lib:format("~p", [Error])}]),
-					read_range2(MessagesRemaining,
-							{Start + ChunkSize, End, OriginStoreID, TargetStoreID});
-				{ok, {Chunk, DataPath}} ->
-					case ar_sync_record:is_recorded(AbsoluteOffset, ar_data_sync,
-							OriginStoreID) of
-						{true, Packing3} ->
-							ar_data_sync:increment_chunk_cache_size(),
-							UnpackedChunk =
-								case Packing3 of
-									unpacked ->
-										Chunk;
-									_ ->
-										none
-								end,
-							Args = {DataRoot, AbsoluteOffset, TXPath, TXRoot, DataPath,
-									Packing3, RelativeOffset, ChunkSize, Chunk,
-									UnpackedChunk, TargetStoreID, ChunkDataKey},
-							gen_server:cast(ar_data_sync:name(TargetStoreID),
-									{pack_and_store_chunk, Args}),
-							read_range2(MessagesRemaining-1,
-								{Start + ChunkSize, End, OriginStoreID, TargetStoreID});
-						{true, _DifferentPacking} ->
-							%% Unlucky timing - the chunk should have been repacked
-							%% in the meantime.
-							read_range2(MessagesRemaining,
-									{Start, End, OriginStoreID, TargetStoreID});
-						Reply ->
-							?LOG_ERROR([{event, chunk_record_not_found},
-									{absolute_end_offset, AbsoluteOffset},
-									{ar_sync_record_reply, io_lib:format("~p", [Reply])}]),
-							read_range2(MessagesRemaining,
-									{Start + ChunkSize, End, OriginStoreID, TargetStoreID})
-					end
-			end
-	end.
+run_test_() ->
+    {foreach, fun() -> ok end, fun(_) -> ok end, [
+                                                  %% No HTTP fetch:
+                                                  fun test_empty_range_skips_fetch/0,
+                                                  fun test_blacklist_past_end_skips_fetch/0,
+                                                  fun test_already_recorded_skips_fetch/0,
+                                                  %% HTTP fetch outcomes:
+                                                  fun test_success_stores_and_rates_ok/0,
+                                                  fun test_multi_chunk_stores_each/0,
+                                                  fun test_404_rates_error_and_does_not_store/0,
+                                                  fun test_generic_error_logs_and_rates_error/0,
+                                                  fun test_timeout_retries_then_succeeds/0,
+                                                  fun test_retries_exhausted_rates_error/0,
+                                                  %% Packing selection:
+                                                  fun test_packed_request_selects_store_packing/0
+                                                 ]}.
 
-sync_range(#sync_task{ start_offset = Start, end_offset = End }, _State) when Start >= End ->
-	ok;
-sync_range(#sync_task{ start_offset = Start, end_offset = End, peer = Peer,
-		retry_count = 0 }, _State) ->
-	?LOG_WARNING([{event, sync_range_retries_exhausted},
-				{peer, ar_util:format_peer(Peer)},
-				{start_offset, Start}, {end_offset, End}]),
-	{error, timeout};
-sync_range(#sync_task{ start_offset = Start, end_offset = End, peer = Peer,
-		store_id = TargetStoreID, retry_count = RetryCount } = SyncTask, State) ->
-	IsChunkCacheFull =
-		case ar_data_sync:is_chunk_cache_full() of
-			true ->
-				ar_util:cast_after(500, self(), {sync_range, SyncTask}),
-				true;
-			false ->
-				false
-		end,
-	IsDiskSpaceSufficient =
-		case IsChunkCacheFull of
-			false ->
-				case ar_data_sync:is_disk_space_sufficient(TargetStoreID) of
-					true ->
-						true;
-					_ ->
-						ar_util:cast_after(30000, self(), {sync_range, SyncTask}),
-						false
-				end;
-			true ->
-				false
-		end,
-	case IsDiskSpaceSufficient of
-		false ->
-			recast;
-		true ->
-			Start2 = ar_tx_blacklist:get_next_not_blacklisted_byte(Start + 1),
-			Byte = Start2 - 1,
-			IsRecorded = ar_sync_record:is_recorded(Byte + 1, ar_data_sync, TargetStoreID),
-			case {Byte >= End, IsRecorded} of
-				{true, _} ->
-					ok;
-				{_, {true, _}} ->
-					ok;
-				_ ->
-					Packing = get_target_packing(TargetStoreID, State#state.request_packed_chunks),
-					case ar_http_iface_client:get_chunk_binary(Peer, Start2, Packing) of
-						{ok, #{ chunk := Chunk } = Proof, _Time, _TransferSize} ->
-							%% In case we fetched a packed small chunk,
-							%% we may potentially skip some chunks by
-							%% continuing with Start2 + byte_size(Chunk) - the skip
-							%% chunks will be then requested later.
-							Start3 = ar_block:get_chunk_padded_offset(
-									Start2 + byte_size(Chunk)) + 1,
-							ar_data_sync:store_fetched_chunk(
-									TargetStoreID, Peer, Byte, Proof),
-							ar_data_sync:increment_chunk_cache_size(),
-							sync_range(
-								SyncTask#sync_task{ start_offset = Start3 },
-								State);
-						{error, timeout} ->
-							?LOG_DEBUG([{event, timeout_fetching_chunk},
-									{peer, ar_util:format_peer(Peer)},
-									{start_offset, Start2}, {end_offset, End}]),
-							SyncTask2 = SyncTask#sync_task{
-								retry_count = RetryCount - 1 },
-							ar_util:cast_after(1000, self(), {sync_range, SyncTask2}),
-							recast;
-						{error, {ok, {{<<"404">>, _}, _, _, _, _}} = Reason} ->
-							{error, Reason};
-						{error, Reason} ->
-							ar_http_iface_client:log_failed_request({error, Reason}, [
-								{event, failed_to_fetch_chunk},
-								{peer, ar_util:format_peer(Peer)},
-								{start_offset, Start2}, {end_offset, End},
-								{reason, io_lib:format("~p", [Reason])}]),
-							{error, Reason}
-					end
-			end
-	end.
+test_empty_range_skips_fetch() ->
+    run_with_mocks(fun(_, _, _) -> error(should_not_fetch) end, fun() ->
+                                                                        ?assertEqual(ok, run(task(100, 100), 5)),
+                                                                        ?assertEqual(0, meck:num_calls(ar_http_iface_client, get_chunk_binary, '_')),
+                                                                        ?assertEqual(0, meck:num_calls(ar_data_sync, store_fetched_chunk, '_')),
+                                                                        ?assert(meck:called(ar_peers, rate_fetched_data,
+                                                                                            [test_peer(), chunk, ok, '_', 0, 5]))
+                                                                end).
 
-get_target_packing(StoreID, true) ->
-	ar_storage_module:get_packing(StoreID);
-get_target_packing(_StoreID, false) ->
-	any.
+test_blacklist_past_end_skips_fetch() ->
+    run_with_mocks(fun(_, _, _) -> error(should_not_fetch) end,
+                   [{ar_tx_blacklist, get_next_not_blacklisted_byte, fun(_) -> 1000 end}],
+                   fun() ->
+                           ?assertEqual(ok, run(task(0, 100), 5)),
+                           ?assertEqual(0,
+                                        meck:num_calls(ar_http_iface_client, get_chunk_binary, '_'))
+                   end).
+
+test_already_recorded_skips_fetch() ->
+    run_with_mocks(fun(_, _, _) -> error(should_not_fetch) end,
+                   [{ar_sync_record, is_recorded, fun(_, _, _) -> {true, unpacked} end}],
+                   fun() ->
+                           ?assertEqual(ok, run(task(0, 100), 5)),
+                           ?assertEqual(0,
+                                        meck:num_calls(ar_http_iface_client, get_chunk_binary, '_')),
+                           ?assertEqual(0,
+                                        meck:num_calls(ar_data_sync, store_fetched_chunk, '_'))
+                   end).
+
+test_success_stores_and_rates_ok() ->
+    run_with_mocks(fun(_, _, _) -> chunk_reply(100) end, fun() ->
+                                                                 ?assertEqual(ok, run(task(0, 100), 5)),
+                                                                 ?assertEqual(1, meck:num_calls(ar_data_sync, store_fetched_chunk, '_')),
+                                                                 ?assert(meck:called(ar_peers, rate_fetched_data,
+                                                                                     [test_peer(), chunk, ok, '_', 100, 5]))
+                                                         end).
+
+test_multi_chunk_stores_each() ->
+    run_with_mocks(fun(_, _, _) -> chunk_reply(100) end, fun() ->
+                                                                 ?assertEqual(ok, run(task(0, 300), 5)),
+                                                                 ?assertEqual(3, meck:num_calls(ar_http_iface_client, get_chunk_binary, '_')),
+                                                                 ?assertEqual(3, meck:num_calls(ar_data_sync, store_fetched_chunk, '_')),
+                                                                 ?assert(meck:called(ar_peers, rate_fetched_data,
+                                                                                     [test_peer(), chunk, ok, '_', 300, 5]))
+                                                         end).
+
+test_404_rates_error_and_does_not_store() ->
+    run_with_mocks(
+      fun(_, _, _) ->
+              {error, {ok, {{<<"404">>, <<>>}, [], <<>>, undefined, undefined}}}
+      end,
+      fun() ->
+              ?assertEqual(ok, run(task(0, 100), 5)),
+              ?assertEqual(0,
+                           meck:num_calls(ar_data_sync, store_fetched_chunk, '_')),
+              ?assertEqual(0,
+                           meck:num_calls(ar_http_iface_client, log_failed_request, '_')),
+              ?assert(meck:called(ar_peers, rate_fetched_data,
+                                  ['_', chunk, {error, '_'}, '_', '_', '_']))
+      end).
+
+test_generic_error_logs_and_rates_error() ->
+    run_with_mocks(fun(_, _, _) -> {error, econnrefused} end, fun() ->
+                                                                      ?assertEqual(ok, run(task(0, 100), 5)),
+                                                                      ?assertEqual(0, meck:num_calls(ar_data_sync, store_fetched_chunk, '_')),
+                                                                      ?assertEqual(1,
+                                                                                   meck:num_calls(ar_http_iface_client, log_failed_request, '_')),
+                                                                      ?assert(meck:called(ar_peers, rate_fetched_data,
+                                                                                          ['_', chunk, {error, econnrefused}, '_', '_', '_']))
+                                                              end).
+
+test_timeout_retries_then_succeeds() ->
+    Counter = counters:new(1, []),
+    GetChunk = fun(_, _, _) ->
+                       case counters:get(Counter, 1) of
+                           0 -> counters:add(Counter, 1, 1), {error, timeout};
+                           _ -> chunk_reply(100)
+                       end
+               end,
+    run_with_mocks(GetChunk, fun() ->
+                                     ?assertEqual(ok, run(task(0, 100), 5)),
+                                     ?assertEqual(2, meck:num_calls(ar_http_iface_client, get_chunk_binary, '_')),
+                                     ?assertEqual(1, meck:num_calls(ar_data_sync, store_fetched_chunk, '_')),
+                                     ?assert(meck:called(ar_peers, rate_fetched_data,
+                                                         [test_peer(), chunk, ok, '_', 100, 5]))
+                             end).
+
+test_retries_exhausted_rates_error() ->
+    run_with_mocks(fun(_, _, _) -> error(should_not_fetch) end, fun() ->
+                                                                        Task = (task(0, 100))#sync_task{ retry_count = 0 },
+                                                                        ?assertEqual(ok, run(Task, 5)),
+                                                                        ?assertEqual(0,
+                                                                                     meck:num_calls(ar_http_iface_client, get_chunk_binary, '_')),
+                                                                        ?assert(meck:called(ar_peers, rate_fetched_data,
+                                                                                            [test_peer(), chunk, {error, timeout}, '_', 100, 5]))
+                                                                end).
+
+test_packed_request_selects_store_packing() ->
+    Packing = {replica_2_9, <<"addr">>},
+    run_with_mocks(fun(_, _, _) -> chunk_reply(100) end,
+                   [{arweave_config, get,
+                     fun([sync, request_packed_chunks]) -> true;
+                        (K) -> meck:passthrough([K]) end},
+                    {ar_storage_module, get_packing, fun(_) -> Packing end}],
+                   fun() ->
+                           ?assertEqual(ok, run(task(0, 100), 5)),
+                           ?assert(meck:called(ar_http_iface_client, get_chunk_binary,
+                                               ['_', '_', Packing]))
+                   end).
+
+%%%-------------------------------------------------------------------
+%%% Test helpers.
+%%%-------------------------------------------------------------------
+
+test_peer() -> {1, 2, 3, 4, 1984}.
+
+task(Start, End) ->
+    #sync_task{ start_offset = Start, end_offset = End, peer = test_peer(),
+                store_id = store1, footprint_key = none }.
+
+chunk_reply(Size) ->
+    {ok, #{ chunk => <<0:(Size * 8)>> }, 1, Size}.
+
+run_with_mocks(GetChunkFun, TestFun) ->
+    run_with_mocks(GetChunkFun, [], TestFun).
+
+%% Install the default mocks (an isolated, no-op fetch environment), let
+%% ExtraMocks override any default by {Module, Function}, run TestFun, unload.
+run_with_mocks(GetChunkFun, ExtraMocks, TestFun) ->
+    Defaults = [
+                {arweave_config, get,
+                 fun([sync, request_packed_chunks]) -> false;
+                    (K) -> meck:passthrough([K]) end},
+                {ar_tx_blacklist, get_next_not_blacklisted_byte, fun(X) -> X end},
+                {ar_sync_record, is_recorded, fun(_, _, _) -> false end},
+                {ar_block, get_chunk_padded_offset, fun(X) -> X end},
+                {ar_http_iface_client, get_chunk_binary, GetChunkFun},
+                {ar_http_iface_client, log_failed_request, fun(_, _) -> ok end},
+                {ar_data_sync, store_fetched_chunk, fun(_, _, _, _) -> ok end},
+                {ar_data_sync, increment_chunk_cache_size, fun() -> ok end},
+                {ar_peers, rate_fetched_data, fun(_, _, _, _, _, _) -> ok end}
+               ],
+    Mocks = merge_mocks(Defaults, ExtraMocks),
+    Modules = lists:usort([M || {M, _, _} <- Mocks]),
+    [ar_test_util:new_mock(M, [passthrough]) || M <- Modules],
+    [ar_test_util:mock_function(M, F, Impl) || {M, F, Impl} <- Mocks],
+    try TestFun()
+    after [ar_test_util:unmock_module(M) || M <- Modules]
+    end.
+
+%% Merge mock specs keyed by {Module, Function}; later specs (ExtraMocks) win.
+merge_mocks(Defaults, Extra) ->
+    Keyed = lists:foldl(
+              fun({M, F, _} = Spec, Acc) -> Acc#{ {M, F} => Spec } end,
+              #{}, Defaults ++ Extra),
+    maps:values(Keyed).
+
+-endif.

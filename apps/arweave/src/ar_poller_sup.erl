@@ -7,29 +7,28 @@
 -export([init/1]).
 
 -include_lib("arweave/include/ar_sup.hrl").
--include_lib("arweave_config/include/arweave_config.hrl").
 
 %%%===================================================================
 %%% Public API.
 %%%===================================================================
 
 start_link() ->
-	supervisor:start_link({local, ?MODULE}, ?MODULE, []).
+    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 %% ===================================================================
 %% Supervisor callbacks.
 %% ===================================================================
 
 init([]) ->
-	{ok, Config} = arweave_config:get_env(),
-	Children = lists:map(
-		fun(Num) ->
-			Name = list_to_atom("ar_poller_worker_" ++ integer_to_list(Num)),
-			{Name, {ar_poller_worker, start_link, [Name]}, permanent, ?SHUTDOWN_TIMEOUT,
-					worker, [ar_poller_worker]}
-		end,
-		lists:seq(1, Config#config.block_pollers)
-	),
-	Workers = [element(1, El) || El <- Children],
-	Children2 = [?CHILD_WITH_ARGS(ar_poller, worker, ar_poller, [ar_poller, Workers]) | Children],
-	{ok, {{one_for_one, 5, 10}, Children2}}.
+    BlockPollers = arweave_config:get([gossip, block, pollers]),
+    Children = lists:map(
+                 fun(Num) ->
+                         Name = list_to_atom("ar_poller_worker_" ++ integer_to_list(Num)),
+                         {Name, {ar_poller_worker, start_link, [Name]}, permanent, ?SHUTDOWN_TIMEOUT,
+                          worker, [ar_poller_worker]}
+                 end,
+                 lists:seq(1, BlockPollers)
+                ),
+    Workers = [element(1, El) || El <- Children],
+    Children2 = [?CHILD_WITH_ARGS(ar_poller, worker, ar_poller, [ar_poller, Workers]) | Children],
+    {ok, {{one_for_one, 5, 10}, Children2}}.

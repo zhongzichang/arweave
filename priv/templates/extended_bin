@@ -24,6 +24,20 @@ esac
 export ERL_EPMD_ADDRESS="${ERL_EPMD_ADDRESS:=127.0.0.1,::1}"
 export ERL_EPMD_PORT="${ERL_EPMD_PORT:=4369}"
 
+######################################################################
+# Workspace isolation. When ARWEAVE_NAMESPACE is set, give this node a
+# unique name so several checkouts can run side by side on one host
+# without colliding on EPMD / node names. Without it, behaviour is
+# unchanged. An explicit ARNODE / NODE_NAME always wins.
+# See doc/workspaces.md and bin/dev/ws.
+######################################################################
+if [ -f "$(dirname "$0")/dev/lib-namespace.sh" ]; then
+    . "$(dirname "$0")/dev/lib-namespace.sh"
+fi
+if [ -n "${ARWEAVE_NS_SUFFIX:-}" ]; then
+    export ARNODE="${ARNODE:-arweave${ARWEAVE_NS_SUFFIX}@127.0.0.1}"
+fi
+
 # http://erlang.org/doc/man/run_erl.html
 # If defined, disables input and output flow control for the pty
 # opend by run_erl. Useful if you want to remove any risk of accidentally
@@ -106,7 +120,9 @@ extract_release_from_rebar_config() {
 }
 
 # Make the value available to variable substitution calls below
-# The following variables are usually hardcoded by rebar3
+# Most of The following variables are usually hardcoded by rebar3
+# if they are empty, this means the entry-point is used from
+# the sources.
 export REL_NAME="{{ release_name }}"
 export REL_VSN="{{ release_version }}"
 export RELEASE_NAME="{{ release_name }}"
@@ -156,7 +172,22 @@ then
 	fi
 fi
 
-export REL_DIR="${RELEASE_ROOT_DIR}/releases/${REL_VSN}"
+# ROOTDIR is what the Erlang VM uses for code:root_dir(), the boot
+# script's $ROOT lib resolution, and nodetool/escript lookups. On a
+# pre-built release install it is this directory (real lib/ and
+# releases/ next to bin/). On a source checkout it is the rebar3
+# release under _build, so the VM loads boot files and code from their
+# real locations — no root-level lib/releases symlinks, and no delayed
+# cleanup racing the next boot's file reads. The process CWD stays at
+# the project root (see the cd before command dispatch), so relative
+# config files, screenlogs, and data paths are unaffected.
+if [ -d "${RELEASE_ROOT_DIR}/releases/${REL_VSN}" ] && [ ! -L "${RELEASE_ROOT_DIR}/releases" ]; then
+    export ROOTDIR="$RELEASE_ROOT_DIR"
+else
+    export ROOTDIR="${BUILD_DIR}/default/rel/${REL_NAME}"
+fi
+
+export REL_DIR="${ROOTDIR}/releases/${REL_VSN}"
 export RUNNER_LOG_DIR="${RUNNER_LOG_DIR:-$RELEASE_ROOT_DIR/logs}"
 export ESCRIPT_NAME="${ESCRIPT_NAME-$SCRIPT}"
 
@@ -196,14 +227,6 @@ _error () {
 ######################################################################
 # Arweave Section
 ######################################################################
-
-# Not all systems supports randomx jit
-if test ${SYSTEM_NAME} = "Darwin"
-then
-    export RANDOMX_JIT="disable randomx_jit"
-else
-    export RANDOMX_JIT=""
-fi
 
 # This variable is the main own used to start arweave
 ARWEAVE_OPTS="-run ar main ${RANDOM_JIT}"
@@ -272,21 +295,17 @@ arweave_check_hugepages() {
 arweave_benchmark() {
     case "${1}"
     in
-	2.9)
-	    shift
-	    arweave_benchmark_2_9 ${*}
-	    ;;
 	hash)
 	    shift
-	    arweave_benchmark_hash ${*}
+	    arweave_benchmark_hash "$@"
 	    ;;
 	packing)
 	    shift
-	    arweave_benchmark_packing ${*}
+	    arweave_benchmark_packing "$@"
 	    ;;
 	vdf)
 	    shift
-	    arweave_benchmark_vdf ${*}
+	    arweave_benchmark_vdf "$@"
 	    ;;
 	*)
 	    arweave_benchmark_help
@@ -295,33 +314,27 @@ arweave_benchmark() {
 }
 
 arweave_benchmark_help() {
-    echo "Usage: ${REL_NAME} benchmark [2.9|hash|packing|vdf]"
+    echo "Usage: ${REL_NAME} benchmark [hash|packing|vdf]"
     echo "Execute Arweave benchmarks. Examples:"
-    echo "  ${REL_NAME} benchmark 2.9"
     echo "  ${REL_NAME} benchmark hash"
     echo "  ${REL_NAME} benchmark packing"
     echo "  ${REL_NAME} benchmark vdf"
     exit 1
 }
 
-arweave_benchmark_2_9() {
-    ARWEAVE_OPTS="-run ar benchmark_2_9"
-    echo ${*}
-}
-
 arweave_benchmark_hash() {
     ARWEAVE_OPTS="-run ar benchmark_hash"
-    echo ${*}
+    ARGS=("$@")
 }
 
 arweave_benchmark_packing() {
     ARWEAVE_OPTS="-run ar benchmark_packing"
-    echo ${*}
+    ARGS=("$@")
 }
 
 arweave_benchmark_vdf() {
     ARWEAVE_OPTS="-run ar benchmark_vdf"
-    echo ${*}
+    ARGS=("$@")
 }
 
 ######################################################################
@@ -331,7 +344,7 @@ arweave_wallet() {
     case "${1}" in
 	create)
 	    shift
-	    arweave_wallet_create ${*}
+	    arweave_wallet_create "$@"
 	    ;;
 	*)
 	    arweave_wallet_help
@@ -351,11 +364,11 @@ arweave_wallet_create() {
     case "${1}" in
 	rsa)
 	    shift
-	    arweave_wallet_create_rsa ${*}
+	    arweave_wallet_create_rsa "$@"
 	    ;;
 	ecdsa)
 	    shift
-	    arweave_wallet_create_ecdsa ${*}
+	    arweave_wallet_create_ecdsa "$@"
 	    ;;
 	*)
 	    arweave_wallet_create_help
@@ -373,12 +386,12 @@ arweave_wallet_create_help() {
 
 arweave_wallet_create_rsa() {
     ARWEAVE_OPTS="-run ar create_wallet"
-    echo ${*}
+    ARGS=("$@")
 }
 
 arweave_wallet_create_ecdsa() {
     ARWEAVE_OPTS="-run ar create_ecdsa_wallet"
-    echo ${*}
+    ARGS=("$@")
 }
 
 ######################################################################
@@ -386,13 +399,107 @@ arweave_wallet_create_ecdsa() {
 ######################################################################
 arweave_doctor() {
     ARWEAVE_OPTS="-run ar_data_doctor main"
-    echo ${*}
+    ARGS=("$@")
 }
 
 arweave_doctor_help() {
     echo "Usage: ${REL_NAME} doctor"
     echo "Execute data doctor analyzer"
     exit 1
+}
+
+######################################################################
+# Arweave Config Section
+######################################################################
+arweave_convert_config() {
+    ARWEAVE_OPTS="-run ar convert_config"
+    ARGS=("$@")
+}
+
+arweave_convert_config_help() {
+    echo "Usage: ${REL_NAME} convert_config <json|yaml> <InputFile> <OutputFile>"
+    echo "Convert a legacy config.json into the new JSON or YAML format."
+    exit 1
+}
+
+arweave_config_help() {
+    echo "Usage: ${REL_NAME} config <command>"
+    echo "Manage Arweave configuration. Commands:"
+    echo "  ${REL_NAME} config help"
+    echo "  ${REL_NAME} config get <parameter>"
+    echo "  ${REL_NAME} config set <parameter> <value>"
+    exit 1
+}
+
+arweave_config_get_help() {
+    echo "Usage: ${REL_NAME} config get <parameter>"
+    echo "Get a configuration value from a running Arweave node."
+    exit 1
+}
+
+arweave_config_set_help() {
+    echo "Usage: ${REL_NAME} config set <parameter> <value>"
+    echo "Set a runtime configuration value on a running Arweave node."
+    exit 1
+}
+
+escape_for_erl_string() {
+    local value="${1}"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    printf '%s' "${value}"
+}
+
+arweave_config_get() {
+    local key="${1}"
+    if [ -z "${key}" ] || [ -n "${2}" ]; then
+        arweave_config_get_help
+    fi
+
+    ping_or_exit
+
+    local escaped_key
+    escaped_key="$(escape_for_erl_string "${key}")"
+    # erl_call -a parses the trailing token as Erlang. Args must be a
+    # list, otherwise a bare string "debug" is interpreted as a
+    # 5-element charlist and apply tries arweave_config_cli:get/5.
+    #
+    # The display string travels base64 (erl_call's term printer
+    # would otherwise quote it); the token is pure base64 alphabet,
+    # so stripping erl_call's outer quotes is unambiguous. Symmetric
+    # with the set transport.
+    local output ret
+    output=$(erl_rpc arweave_config_cli get_base64 "[\"${escaped_key}\"]")
+    ret=${?}
+    if [ "${ret}" -ne 0 ]; then
+        printf '%s\n' "${output}"
+        return "${ret}"
+    fi
+    output="${output#\"}"
+    output="${output%\"}"
+    printf '%s' "${output}" | base64 --decode
+    printf '\n'
+}
+
+arweave_config_set() {
+    local key="${1}"
+    shift
+    local value="${*}"
+    if [ -z "${key}" ] || [ -z "${value}" ]; then
+        arweave_config_set_help
+    fi
+
+    ping_or_exit
+
+    # erl_call -a parses its argument string as Erlang terms, so a
+    # value containing quotes (e.g. a JSON array for a list option)
+    # cannot be safely embedded as a string literal, no matter the
+    # escaping. Ship both tokens base64-encoded (quote-free by
+    # construction) and let arweave_config_cli:set_base64/2 decode.
+    local b64_key b64_value
+    b64_key="$(printf '%s' "${key}" | base64 | tr -d '\n')"
+    b64_value="$(printf '%s' "${value}" | base64 | tr -d '\n')"
+    erl_rpc arweave_config_cli set_base64 "[\"${b64_key}\", \"${b64_value}\"]"
 }
 
 ######################################################################
@@ -409,7 +516,7 @@ arweave_developer_mode() {
 
 # check if a command (subcommand) is a developer command.
 is_arweave_developer_command() {
-  local commands="test test_e2e"
+  local commands="test"
   local value="${1}"
   if test "${ARWEAVE_DEV}"
   then
@@ -457,36 +564,25 @@ arweave_version_help() {
 arweave_test() {
     TEST_CONFIG="./config/sys.config"
     TEST_PROFILE="test"
-    TEST_NODE_NAME="${NODE_NAME:-main-localtest}"
+    TEST_NODE_NAME="${NODE_NAME:-main-localtest${ARWEAVE_NS_SUFFIX:-}}"
     TEST_NODE_HOST="${NODE_HOST:-127.0.0.1}"
     TEST_COOKIE="${COOKIE:-test}"
     TEST_MODULE="tests"
-    TEST_LOG="main-localtest.out"
-    arweave_test_run ${*}
+    # Console transcript lands beside the node logs (see bin/test), not in
+    # the repo root.
+    TEST_LOG="${AR_TEST_LOG_DIR:-logs/eunit}/main-localtest.out"
+    arweave_test_run "$@"
 }
 
 arweave_test_help() {
-    echo "Usage: ${REL_NAME} test MODULE"
-    echo "Run Arweave Test Suite for module MODULE"
+    echo "Usage: ${REL_NAME} test [module | module:test ...]"
+    echo "Run Arweave Test Suite"
+    echo "  test                     - run all tests"
+    echo "  test module              - run all tests in module"
+    echo "  test module:test         - run specific test from module"
+    echo "  test mod1 mod2:test mod3 - mixed mode"
 }
 
-arweave_e2e() {
-    TEST_CONFIG="./config/sys.config"
-    TEST_PROFILE="e2e"
-    TEST_NODE_NAME="${NODE_NAME:-main-e2e}"
-    TEST_NODE_HOST="${NODE_HOST:-127.0.0.1}"
-    TEST_COOKIE="${COOKIE:-e2e}"
-    TEST_MODULE="e2e"
-    TEST_LOG="main-e2e.out"
-    arweave_test_run ${*}
-}
-
-arweave_e2e_help() {
-    echo "Usage: ${REL_NAME} test_e2e MODULE"
-    echo "Run Arweave e2e Test Suite for module MODULE"
-}
-
-# test and e2e features are sharing the same procedures.
 arweave_test_run() {
     (
 	echo -e "\033[0;32m===> Enter into ${PARENT_DIR}\033[0m"
@@ -498,17 +594,30 @@ arweave_test_run() {
 	# if a specific test is specified
 	if test "${1}"
 	then
-	    TEST_NODE="${TEST_NODE_NAME}-${1}@${TEST_NODE_HOST}"
+	    # Replace colons with underscores for valid node name
+	    SANITIZED_ARG="${1//:/_}"
+	    TEST_NODE="${TEST_NODE_NAME}-${SANITIZED_ARG}@${TEST_NODE_HOST}"
 	else
 	    TEST_NODE="${TEST_NODE_NAME}@${TEST_NODE_HOST}"
 	fi
 
-	TEST_PATH="$(./rebar3 as ${TEST_PROFILE} path)"
-	TEST_PATH_BASE="$(./rebar3 as ${TEST_PROFILE} path --base)/lib/arweave/test"
-	PARAMS="-pa ${TEST_PATH} ${TEST_PATH_BASE} -config ${TEST_CONFIG} -noshell"
+        TEST_PATH="$(./rebar3 as ${TEST_PROFILE} path)"
+        
+        ## TODO: Generate path for all apps -> Should we fetch this from somewhere?
+        APPS="arweave arweave_config arweave_limiter arweave_diagnostic"
+
+	PATH_ARGS=""
+        for app in $APPS; do
+            P="$(./rebar3 as ${TEST_PROFILE} path --base)/lib/${app}/test"
+            echo $P
+            PATH_ARGS="${PATH_ARGS} ${P}"
+        done
+
+        PARAMS="-pa ${TEST_PATH} ${PATH_ARGS} -config ${TEST_CONFIG} -noshell"
 	ENTRY_POINT="-run ar ${TEST_MODULE} ${*} -s init stop"
 	command="erl ${PARAMS} -name ${TEST_NODE} -setcookie ${TEST_COOKIE} ${ENTRY_POINT}"
 	echo -e "\033[0;32m===> Execute command ${command}\033[0m"
+	mkdir -p "$(dirname "${TEST_LOG}")"
 	set -xe -o pipefail
 	${command} | tee "${TEST_LOG}"
 	exit $?
@@ -527,6 +636,9 @@ relx_usage() {
 	    ;;
 	check)
 	    arweave_check_help
+	    ;;
+	config)
+	    arweave_config_help
 	    ;;
 	doctor)
 	    arweave_doctor_help
@@ -616,9 +728,6 @@ relx_usage() {
 	test)
 	    arweave_test_help
 	    ;;
-	test_e2e)
-	    arweave_e2e_help
-	    ;;
 	*)
 	    # check for extension
 	    IS_EXTENSION=$(relx_is_extension "$command")
@@ -633,6 +742,7 @@ relx_usage() {
 		echo ""
 		echo "  benchmark               Run Arweave Benchmarks"
 		echo "  check                   Check system parameters for Arweave"
+		echo "  config                  Manage Arweave configuration"
 		echo "  console                 Start Arweave with an interactive Erlang shell"
 		echo "  console_clean           Start an interactive Erlang shell without the Arweave release's applications"
 		echo "  daemon                  Start Arweave in the background with run_erl (named pipes)"
@@ -663,8 +773,7 @@ relx_usage() {
                 then
 		  echo ""
 		  echo "Arweave Commands (developer mode):"
-		  echo "  test                    Run Arweave test Suite"
-		  echo "  test_e2e                Run Arweave e2e Test Suite"
+		  echo "  test [MODULE [TEST]]     Run Arweave test Suite"
 		fi
 	    fi
 	    ;;
@@ -672,7 +781,7 @@ relx_usage() {
 }
 
 find_erts_dir() {
-    __erts_dir="$RELEASE_ROOT_DIR/erts-$ERTS_VSN"
+    __erts_dir="$ROOTDIR/erts-$ERTS_VSN"
     if [ -d "$__erts_dir" ]; then
 	ERTS_DIR="$__erts_dir";
     else
@@ -685,7 +794,10 @@ find_erts_dir() {
 	    __erts_version="$("$__erl" -boot no_dot_erlang -sasl errlog_type error -noshell -eval "$erts_version_code")"
 	    ERTS_DIR="${__erl_root}/erts-${__erts_version}"
 	    if [ -d "$ERTS_DIR" ]; then
-		echo "Exact ERTS version (${ERTS_VSN}) match not found, instead using ${__erts_version}. The release may fail to run." 1>&2
+		# Warn only when the release actually pinned an ERTS version:
+		# builds without include_erts render ERTS_VSN empty and always
+		# use the system ERTS — nothing to mismatch.
+		[ -n "$ERTS_VSN" ] && echo "Exact ERTS version (${ERTS_VSN}) match not found, instead using ${__erts_version}. The release may fail to run." 1>&2
 		ERTS_VSN=${__erts_version}
 	    else
 		echo "Can not run the release. There is no ERTS bundled with the release or found on the system."
@@ -984,7 +1096,12 @@ check_replace_os_vars() {
     ORIG_FILE_PATH="$IN_FILE_PATH.orig"
     if [ -f "$SRC_FILE_PATH" ]; then
 	OUT_FILE_PATH=$(make_out_file_path "$IN_FILE_PATH")
-	replace_os_vars "$SRC_FILE_PATH" "$OUT_FILE_PATH"
+	# A non-owning user (e.g. an operator running `config help`)
+	# cannot re-render into the release dir: keep the file rendered
+	# at deploy time instead of spraying awk write errors.
+	if [ -w "$OUT_FILE_PATH" ] || { [ ! -e "$OUT_FILE_PATH" ] && [ -w "$(dirname "$OUT_FILE_PATH")" ]; }; then
+	    replace_os_vars "$SRC_FILE_PATH" "$OUT_FILE_PATH"
+	fi
     elif [ "$RELX_REPLACE_OS_VARS" ]; then
 	OUT_FILE_PATH=$(make_out_file_path "$IN_FILE_PATH")
 	# If vm.args.orig or sys.config.orig is present then use that
@@ -1058,7 +1175,7 @@ relx_get_extension_script() {
     # below are the extensions declarations
     # of the form:
     # foo_extension="path/to/foo_script";bar_extension="path/to/bar_script"
-    {{{extension_declarations}}}
+
     # get the command extension (eg. foo) and
     # obtain the actual script filename that it
     # refers to (eg. "path/to/foo_script"
@@ -1098,32 +1215,27 @@ process_internal_args() {
 # and the one after. The one before is used as Erlang
 # VM parameters and should overwrite default configuration,
 # The last part (LOCAL_PARAMS) contains arweave parameters.
-# This function export LOCAL_PARAMS and VM_PARAMS variables.
+# This function sets the LOCAL_PARAMS and VM_PARAMS arrays. Arrays
+# preserve argument boundaries: a single quoted argument containing
+# whitespace (e.g. a JSON storage module) stays one argument.
 parse_args() {
 	local separator="--"
-	local vm_params=""
-	local params=""
-	while test "${*}"
+	VM_PARAMS=()
+	LOCAL_PARAMS=()
+	while [ $# -gt 0 ]
 	do
-		local arg="${1}"
-		if test "${arg}" = ${separator}
+		if test "${1}" = "${separator}"
 		then
-			test "${vm_params}" \
-				&& vm_params="${vm_params} ${params}" \
-				|| vm_params="${params}"
-			params=""
+			VM_PARAMS+=("${LOCAL_PARAMS[@]}")
+			LOCAL_PARAMS=()
 		else
-			test "${params}" \
-				&& params="${params} ${arg}" \
-				|| params="${arg}"
+			LOCAL_PARAMS+=("${1}")
 		fi
 
 		# don't forget to shift to remove the previous
 		# argument from the list
 		shift
 	done
-	export VM_PARAMS="${vm_params}"
-	export LOCAL_PARAMS="${params}"
 }
 
 # if ARWEAVE_DEV environment is defined, then
@@ -1138,7 +1250,6 @@ process_internal_args "$@"
 
 find_erts_dir
 find_erl_call
-export ROOTDIR="$RELEASE_ROOT_DIR"
 export BINDIR="$ERTS_DIR/bin"
 export EMU="beam"
 export PROGNAME="erl"
@@ -1329,7 +1440,9 @@ RELX_HOSTNAME=$(echo "${NAME}" | cut -d'@' -f2)
 test -z "$PIPE_DIR" && PIPE_BASE_DIR='/tmp/erl_pipes/'
 PIPE_DIR="${PIPE_DIR:-/tmp/erl_pipes/$NAME/}"
 
-cd "$ROOTDIR"
+# Change to the project root directory (instead of the release root ROOTDIR)
+# so that relative paths (like config files) and logs work as expected.
+cd "$RELEASE_ROOT_DIR"
 
 if is_arweave_developer_command "${1}"
 then
@@ -1341,12 +1454,89 @@ fi
 case "$1" in
     check)
 	shift
-	arweave_check ${*}
+	arweave_check "$@"
+	;;
+
+    config)
+	shift
+	case "$1" in
+	    help|"")
+		shift
+		subcommand="config"
+		# Help output is pure — it reads the option spec modules
+		# directly and needs no running application. Boot only
+		# kernel/stdlib and skip vm.args so help never starts
+		# distribution (whose -name collides with a running node)
+		# nor the full release apps.
+		BOOTFILE="$REL_DIR/start_clean"
+		CODE_LOADING_MODE="${CODE_LOADING_MODE:-interactive}"
+		VMARGS_PATH="/dev/null"
+		FOREGROUNDOPTIONS="-noinput +Bd"
+		ARWEAVE_OPTS="-run arweave_config_help main"
+		ARGS=("$@")
+		;;
+	    get)
+		shift
+		arweave_config_get "$@"
+		exit $?
+		;;
+	    set)
+		shift
+		arweave_config_set "$@"
+		exit $?
+		;;
+	    *)
+		arweave_config_help
+		;;
+	esac
+
+	parse_args "${ARGS[@]}"
+	ARGS=("${LOCAL_PARAMS[@]}")
+	CODE_LOADING_MODE="${CODE_LOADING_MODE:-embedded}"
+	EMU="beam"
+	PROGNAME="${0#*/}"
+
+	export EMU
+	export PROGNAME
+
+	echo "Exec: $BINDIR/erlexec" \
+	    "${VM_PARAMS[@]}" \
+	    ${EXTRA_DIST_ARGS} \
+	    ${FOREGROUNDOPTIONS} \
+	    -boot "$BOOTFILE" \
+	    -mode "$CODE_LOADING_MODE" \
+	    -boot_var SYSTEM_LIB_DIR "$SYSTEM_LIB_DIR" \
+	    -config "$RELX_CONFIG_PATH" \
+	    -args_file "$VMARGS_PATH" \
+	    -- ${ARWEAVE_OPTS} "${ARGS[@]}"
+	echo "Root: $ROOTDIR"
+
+	echo "$RELEASE_ROOT_DIR"
+	if ! command -v logger > /dev/null 2>&1
+	then
+	    echo "${REL_NAME}[$$] Starting up"
+	else
+	    logger -t "${REL_NAME}[$$]" "Starting up"
+	fi
+
+	relx_run_hooks "$PRE_START_HOOKS"
+	arweave_check
+
+	exec "$BINDIR/erlexec" \
+	    "${VM_PARAMS[@]}" \
+	    ${EXTRA_DIST_ARGS} \
+	    ${FOREGROUNDOPTIONS} \
+	    -boot "$BOOTFILE" \
+	    -mode "$CODE_LOADING_MODE" \
+	    -boot_var SYSTEM_LIB_DIR "$SYSTEM_LIB_DIR" \
+	    -config "$RELX_CONFIG_PATH" \
+	    -args_file "$VMARGS_PATH" \
+	    -- ${ARWEAVE_OPTS} "${ARGS[@]}"
 	;;
 
     version)
 	shift
-	arweave_version ${*}
+	arweave_version "$@"
 	;;
 
     daemon|daemon_boot)
@@ -1364,7 +1554,16 @@ case "$1" in
 		;;
 	esac
 
-	ARGS="$(printf "'%s' " "$@")"
+	# Build a single-quoted argument string for the run_erl command
+	# line. printf with no arguments still renders its format once,
+	# which would fabricate one empty '' argument - so only build the
+	# string when there are arguments to quote.
+	if [ $# -gt 0 ]
+	then
+		ARGS="$(printf "'%s' " "$@")"
+	else
+		ARGS=""
+	fi
 
 	# shellcheck disable=SC2174
 	test -z "$PIPE_BASE_DIR" || mkdir -m 1777 -p "$PIPE_BASE_DIR"
@@ -1499,7 +1698,7 @@ case "$1" in
 	relx_rem_sh
 	;;
 
-    console|console_clean|console_boot|foreground|foreground_clean|benchmark|wallet|doctor)
+    console|console_clean|console_boot|foreground|foreground_clean|benchmark|wallet|doctor|convert_config)
 	FOREGROUNDOPTIONS=""
 	# .boot file typically just $REL_NAME (ie, the app name)
 	# however, for debugging, sometimes start_clean.boot is useful.
@@ -1513,9 +1712,9 @@ case "$1" in
 		else
 		  BOOTFILE="$REL_DIR/start"
 		fi
-		ARGS=${*}
+		ARGS=("$@")
 		;;
-	    foreground|foreground_clean|benchmark|wallet|doctor)
+	    foreground|foreground_clean|benchmark|wallet|doctor|convert_config)
 		shift
 		# start up the release in the foreground for use by runit
 		# or other supervision services
@@ -1530,23 +1729,43 @@ case "$1" in
 		# foreground mode, ARGS will be modified.
 		case ${subcommand} in
 		    benchmark)
-			arweave_benchmark ${*}
-			ARGS=$(arweave_benchmark ${*})
+			arweave_benchmark "$@"
 			;;
 		    wallet)
-			arweave_wallet ${*}
-			ARGS=$(arweave_wallet ${*})
+			# One-shot local run beside a possibly-running node:
+			# skip vm.args so wallet creation never starts
+			# distribution with the node's -name. Keeps the full
+			# release boot — create_wallet needs the started
+			# arweave_config application.
+			VMARGS_PATH="/dev/null"
+			arweave_wallet "$@"
 			;;
 		    doctor)
-			arweave_doctor ${*}
-			ARGS=$(arweave_doctor ${*})
+			arweave_doctor "$@"
+			;;
+		    convert_config)
+			# Boot only kernel/stdlib (start_clean, interactive
+			# code loading): the converter starts arweave_config
+			# and its dependencies itself. Skipping the full
+			# release boot keeps os_mon's memsup port program out
+			# of the run — its shutdown race prints a scary
+			# "Error writing to pipe: Broken pipe" to users.
+			BOOTFILE="$REL_DIR/start_clean"
+			CODE_LOADING_MODE="${CODE_LOADING_MODE:-interactive}"
+			# One-shot local run: skip vm.args so the converter
+			# does not start distribution with the node's -name
+			# (which collides with a RUNNING node when the config
+			# is regenerated before a restart) nor inherit
+			# server-tuned VM flags.
+			VMARGS_PATH="/dev/null"
+			arweave_convert_config "$@"
 			;;
 		    foreground_clean)
 			ARWEAVE_OPTS=""
-			ARGS=${*}
+			ARGS=("$@")
 			;;
 		    *)
-			ARGS=${*}
+			ARGS=("$@")
 			;;
 		esac
 		;;
@@ -1555,21 +1774,21 @@ case "$1" in
 		# if not set by user use interactive mode for console_clean
 		CODE_LOADING_MODE="${CODE_LOADING_MODE:-interactive}"
 		BOOTFILE="$REL_DIR/start_clean"
-		ARGS=${*}
+		ARGS=("$@")
 		;;
 	    console_boot)
 		shift
 		BOOTFILE="$1"
 		shift
-		ARGS=${*}
+		ARGS=("$@")
 		;;
 	esac
 
 	# split the argument in two parts based on the previously
 	# passed args, LOCAL_PARAMS is for arweave, VM_PARAMS is for
 	# the vm.
-	parse_args ${ARGS}
-	ARGS=${LOCAL_PARAMS}
+	parse_args "${ARGS[@]}"
+	ARGS=("${LOCAL_PARAMS[@]}")
 
 	# if not set by user or console_clean use embedded
 	CODE_LOADING_MODE="${CODE_LOADING_MODE:-embedded}"
@@ -1584,7 +1803,7 @@ case "$1" in
 	# Dump environment info for logging purposes
 	# shellcheck disable=SC2086
 	echo "Exec: $BINDIR/erlexec" \
-	    ${VM_PARAMS} \
+	    "${VM_PARAMS[@]}" \
 	    ${EXTRA_DIST_ARGS} \
 	    ${FOREGROUNDOPTIONS} \
 	    -boot "$BOOTFILE" \
@@ -1592,7 +1811,7 @@ case "$1" in
 	    -boot_var SYSTEM_LIB_DIR "$SYSTEM_LIB_DIR" \
 	    -config "$RELX_CONFIG_PATH" \
 	    -args_file "$VMARGS_PATH" \
-	    -- ${ARWEAVE_OPTS} ${ARGS}
+	    -- ${ARWEAVE_OPTS} -extra "${ARGS[@]}"
 	echo "Root: $ROOTDIR"
 
 	# Log the startup
@@ -1613,7 +1832,7 @@ case "$1" in
 	# The variabre FOREGROUNDOPTIONS must NOT be quoted.
 	# shellcheck disable=SC2086
 	exec "$BINDIR/erlexec" \
-	    ${VM_PARAMS} \
+	    "${VM_PARAMS[@]}" \
 	    ${EXTRA_DIST_ARGS} \
 	    ${FOREGROUNDOPTIONS} \
 	    -boot "$BOOTFILE" \
@@ -1621,7 +1840,7 @@ case "$1" in
 	    -boot_var SYSTEM_LIB_DIR "$SYSTEM_LIB_DIR" \
 	    -config "$RELX_CONFIG_PATH" \
 	    -args_file "$VMARGS_PATH" \
-	    -- ${ARWEAVE_OPTS} ${ARGS}
+	    -- ${ARWEAVE_OPTS} -extra "${ARGS[@]}"
 	# exec will replace the current image and nothing else gets
 	# executed from this point on, this explains the absence
 	# of the pre start hook
@@ -1674,11 +1893,7 @@ case "$1" in
 	;;
     test)
 	shift
-	arweave_test ${*}
-	;;
-    test_e2e)
-	shift
-	arweave_e2e ${*}
+	arweave_test "$@"
 	;;
     help)
 	if [ -z "$2" ]; then

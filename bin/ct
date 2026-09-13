@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -e
+
+# Ensure test artifacts are rebuilt before running Common Test suites.
+./ar-rebar3 test compile
+
+# Keep CT's reports beside eunit's (see bin/test) under a single ./logs
+# root, rather than buried in _build where a clean wipes them.
+# cth_surefire's junit_report.xml lands in here too (see rebar.config).
+CT_LOGDIR="${CT_LOGDIR:-logs/ct}"
+mkdir -p "${CT_LOGDIR}"
+
+# Plain `ct` (not `as test ct`): the ct task already runs under the
+# test profile, and `as` splits every argument on commas for task
+# chaining — which breaks comma-separated `--suite a,b` lists.
+./rebar3 ct --logdir "${CT_LOGDIR}" "$@"

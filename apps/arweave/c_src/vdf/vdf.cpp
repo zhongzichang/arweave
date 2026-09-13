@@ -1,4 +1,5 @@
 #include <thread>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -13,9 +14,9 @@ struct vdf_sha_thread_arg {
 	unsigned char* saltBuffer;
 	unsigned char* seed;
 	unsigned char* outCheckpoint;
-	int checkpointCount;
-	int skipCheckpointCount;
-	int hashingIterations;
+	unsigned int checkpointCount;
+	unsigned int skipCheckpointCount;
+	unsigned int hashingIterations;
 	unsigned char* out;
 };
 
@@ -30,33 +31,33 @@ public:
 	unsigned char* inCheckpointRandomx;
 	unsigned char* resetStepNumberBin256;
 	unsigned char* resetSeed;
-	int checkpointCount;
-	int skipCheckpointCount;
-	int hashingIterationsSha;
-	int hashingIterationsRandomx;
+	unsigned int checkpointCount;
+	unsigned int skipCheckpointCount;
+	unsigned int hashingIterationsSha;
+	unsigned int hashingIterationsRandomx;
 
 	std::vector<vdf_sha_verify_thread_arg> _vdf_sha_verify_thread_arg_list;
-	volatile bool verifyRes;
+	std::atomic<bool> verifyRes;
 	std::mutex lock;
 };
 
 struct vdf_sha_verify_thread_arg {
 	std::thread* thread;
-	volatile bool in_progress;
+	bool in_progress;
 
 	vdf_verify_job* job;
-	int checkpointIdx;
+	unsigned int checkpointIdx;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //    SHA
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // NOTE saltBuffer is mutable in progress
-void _vdf_sha2(unsigned char* saltBuffer, unsigned char* seed, unsigned char* out, unsigned char* outCheckpoint, int checkpointCount, int skipCheckpointCount, int hashingIterations) {
+void _vdf_sha2(unsigned char* saltBuffer, unsigned char* seed, unsigned char* out, unsigned char* outCheckpoint, unsigned int checkpointCount, unsigned int skipCheckpointCount, unsigned int hashingIterations) {
 	unsigned char tempOut[VDF_SHA_HASH_SIZE];
 	// 2 different branches for different optimisation cases
 	if (skipCheckpointCount == 0) {
-		for(int checkpointIdx = 0; checkpointIdx <= checkpointCount; checkpointIdx++) {
+		for(unsigned int checkpointIdx = 0; checkpointIdx <= checkpointCount; checkpointIdx++) {
 			unsigned char* locIn  = checkpointIdx == 0               ? seed : (outCheckpoint + VDF_SHA_HASH_SIZE*(checkpointIdx-1));
 			unsigned char* locOut = checkpointIdx == checkpointCount ? out  : (outCheckpoint + VDF_SHA_HASH_SIZE*checkpointIdx);
 
@@ -67,7 +68,7 @@ void _vdf_sha2(unsigned char* saltBuffer, unsigned char* seed, unsigned char* ou
 				SHA256_Update(&sha256, locIn, VDF_SHA_HASH_SIZE); // -1 memcpy
 				SHA256_Final(tempOut, &sha256);
 			}
-			for(int i = 2; i < hashingIterations; i++) {
+			for(unsigned int i = 2; i < hashingIterations; i++) {
 				SHA256_CTX sha256;
 				SHA256_Init(&sha256);
 				SHA256_Update(&sha256, saltBuffer, SALT_SIZE);
@@ -84,7 +85,7 @@ void _vdf_sha2(unsigned char* saltBuffer, unsigned char* seed, unsigned char* ou
 			long_add(saltBuffer, 1);
 		}
 	} else {
-		for(int checkpointIdx = 0; checkpointIdx <= checkpointCount; checkpointIdx++) {
+		for(unsigned int checkpointIdx = 0; checkpointIdx <= checkpointCount; checkpointIdx++) {
 			unsigned char* locIn  = checkpointIdx == 0               ? seed : (outCheckpoint + VDF_SHA_HASH_SIZE*(checkpointIdx-1));
 			unsigned char* locOut = checkpointIdx == checkpointCount ? out  : (outCheckpoint + VDF_SHA_HASH_SIZE*checkpointIdx);
 
@@ -96,7 +97,7 @@ void _vdf_sha2(unsigned char* saltBuffer, unsigned char* seed, unsigned char* ou
 				SHA256_Final(tempOut, &sha256);
 			}
 			// 1 skip on start
-			for(int i = 1; i < hashingIterations; i++) {
+			for(unsigned int i = 1; i < hashingIterations; i++) {
 				SHA256_CTX sha256;
 				SHA256_Init(&sha256);
 				SHA256_Update(&sha256, saltBuffer, SALT_SIZE);
@@ -104,9 +105,9 @@ void _vdf_sha2(unsigned char* saltBuffer, unsigned char* seed, unsigned char* ou
 				SHA256_Final(tempOut, &sha256);
 			}
 			long_add(saltBuffer, 1);
-			for(int j = 1; j < skipCheckpointCount; j++) {
+			for(unsigned int j = 1; j < skipCheckpointCount; j++) {
 				// no skips
-				for(int i = 0; i < hashingIterations; i++) {
+				for(unsigned int i = 0; i < hashingIterations; i++) {
 					SHA256_CTX sha256;
 					SHA256_Init(&sha256);
 					SHA256_Update(&sha256, saltBuffer, SALT_SIZE);
@@ -116,7 +117,7 @@ void _vdf_sha2(unsigned char* saltBuffer, unsigned char* seed, unsigned char* ou
 				long_add(saltBuffer, 1);
 			}
 			// 1 skip on end
-			for(int i = 1; i < hashingIterations; i++) {
+			for(unsigned int i = 1; i < hashingIterations; i++) {
 				SHA256_CTX sha256;
 				SHA256_Init(&sha256);
 				SHA256_Update(&sha256, saltBuffer, SALT_SIZE);
@@ -140,7 +141,7 @@ void _vdf_sha2(unsigned char* saltBuffer, unsigned char* seed, unsigned char* ou
 //   unsigned char* outCheckpoint = (unsigned char*)malloc(checkpointCount*VDF_SHA_HASH_SIZE);
 //   free(outCheckpoint);
 // for call
-void vdf_sha2(unsigned char* saltBuffer, unsigned char* seed, unsigned char* out, unsigned char* outCheckpoint, int checkpointCount, int skipCheckpointCount, int hashingIterations) {
+void vdf_sha2(unsigned char* saltBuffer, unsigned char* seed, unsigned char* out, unsigned char* outCheckpoint, unsigned int checkpointCount, unsigned int skipCheckpointCount, unsigned int hashingIterations) {
 	unsigned char saltBufferStack[SALT_SIZE];
 	// ensure 1 L1 cache page used
 	// no access to heap, except of 0-iteration
@@ -155,7 +156,7 @@ void vdf_sha2(unsigned char* saltBuffer, unsigned char* seed, unsigned char* out
 void _vdf_sha_verify_thread(vdf_sha_verify_thread_arg* _arg) {
 	vdf_sha_verify_thread_arg* arg = _arg;
 	while(true) {
-		if (!arg->job->verifyRes) {
+		if (!arg->job->verifyRes.load()) {
 			return;
 		}
 
@@ -173,7 +174,7 @@ void _vdf_sha_verify_thread(vdf_sha_verify_thread_arg* _arg) {
 		// do not rewrite in
 		unsigned char inCopy[VDF_SHA_HASH_SIZE];
 		memcpy(inCopy, in, VDF_SHA_HASH_SIZE);
-		for(int i=0;i<=arg->job->skipCheckpointCount;i++) {
+		for(unsigned int i=0;i<=arg->job->skipCheckpointCount;i++) {
 			_vdf_sha2(saltBuffer, inCopy, expdOut, NULL, 0, 0, arg->job->hashingIterationsSha);
 			memcpy(outFullCheckpoint, expdOut, VDF_SHA_HASH_SIZE);
 			outFullCheckpoint += VDF_SHA_HASH_SIZE;
@@ -182,7 +183,7 @@ void _vdf_sha_verify_thread(vdf_sha_verify_thread_arg* _arg) {
 		}
 		// 0 == equal
 		if (0 != memcmp(expdOut, out, VDF_SHA_HASH_SIZE)) {
-			arg->job->verifyRes = false;
+			arg->job->verifyRes.store(false);
 			return;
 		}
 
@@ -190,7 +191,7 @@ void _vdf_sha_verify_thread(vdf_sha_verify_thread_arg* _arg) {
 			const std::lock_guard<std::mutex> lock(arg->job->lock);
 
 			bool found = false;
-			for(int i=arg->checkpointIdx+1;i<arg->job->checkpointCount;i++) {
+			for(unsigned int i=arg->checkpointIdx+1;i<arg->job->checkpointCount;i++) {
 				vdf_sha_verify_thread_arg* new_arg = &arg->job->_vdf_sha_verify_thread_arg_list[i];
 				if (!new_arg->in_progress) {
 					new_arg->in_progress = true;
@@ -225,7 +226,7 @@ bool fast_rev_cmp256(unsigned char* a, unsigned char* b) {
 void _vdf_sha_verify_with_reset_thread(vdf_sha_verify_thread_arg* _arg) {
 	vdf_sha_verify_thread_arg* arg = _arg;
 	while(true) {
-		if (!arg->job->verifyRes) {
+		if (!arg->job->verifyRes.load()) {
 			return;
 		}
 
@@ -248,7 +249,7 @@ void _vdf_sha_verify_with_reset_thread(vdf_sha_verify_thread_arg* _arg) {
 			reset_mix(inCopy, inCopy, arg->job->resetSeed);
 		}
 
-		for(int i=0;i<=arg->job->skipCheckpointCount;i++) {
+		for(unsigned int i=0;i<=arg->job->skipCheckpointCount;i++) {
 			_vdf_sha2(saltBuffer, inCopy, expdOut, NULL, 0, 0, arg->job->hashingIterationsSha);
 			memcpy(outFullCheckpoint, expdOut, VDF_SHA_HASH_SIZE);
 			outFullCheckpoint += VDF_SHA_HASH_SIZE;
@@ -261,7 +262,7 @@ void _vdf_sha_verify_with_reset_thread(vdf_sha_verify_thread_arg* _arg) {
 		}
 		// 0 == equal
 		if (0 != memcmp(expdOut, out, VDF_SHA_HASH_SIZE)) {
-			arg->job->verifyRes = false;
+			arg->job->verifyRes.store(false);
 			return;
 		}
 
@@ -269,7 +270,7 @@ void _vdf_sha_verify_with_reset_thread(vdf_sha_verify_thread_arg* _arg) {
 			const std::lock_guard<std::mutex> lock(arg->job->lock);
 
 			bool found = false;
-			for(int i=arg->checkpointIdx+1;i<arg->job->checkpointCount;i++) {
+			for(unsigned int i=arg->checkpointIdx+1;i<arg->job->checkpointCount;i++) {
 				vdf_sha_verify_thread_arg* new_arg = &arg->job->_vdf_sha_verify_thread_arg_list[i];
 				if (!new_arg->in_progress) {
 					new_arg->in_progress = true;
@@ -285,7 +286,7 @@ void _vdf_sha_verify_with_reset_thread(vdf_sha_verify_thread_arg* _arg) {
 	// TODO steal job from other hash function
 }
 
-bool vdf_parallel_sha_verify_with_reset(unsigned char* startSaltBuffer, unsigned char* seed, int checkpointCount, int skipCheckpointCount, int hashingIterations, unsigned char* inRes, unsigned char* inCheckpoint, unsigned char* outCheckpoint, unsigned char* resetStepNumberBin256, unsigned char* resetSeed, int maxThreadCount) {
+bool vdf_parallel_sha_verify_with_reset(unsigned char* startSaltBuffer, unsigned char* seed, unsigned int checkpointCount, unsigned int skipCheckpointCount, unsigned int hashingIterations, unsigned char* inRes, unsigned char* inCheckpoint, unsigned char* outCheckpoint, unsigned char* resetStepNumberBin256, unsigned char* resetSeed, int maxThreadCount) {
 	int freeThreadCount = maxThreadCount;
 
 	vdf_verify_job job;
@@ -298,11 +299,11 @@ bool vdf_parallel_sha_verify_with_reset(unsigned char* startSaltBuffer, unsigned
 	job.hashingIterationsSha = hashingIterations;
 	job.resetStepNumberBin256 = resetStepNumberBin256;
 	job.resetSeed = resetSeed;
-	job.verifyRes = true;
+	job.verifyRes.store(true);
 
 	job._vdf_sha_verify_thread_arg_list    .resize(checkpointCount);
 
-	for (int checkpointIdx=0;checkpointIdx<checkpointCount;checkpointIdx++) {
+	for (unsigned int checkpointIdx=0;checkpointIdx<checkpointCount;checkpointIdx++) {
 		struct vdf_sha_verify_thread_arg*     _vdf_sha_verify_thread_arg     = &job._vdf_sha_verify_thread_arg_list[checkpointIdx];
 		_vdf_sha_verify_thread_arg    ->checkpointIdx = checkpointIdx;
 		_vdf_sha_verify_thread_arg    ->thread = NULL;
@@ -310,7 +311,7 @@ bool vdf_parallel_sha_verify_with_reset(unsigned char* startSaltBuffer, unsigned
 		_vdf_sha_verify_thread_arg    ->job = &job;
 	}
 
-	for (int checkpointIdx=0;checkpointIdx<checkpointCount;checkpointIdx++) {
+	for (unsigned int checkpointIdx=0;checkpointIdx<checkpointCount;checkpointIdx++) {
 		struct vdf_sha_verify_thread_arg*     _vdf_sha_verify_thread_arg     = &job._vdf_sha_verify_thread_arg_list[checkpointIdx];
 		if (freeThreadCount > 0) {
 			freeThreadCount--;
@@ -321,7 +322,7 @@ bool vdf_parallel_sha_verify_with_reset(unsigned char* startSaltBuffer, unsigned
 		if (freeThreadCount == 0) break;
 	}
 
-	if (job.verifyRes) {
+	if (job.verifyRes.load()) {
 		unsigned char expdOut[VDF_SHA_HASH_SIZE];
 		unsigned char* sha_temp_result;
 		if (checkpointCount == 0) {
@@ -347,7 +348,7 @@ bool vdf_parallel_sha_verify_with_reset(unsigned char* startSaltBuffer, unsigned
 			reset_mix(inCopy, inCopy, resetSeed);
 		}
 
-		for(int i=0;i<=skipCheckpointCount;i++) {
+		for(unsigned int i=0;i<=skipCheckpointCount;i++) {
 			_vdf_sha2(finalSaltBuffer, inCopy, expdOut, NULL, 0, 0, hashingIterations);
 			memcpy(outFullCheckpoint, expdOut, VDF_SHA_HASH_SIZE);
 			outFullCheckpoint += VDF_SHA_HASH_SIZE;
@@ -359,20 +360,21 @@ bool vdf_parallel_sha_verify_with_reset(unsigned char* startSaltBuffer, unsigned
 			// NOTE long_add included
 		}
 		if (0 != memcmp(expdOut, inRes, VDF_SHA_HASH_SIZE)) {
-			job.verifyRes = false;
+			job.verifyRes.store(false);
 		}
 	}
 
-	for (int checkpointIdx=0;checkpointIdx<checkpointCount;checkpointIdx++) {
+	for (unsigned int checkpointIdx=0;checkpointIdx<checkpointCount;checkpointIdx++) {
 		struct vdf_sha_verify_thread_arg*     _vdf_sha_verify_thread_arg     = &job._vdf_sha_verify_thread_arg_list[checkpointIdx];
 
 		if (_vdf_sha_verify_thread_arg->thread) {
 			_vdf_sha_verify_thread_arg->thread->join();
-			free(_vdf_sha_verify_thread_arg->thread);
+			delete _vdf_sha_verify_thread_arg->thread;
+			_vdf_sha_verify_thread_arg->thread = NULL;
 		}
 	}
 
-	return job.verifyRes;
+	return job.verifyRes.load();
 }
 
 }

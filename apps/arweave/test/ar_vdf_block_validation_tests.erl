@@ -1,17 +1,22 @@
 -module(ar_vdf_block_validation_tests).
+-test_peers([peer1]).
 
 -include_lib("eunit/include/eunit.hrl").
 
+-include_lib("arweave/include/ar.hrl").
 -include_lib("arweave_config/include/arweave_config.hrl").
 
--define(TEST_RESET_FREQUENCY, 400).
+%% Low enough that the +100 step waits stay in the first post-reset session
+%% without burning the test budget on VDF steps.
+-define(TEST_RESET_FREQUENCY, 150).
+-define(TEST_VDF_DIFFICULTY, 100_000).
 -define(BLOCK_DELIVERY_TIMEOUT, 120000).
 
 fork_at_entropy_reset_point_test_() ->
-	[
-		{timeout, ?TEST_NODE_TIMEOUT, fun test_fork_checkpoints_not_found/0},
-		{timeout, ?TEST_NODE_TIMEOUT, fun test_fork_refuse_validation/0}
-	].
+    [
+        {timeout, ?TEST_NODE_TIMEOUT, fun test_fork_checkpoints_not_found/0},
+        {timeout, ?TEST_NODE_TIMEOUT, fun test_fork_refuse_validation/0}
+    ].
 
 %% Scenario:
 %% 1. VDF server applies a block that opens a new VDF session
@@ -26,79 +31,72 @@ fork_at_entropy_reset_point_test_() ->
 %% that the block is rejected and that the VDF client can later get on
 %% the correct chain and then mine a solution there.
 test_fork_checkpoints_not_found() ->
-	mock_reset_frequency_and_block_propagation_parallelization(),
-	try
-		[B0] = ar_weave:init(),
+    mock_reset_frequency(),
+    try
+        [B0] = test_weave(),
 
-		%% Start nodes in such way that they will not gossip blocks to
-		%% each other. This lets us control when blocks are shared.
-		%% Note: also relies on `mock_block_propagation_parallelization()`.
-		{ok, Config} = arweave_config:get_env(),
-		ar_test_node:start(#{
-			b0 => B0,
-			config => Config#config{
-				nonce_limiter_client_peers = [
-					ar_util:format_peer(ar_test_node:peer_ip(peer1))
-				],
-				block_pollers = 0
-			}
-		}),
-		mock_reset_frequency_and_block_propagation_parallelization(main),
+        %% Start nodes that won't gossip blocks to each other, so the test
+        %% controls when blocks are shared while mining forks.
+        ar_test_node:start(#{
+            b0 => B0,
+            config => #{
+                [peers, vdf_client] => [arweave_util:format_peer(ar_test_node:peer_ip(peer1))],
+                [gossip, block, pollers] => 0
+            }
+        }),
+        mock_reset_frequency(main),
 
-		{ok, PeerConfig} = ar_test_node:get_config(peer1),
-		ar_test_node:start_peer(peer1, #{
-			b0 => B0,
-			config => PeerConfig#config{
-				nonce_limiter_server_trusted_peers = [
-					ar_util:format_peer(ar_test_node:peer_ip(main))
-				],
-				block_pollers = 0
-			}
-		}),
-		mock_reset_frequency_and_block_propagation_parallelization(peer1),
+        ar_test_node:start_peer(peer1, #{
+            b0 => B0,
+            config => #{
+                [peers, vdf_server] => [arweave_util:format_peer(ar_test_node:peer_ip(main))],
+                [gossip, block, pollers] => 0
+            }
+        }),
+        mock_reset_frequency(peer1),
 
-		H2 = ar_test_node:with_gossip_paused(main, fun() ->
-			%% Still need to connect to make sure VDF is shared
-			ar_test_node:connect_to_peer(peer1),
+        ar_test_node:with_gossip_paused(main, fun() ->
+            ar_test_node:with_gossip_paused(peer1, fun() ->
+                %% Still need to connect to make sure VDF is shared.
+                ar_test_node:connect_to_peer(peer1),
 
-			ar_test_node:mine(main),
-			[H1 | _] = ar_test_node:wait_until_height(main, 1),
-			send_block(H1, main, peer1),
-			ar_test_node:wait_until_height(peer1, 1),
+                ar_test_node:mine(main),
+                {ok, [H1 | _]} = ar_test_await:node_height(main, 1),
+                ok = ar_test_await:block_applied_from(peer1, main, H1, 1),
 
-			ar_test_node:disconnect_from(peer1),
-			%% Make sure that we are deep into the new session before we try to mine.
-			%% Suspend peer1's nonce limiter so it cannot advance to the new session while isolated.
-			[H2Local | _] = with_nonce_limiter_paused(peer1, fun() ->
-				wait_until_step_number(main, ?TEST_RESET_FREQUENCY + 101),
-				ar_test_node:mine(main),
-				ar_test_node:wait_until_height(main, 2)
-			end),
+                ar_test_node:disconnect_from(peer1),
+                %% Suspend peer1's nonce limiter so it stays in the old session while
+                %% main advances deep into the new one before mining.
+                [H2 | _] = with_nonce_limiter_paused(peer1, fun() ->
+                    ok = ar_test_await:vdf_step(main, ?TEST_RESET_FREQUENCY + 101),
+                    ar_test_node:mine(main),
+                    {ok, BI2} = ar_test_await:node_height(main, 2),
+                    BI2
+                end),
 
-			ar_test_node:connect_to_peer(peer1),
-			%% Wait until peer1 has transitioned to the new VDF session.
-			wait_until_step_number(peer1, ?TEST_RESET_FREQUENCY + 1),
-			with_vdf_pull_and_push_disabled(peer1, fun() ->
-				ar_test_node:mine(peer1),
-				%% Assert that peer1 is unable to mine a block.
-				timer:sleep(10000),
-				BI = ar_test_node:remote_call(peer1, ar_node, get_blocks, []),
-				?assertEqual(2, length(BI))
-			end),
-			H2Local
-		end),
+                ar_test_node:connect_to_peer(peer1),
+                %% Wait until peer1 has transitioned to the new VDF session.
+                ok = ar_test_await:vdf_step(peer1, ?TEST_RESET_FREQUENCY + 1),
+                with_vdf_pull_and_push_disabled(peer1, fun() ->
+                    ar_test_node:mine(peer1),
+                    %% Assert that peer1 is unable to mine a block.
+                    timer:sleep(10000),
+                    BI = ar_test_node:remote_call(peer1, ar_node, get_blocks, []),
+                    ?assertEqual(2, length(BI))
+                end),
 
-		%% Get peer1 on the main chain
-		send_block(H2, main, peer1),
-		ar_test_node:wait_until_height(peer1, 2),
+                %% Get peer1 on the main chain.
+                ok = ar_test_await:block_applied_from(peer1, main, H2, 2),
 
-		%% Now that we're on the main chain and still mining, we should eventually mine a block.
-		ar_test_node:mine(peer1),
-		ar_test_node:wait_until_height(peer1, 3)
-	after
-		disable_mocks(main),
-		disable_mocks(peer1)
-	end.
+                %% On the main chain, peer1 should now be able to mine a block.
+                ar_test_node:mine(peer1),
+                ?assertMatch({ok, _}, ar_test_await:node_height(peer1, 3))
+            end)
+        end)
+    after
+        disable_mocks(main),
+        disable_mocks(peer1)
+    end.
 
 %% Scenario:
 %% 1. There's a chain fork on a block that opens a new VDF session.
@@ -124,180 +122,145 @@ test_fork_checkpoints_not_found() ->
 %% broke this fix for nodes using `disable vdf_server_pull`. We've now
 %% re-applied the fix and added this test.
 test_fork_refuse_validation() ->
-	mock_reset_frequency_and_block_propagation_parallelization(),
-	try
-		[B0] = ar_weave:init(),
+    mock_reset_frequency(),
+    try
+        [B0] = test_weave(),
 
-		%% Start nodes in such way that they will not gossip blocks to
-		%% each other. This lets us control when blocks are shared.
-		%% Note: also relies on `mock_block_propagation_parallelization()`.
-		{ok, Config} = arweave_config:get_env(),
-		ar_test_node:start(#{
-			b0 => B0,
-			config => Config#config{
-				nonce_limiter_client_peers = [
-					ar_util:format_peer(ar_test_node:peer_ip(peer1))
-				],
-				block_pollers = 0
-			}
-		}),
-		mock_reset_frequency_and_block_propagation_parallelization(main),
+        %% Start nodes that won't gossip blocks to each other, so the test
+        %% controls when blocks are shared while mining forks.
+        ar_test_node:start(#{
+            b0 => B0,
+            config => #{
+                [peers, vdf_client] => [arweave_util:format_peer(ar_test_node:peer_ip(peer1))],
+                [gossip, block, pollers] => 0
+            }
+        }),
+        mock_reset_frequency(main),
 
-		{ok, PeerConfig} = ar_test_node:get_config(peer1),
-		ar_test_node:start_peer(peer1, #{
-			b0 => B0,
-			config => PeerConfig#config{
-				nonce_limiter_server_trusted_peers = [
-					ar_util:format_peer(ar_test_node:peer_ip(main))
-				],
-				block_pollers = 0,
-				disable = [vdf_server_pull | PeerConfig#config.disable]
-			}
-		}),
-		mock_reset_frequency_and_block_propagation_parallelization(peer1),
+        ar_test_node:start_peer(peer1, #{
+            b0 => B0,
+            config => #{
+                [peers, vdf_server] => [arweave_util:format_peer(ar_test_node:peer_ip(main))],
+                [gossip, block, pollers] => 0,
+                [vdf, pull] => false
+            }
+        }),
+        mock_reset_frequency(peer1),
 
-		ar_test_node:with_gossip_paused(main, fun() ->
-			%% Still need to connect to make sure VDF is shared
-			ar_test_node:connect_to_peer(peer1),
+        ar_test_node:with_gossip_paused(main, fun() ->
+            ar_test_node:with_gossip_paused(peer1, fun() ->
+                %% Still need to connect to make sure VDF is shared.
+                ar_test_node:connect_to_peer(peer1),
 
-		ar_test_node:mine(main),
-		[H1 | _] = ar_test_node:wait_until_height(main, 1),
-		send_block(H1, main, peer1),
-		ar_test_node:assert_wait_until_height(peer1, 1),
-		wait_until_step_number(peer1, ?TEST_RESET_FREQUENCY + 1),
+                ar_test_node:mine(main),
+                {ok, [H1 | _]} = ar_test_await:node_height(main, 1),
+                ok = ar_test_await:block_applied_from(peer1, main, H1, 1),
+                ok = ar_test_await:vdf_step(peer1, ?TEST_RESET_FREQUENCY + 1),
 
-		ar_test_node:mine(peer1),
-		ar_test_node:wait_until_height(peer1, 2),
-		ar_test_node:disconnect_from(peer1),
-		wait_until_step_number(main, ?TEST_RESET_FREQUENCY + 100),
+                ar_test_node:mine(peer1),
+                ?assertMatch({ok, _}, ar_test_await:node_height(peer1, 2)),
+                %% Peer1 must keep its losing fork fixed while main mines the winning branch.
+                ok = ar_test_node:remote_call(peer1, ar_node_worker, pause, []),
+                ar_test_await:mining_paused(peer1),
+                ar_test_node:disconnect_from(peer1),
+                ok = ar_test_await:vdf_step(main, ?TEST_RESET_FREQUENCY + 100),
 
-		ar_test_node:mine(main),
-		[H2 | _] = ar_test_node:wait_until_height(main, 2),
-		ar_test_node:mine(main),
-		[H3 | _] = ar_test_node:wait_until_height(main, 3),
-		%% Just avoids some errors if the test finishes before the mining server is paused.
-		ar_test_node:wait_until_mining_paused(main),
+                ar_test_node:mine(main),
+                {ok, [H2 | _]} = ar_test_await:node_height(main, 2),
+                ar_test_node:mine(main),
+                {ok, [H3 | _]} = ar_test_await:node_height(main, 3),
+                %% Avoids noise if the test finishes before the mining server is paused.
+                ar_test_await:mining_paused(main),
 
-			ar_test_node:connect_to_peer(peer1),
-			ensure_block_applied(H2, main, peer1, 2),
-			ensure_block_applied(H3, main, peer1, 3)
-		end),
-		ar_test_node:wait_until_height(peer1, 3)
-	after
-		disable_mocks(main),
-		disable_mocks(peer1)
-	end.
+                ar_test_node:connect_to_peer(peer1),
+                ok = ar_test_await:block_applied_from(peer1, main, H2, 2),
+                ok = ar_test_await:block_applied_from(peer1, main, H3, 3),
+                ?assertMatch({ok, _}, ar_test_await:node_height(peer1, 3))
+            end)
+        end)
+    after
+        disable_mocks(main),
+        disable_mocks(peer1)
+    end.
 
-mock_reset_frequency_and_block_propagation_parallelization() ->
-	ar_test_node:new_mock(ar_nonce_limiter, [passthrough]),
-	ar_test_node:new_mock(ar_bridge, [passthrough]),
-	ar_test_node:mock_function(ar_nonce_limiter, get_reset_frequency, fun() -> ?TEST_RESET_FREQUENCY end),
-	ar_test_node:mock_function(ar_bridge, block_propagation_parallelization, fun() -> 0 end).
+mock_reset_frequency() ->
+    ar_test_util:new_mock(ar_nonce_limiter, [passthrough]),
+    ok = meck:expect(ar_nonce_limiter, get_reset_frequency, 0, ?TEST_RESET_FREQUENCY).
 
-mock_reset_frequency_and_block_propagation_parallelization(Node) ->
-	ar_test_node:remote_call(Node, ar_test_node, new_mock, [ar_nonce_limiter, [passthrough]]),
-	ar_test_node:remote_call(Node, ar_test_node, new_mock, [ar_bridge, [passthrough]]),
-	ar_test_node:remote_call(Node, ar_test_node, mock_function, [ar_nonce_limiter, get_reset_frequency, fun() -> ?TEST_RESET_FREQUENCY end]),
-	ar_test_node:remote_call(Node, ar_test_node, mock_function, [ar_bridge, block_propagation_parallelization, fun() -> 0 end]).
+mock_reset_frequency(Node) ->
+    ok = ar_test_node:remote_call(Node, ar_test_util, new_mock,
+        [ar_nonce_limiter, [passthrough]]),
+    ok = ar_test_node:remote_call(Node, meck, expect,
+        [ar_nonce_limiter, get_reset_frequency, 0, ?TEST_RESET_FREQUENCY]).
 
 disable_mocks(Node) ->
-	ok = ar_test_node:remote_call(Node, ar_test_node, unmock_module, [ar_bridge]),
-	ok = ar_test_node:remote_call(Node, ar_test_node, unmock_module, [ar_nonce_limiter]).
+    ok = ar_test_node:remote_call(Node, ar_test_util, unmock_module, [ar_nonce_limiter]).
 
-send_block(H, FromNode, ToNode) ->
-	Block = ar_test_node:remote_call(FromNode, ar_storage, read_block, [H]),
-	case ar_test_node:send_new_block(ar_test_node:peer_ip(ToNode), Block) of
-		{ok, {{<<"200">>, _}, _, _, _, _}} ->
-			ok;
-		{ok, {{<<"208">>, _}, _, _, _, _}} ->
-			ok;
-		Error ->
-			?assert(false, io_lib:format("Got unexpected error: ~p", [Error]))
-	end.
-
-ensure_block_applied(H, FromNode, ToNode, TargetHeight) ->
-	ar_util:do_until(
-		fun() ->
-			send_block(H, FromNode, ToNode),
-			Height = ar_test_node:remote_call(ToNode, ar_node, get_height, []),
-			Height >= TargetHeight
-		end,
-		1000,
-		?BLOCK_DELIVERY_TIMEOUT).
-
-wait_until_step_number(Node, StepNumber) ->
-	true = ar_util:do_until(
-		fun() ->
-			try
-				CurrentStepNumber = ar_test_node:remote_call(
-					Node, ar_nonce_limiter, get_current_step_number, []),
-				CurrentStepNumber >= StepNumber
-			catch
-				%% meck's internal gen_server proxy uses gen_server:call/2
-				%% with the default 5s timeout, which can fire under load.
-				exit:{timeout, _} ->
-					false
-			end
-		end,
-		500,
-		120000).
+test_weave() ->
+    [B0] = ar_weave:init(),
+    NonceLimiterInfo = B0#block.nonce_limiter_info,
+    B1 = B0#block{
+        nonce_limiter_info = NonceLimiterInfo#nonce_limiter_info{
+            vdf_difficulty = ?TEST_VDF_DIFFICULTY,
+            next_vdf_difficulty = ?TEST_VDF_DIFFICULTY
+        }
+    },
+    [B1#block{ indep_hash = ar_block:indep_hash(B1) }].
 
 with_nonce_limiter_paused(Node, Fun) when is_function(Fun, 0) ->
-	Pid = suspend_nonce_limiter(Node),
-	try
-		Fun()
-	after
-		resume_nonce_limiter(Node, Pid)
-	end.
+    Pid = suspend_nonce_limiter(Node),
+    try
+        Fun()
+    after
+        resume_nonce_limiter(Node, Pid)
+    end.
 
 with_vdf_pull_and_push_disabled(Node, Fun) when is_function(Fun, 0) ->
-	{ok, Config} = ar_test_node:remote_call(Node, arweave_config, get_env, []),
-	DisableFlags = Config#config.disable,
-	%% Update config so that ar_http_iface_middleware
-	%% responds to POST /vdf with #nonce_limiter_update_response {postpone = 120 }.
-	ok = ar_test_node:remote_call(
-		Node,
-		arweave_config,
-		set_env,
-		[Config#config{ disable = lists:delete(vdf_server_pull, DisableFlags) }]
-	),
-	%% Also suspend the pull loop so peer1 cannot fetch full sessions.
-	Pid = suspend_nonce_limiter_client(Node),
-	try
-		Fun()
-	after
-		ok = ar_test_node:remote_call(Node, arweave_config, set_env, [Config]),
-		resume_nonce_limiter_client(Node, Pid)
-	end.
+    %% Disable `[vdf, pull]' so `ar_http_iface_middleware' responds to
+    %% POST /vdf with `#nonce_limiter_update_response{postpone = 120}'.
+    %% (In the legacy config this was the `vdf_server_pull' bit of
+    %% `disable'; in the per-leaf store it's the dedicated boolean.)
+    Prior = ar_test_node:remote_call(Node, arweave_config, get, [[vdf, pull]]),
+    ok = ar_test_node:remote_call(Node, arweave_config, force_config,
+        [#{[vdf, pull] => false}]),
+    %% Also suspend the pull loop so peer1 cannot fetch full sessions.
+    Pid = suspend_nonce_limiter_client(Node),
+    try
+        Fun()
+    after
+        ok = ar_test_node:remote_call(Node, arweave_config, force_config,
+            [#{[vdf, pull] => Prior}]),
+        resume_nonce_limiter_client(Node, Pid)
+    end.
 
 suspend_nonce_limiter(Node) ->
-	Pid = ar_test_node:remote_call(Node, erlang, whereis, [ar_nonce_limiter]),
-	?assert(is_pid(Pid)),
-	ok = ar_test_node:remote_call(Node, sys, suspend, [Pid]),
-	Pid.
+    Pid = ar_test_node:remote_call(Node, erlang, whereis, [ar_nonce_limiter]),
+    ?assert(is_pid(Pid)),
+    ok = ar_test_node:remote_call(Node, sys, suspend, [Pid]),
+    Pid.
 
 suspend_nonce_limiter_client(Node) ->
-	Pid = ar_test_node:remote_call(Node, erlang, whereis, [ar_nonce_limiter_client]),
-	?assert(is_pid(Pid)),
-	ok = ar_test_node:remote_call(Node, sys, suspend, [Pid]),
-	Pid.
+    Pid = ar_test_node:remote_call(Node, erlang, whereis, [ar_nonce_limiter_client]),
+    ?assert(is_pid(Pid)),
+    ok = ar_test_node:remote_call(Node, sys, suspend, [Pid]),
+    Pid.
 
 resume_nonce_limiter(_Node, undefined) ->
-	ok;
+    ok;
 resume_nonce_limiter(Node, Pid) ->
-	case ar_test_node:remote_call(Node, erlang, is_process_alive, [Pid]) of
-		true ->
-			ok = ar_test_node:remote_call(Node, sys, resume, [Pid]);
-		false ->
-			ok
-	end.
+    case ar_test_node:remote_call(Node, erlang, is_process_alive, [Pid]) of
+        true ->
+            ok = ar_test_node:remote_call(Node, sys, resume, [Pid]);
+        false ->
+            ok
+    end.
 
 resume_nonce_limiter_client(_Node, undefined) ->
-	ok;
+    ok;
 resume_nonce_limiter_client(Node, Pid) ->
-	case ar_test_node:remote_call(Node, erlang, is_process_alive, [Pid]) of
-		true ->
-			ok = ar_test_node:remote_call(Node, sys, resume, [Pid]);
-		false ->
-			ok
-	end.
+    case ar_test_node:remote_call(Node, erlang, is_process_alive, [Pid]) of
+        true ->
+            ok = ar_test_node:remote_call(Node, sys, resume, [Pid]);
+        false ->
+            ok
+    end.

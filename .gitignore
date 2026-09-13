@@ -2,6 +2,7 @@
 *.log
 *.dat
 .vscode
+.envrc
 *.out
 *.code-workspace
 .arweave.plt
@@ -32,6 +33,7 @@ metrics_*
 release/output
 .DS_Store
 .tmp
+tmp
 node_modules
 screenlog.0
 _*
@@ -41,4 +43,10 @@ localnet_snapshot/wallets/arweave_keyfile_*
 !**/_*.json
 .jupyter/migrated
 notebooks/.ipynb_checkpoints
+.venv
 
+# Claude Code: ignore per-user / runtime state, but allow shared team
+# config (.claude/settings.json, .claude/commands/, .claude/agents/,
+# .claude/hooks/) to be committed.
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
